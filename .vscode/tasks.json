@@ -1,0 +1,32 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Debug",
+            "type": "shell",
+            "command": "cmake --build ${workspaceFolder}/G431_w5500/build/Debug",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"]
+        }
+        ,
+        {
+            "label": "Flash",
+            "type": "shell",
+            "command": "C:\\Users\\ibuki_ono\\AppData\\Local\\Microsoft\\WinGet\\Packages\\xpack-dev-tools.openocd-xpack_Microsoft.Winget.Source_8wekyb3d8bbwe\\xpack-openocd-0.12.0-7\\bin\\openocd.exe",
+            "args": [
+                "-f", "interface/stlink.cfg",
+                "-f", "target/stm32g4x.cfg",
+                "-c", "program G431_w5500/build/Debug/G431_w5500.elf verify reset exit"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "Build Debug",
+            "group": "test",
+            "problemMatcher": []
+        }
+    ]
+}

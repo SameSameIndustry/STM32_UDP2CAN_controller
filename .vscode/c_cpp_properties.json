@@ -1,0 +1,27 @@
+{
+    "configurations": [
+        {
+            "name": "STM32G4",
+            "includePath": [
+                "${workspaceFolder}/G431_w5500/Core/Inc",
+                "${workspaceFolder}/G431_w5500/Core/Drivers/W5500/Ethernet",
+                "${workspaceFolder}/G431_w5500/Core/Drivers/W5500/Ethernet/W5500",
+                "${workspaceFolder}/G431_w5500/Drivers/STM32G4xx_HAL_Driver/Inc",
+                "${workspaceFolder}/G431_w5500/Drivers/STM32G4xx_HAL_Driver/Inc/Legacy",
+                "${workspaceFolder}/G431_w5500/Drivers/CMSIS/Device/ST/STM32G4xx/Include",
+                "${workspaceFolder}/G431_w5500/Drivers/CMSIS/Include"
+            ],
+            "defines": [
+                "USE_HAL_DRIVER",
+                "STM32G431xx",
+                "_WIZCHIP_=W5500"
+            ],
+            "compileCommands": "${workspaceFolder}/G431_w5500/build/Debug/compile_commands.json",
+            "compilerPath": "C:\\Program Files\\Arm\\GNU Toolchain mingw-w64-x86_64-arm-none-eabi\\bin\\arm-none-eabi-gcc.exe",
+            "cStandard": "c11",
+            "cppStandard": "c++14",
+            "intelliSenseMode": "gcc-arm"
+        }
+    ],
+    "version": 4
+}

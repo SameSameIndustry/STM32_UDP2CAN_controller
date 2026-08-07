@@ -1,0 +1,34 @@
+# Build artifacts (STM32CubeIDE / CMake)
+CubeIDE/*/Debug/
+CubeIDE/*/Release/
+CubeIDE/*/.settings/
+G431_w5500/build/
+**/*.mcupreferredtarget
+
+# KiCad temporary / cache / backup files
+**/*-backups/
+**/fp-info-cache
+*.kicad_prl
+*.bak
+*.000
+*.bck
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*~
+~*
+_autosave-*
+\#auto_saved_files\#
+*.tmp
+*-save.pro
+*-save.kicad_pcb
+~*.lck
+
+# Object / debug artifacts
+*.o
+*.d
+*.su
+*.elf
+*.bin
+*.hex
+*.map
+*.list
