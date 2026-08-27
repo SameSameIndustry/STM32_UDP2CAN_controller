@@ -21,9 +21,15 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 #include <string.h>
 #include "wizchip_conf.h"
 #include "socket.h"
+#include "can_bus.h"
+#include "can_udp_bridge.h"
+#include "dji_c610.h"
+#include "odrive_can.h"
+#include "vesc_can.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,6 +39,21 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// GIM8018-8はODrive互換と認識されているとのことなので、まずODrive CAN Simple
+// プロトコルのnode_idとして扱う (ODrive公式デフォルトは0)。
+// tools/can_id_scanner/can_id_scanner.py の「ODrive heartbeat」欄に出てくる
+// node IDを見て、実機に合わせて確認・変更すること。
+#define GIM_NODE_ID 0U
+
+// 比較用: 2025年のM5_Lower-Controller(lib/VescCAN)ではController ID 10, 20が
+// 使われていた形跡があるが、GIM8018-8がこちらの可能性も完全には排除できないため
+// 受信のみ監視する(実際のコマンド送信はしない)。tools/can_id_scanner の
+// 「VESC status」欄に何か出てくるようなら、実はこちらが正解ということになる。
+#define VESC_TEST_ID 10U
+
+#define C610_ESC_ID  1U   // C610本体のダイヤル/DIPスイッチで設定したID (1-8)
+#define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
+#define HEARTBEAT_PORT  5002U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -41,13 +62,16 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+FDCAN_HandleTypeDef hfdcan1;
+
 SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim1;
 DMA_HandleTypeDef hdma_tim1_ch1;
 
 /* USER CODE BEGIN PV */
-
+ODriveCAN_Axis_t gim_axis;         // GIM8018-8 (本命: ODrive CAN Simple)
+VescCAN_Motor_t vesc_test_motor;   // 比較用 (受信のみ監視、VESCプロトコルだった場合の保険)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,6 +80,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_FDCAN1_Init(void);
 /* USER CODE BEGIN PFP */
 void ws2812_show(void);
 void ws2812_fill_buffer(void);
@@ -93,6 +118,17 @@ uint8_t W5500_ReadByte(void) {
 void W5500_WriteByte(uint8_t wb) {
     HAL_SPI_Transmit(&hspi1, &wb, 1, HAL_MAX_DELAY);
 }
+
+// HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングを
+// 挟むことで、PCからのCAN送信コマンドへの応答性を確保する (数msの粒度)
+static void Delay_WithCANPoll(uint32_t ms)
+{
+    uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < ms) {
+        CANUDPBridge_Poll();
+        HAL_Delay(5);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -127,6 +163,7 @@ int main(void)
   MX_DMA_Init();
   MX_TIM1_Init();
   MX_SPI1_Init();
+  MX_FDCAN1_Init();
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
 
@@ -167,6 +204,44 @@ int main(void)
   uint8_t dest_ip[4] = {192, 168, 1, 2}; // ★あなたのPCのIPアドレス
   uint16_t dest_port = 5000;             // 送信先ポート番号
   uint8_t sn = 0;                        // 使用するソケット番号
+
+  // ハートビート: W5500/Ethernetが単体で生きているかを確認するための定期ブロードキャスト。
+  // 送信先を255.255.255.255(ブロードキャスト)にしているので、PC側のIP設定が
+  // まだ合っていなくても同一セグメント上ならWiresharkに映る (udp.port==5002 でフィルタ)。
+  uint8_t hb_broadcast_ip[4] = {255, 255, 255, 255};
+  uint32_t hb_seq = 0;
+  socket(HEARTBEAT_SN, Sn_MR_UDP, HEARTBEAT_PORT, 0);
+  {
+      // このあと呼ぶMX_FDCAN1_Init()がもし固まった場合、while(1)ループに一切
+      // 到達できず定期ハートビートも送られなくなる。それでも「Ethernetの初期化
+      // 自体は成功した」ことを確認できるよう、ここで最低1発だけ即時送信しておく。
+      char hb_msg[48];
+      int hb_len = snprintf(hb_msg, sizeof(hb_msg), "HB (boot) tick=%lu\r\n",
+                             (unsigned long)HAL_GetTick());
+      if (hb_len > 0) {
+          sendto(HEARTBEAT_SN, (uint8_t*)hb_msg, (uint16_t)hb_len, hb_broadcast_ip, HEARTBEAT_PORT);
+      }
+  }
+
+  // CAN<->UDPブリッジ (CAN ID調査用)。ソケット1、ポート5001を使う (上記の"Hello"デモとは別ソケット)。
+  // PC側からこのポートに一度何か送れば、以後は受信した全CANフレームがそのPCへ生転送される。
+  CANUDPBridge_Init(1, 5001);
+
+  // CANバスの起動 (フィルタ設定 + HAL_FDCAN_Start + Rx割り込み有効化)
+  CANBus_Init(&hfdcan1);
+
+  // DJI C610 (M2006用ESC) の初期化。ESC側のIDは基板のダイヤルATC/DIPで1〜8に設定しておく
+  DJIC610_Init();
+
+  // GIM8018-8の初期化。本命としてODrive CAN Simpleプロトコルで扱う。
+  ODriveCAN_Init(&gim_axis, GIM_NODE_ID);
+  // Velocity Controlに入る (Set_Controller_Mode + Set_Axis_Requested_State(CLOSED_LOOP_CONTROL))。
+  // モーター/エンコーダのキャリブレーションが済んでいない個体だと失敗するが、その場合も
+  // 送信自体は害がなく、失敗はheartbeatのaxis_error/axis_stateから分かる。
+  ODriveCAN_EnableVelocityControl(&gim_axis);
+
+  // 比較用: VESCプロトコルだった場合に備え、受信のみ監視する(コマンドは送らない)
+  VescCAN_Init(&vesc_test_motor, VESC_TEST_ID);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -178,12 +253,22 @@ int main(void)
     /* USER CODE BEGIN 3 */
 	    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
 
+        // ハートビート送信 (ループ1周につき1回、約1.5秒間隔)
+        {
+            char hb_msg[48];
+            int hb_len = snprintf(hb_msg, sizeof(hb_msg), "HB seq=%lu tick=%lu\r\n",
+                                   (unsigned long)hb_seq++, (unsigned long)HAL_GetTick());
+            if (hb_len > 0) {
+                sendto(HEARTBEAT_SN, (uint8_t*)hb_msg, (uint16_t)hb_len, hb_broadcast_ip, HEARTBEAT_PORT);
+            }
+        }
+
         for (int i = 0; i < LED_NUM; i++) {
             led_data[i][1] = 100;
             led_data[i][2] = 0;
         }
         ws2812_show();
-        HAL_Delay(500);
+        Delay_WithCANPoll(500);
 
         // 緑
         for (int i = 0; i < LED_NUM; i++) {
@@ -191,7 +276,7 @@ int main(void)
             led_data[i][1] = 0;
         }
         ws2812_show();
-        HAL_Delay(500);
+        Delay_WithCANPoll(500);
 
         // 青
         for (int i = 0; i < LED_NUM; i++) {
@@ -199,7 +284,7 @@ int main(void)
             led_data[i][2] = 100;
         }
         ws2812_show();
-        HAL_Delay(500);
+        Delay_WithCANPoll(500);
 
         // ソケットが開いていなければ開く
 		if (getSn_SR(sn) == SOCK_CLOSED) {
@@ -212,6 +297,14 @@ int main(void)
 
 		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // 生存確認用LED (LD2)
 //		HAL_Delay(1000); // 1秒おき
+
+        // GIM8018-8 (ODrive CAN Simple) の回転テスト。速度指令 0.5 turns/s (≒30rpm相当の低速)。
+        // ⚠ GIM_NODE_IDが実機と合っているか、tools/can_id_scanner の
+        //    「ODrive heartbeat」欄(axis_state=8 = CLOSED_LOOP_CONTROLになっているか)で
+        //    確認してから通電すること。負荷を外した状態・電流制限をかけた電源でまず試すこと。
+        //    axis_errorが非0だったり反応がなければ、モーター/エンコーダのキャリブレーションが
+        //    済んでいない可能性がある(ODrive/GIM設定ツール側での作業が必要)。
+        ODriveCAN_SetInputVel(&gim_axis, 0.5f, 0.0f);
 
   }
   /* USER CODE END 3 */
@@ -260,6 +353,49 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief FDCAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_FDCAN1_Init(void)
+{
+
+  /* USER CODE BEGIN FDCAN1_Init 0 */
+
+  /* USER CODE END FDCAN1_Init 0 */
+
+  /* USER CODE BEGIN FDCAN1_Init 1 */
+
+  /* USER CODE END FDCAN1_Init 1 */
+  hfdcan1.Instance = FDCAN1;
+  hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
+  hfdcan1.Init.TransmitPause = DISABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
+  hfdcan1.Init.NominalPrescaler = 3;
+  hfdcan1.Init.NominalSyncJumpWidth = 1;
+  hfdcan1.Init.NominalTimeSeg1 = 13;
+  hfdcan1.Init.NominalTimeSeg2 = 2;
+  hfdcan1.Init.DataPrescaler = 1;
+  hfdcan1.Init.DataSyncJumpWidth = 1;
+  hfdcan1.Init.DataTimeSeg1 = 1;
+  hfdcan1.Init.DataTimeSeg2 = 1;
+  hfdcan1.Init.StdFiltersNbr = 0;
+  hfdcan1.Init.ExtFiltersNbr = 0;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN FDCAN1_Init 2 */
+
+  /* USER CODE END FDCAN1_Init 2 */
+
 }
 
 /**

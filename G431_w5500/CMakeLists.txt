@@ -47,6 +47,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Drivers/W5500/Ethernet/socket.c
     Core/Drivers/W5500/Ethernet/wizchip_conf.c
     Core/Drivers/W5500/Ethernet/W5500/w5500.c
+    Core/Src/can_bus.c
+    Core/Src/can_udp_bridge.c
+    Core/Src/dji_c610.c
+    Core/Src/vesc_can.c
+    Core/Src/odrive_can.c
 )
 
 # Add include paths
