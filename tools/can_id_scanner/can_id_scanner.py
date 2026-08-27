@@ -91,7 +91,9 @@ ODRIVE_AXIS_STATE_NAMES = {
 ODRIVE_AXIS_STATE_IDLE = 1
 ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL = 8
 ODRIVE_CONTROL_MODE_VELOCITY_CONTROL = 2
+ODRIVE_CONTROL_MODE_POSITION_CONTROL = 3
 ODRIVE_INPUT_MODE_PASSTHROUGH = 1
+ODRIVE_INPUT_MODE_POS_FILTER = 3
 
 
 def pack_command(can_id: int, is_extended: bool, data: bytes) -> bytes:
@@ -258,10 +260,11 @@ class App(tk.Tk):
             self, text="ODrive heartbeat / encoder (自動収集 = node IDの発見場所。本命はこちら)", padding=8
         )
         ostat.pack(fill="x", padx=8, pady=4)
-        ocolumns = ("node", "state", "err", "pos", "vel", "t")
+        ocolumns = ("node", "state", "err", "pos", "vel", "outpos", "t")
         oheaders = {"node": "Node ID", "state": "Axis State", "err": "Axis Error",
-                    "pos": "Pos [turn]", "vel": "Vel [turn/s]", "t": "tick_ms"}
-        owidths = {"node": 70, "state": 160, "err": 90, "pos": 90, "vel": 90, "t": 90}
+                    "pos": "Pos [turn] (native)", "vel": "Vel [turn/s] (native)",
+                    "outpos": "Pos [turn] (÷Gear Ratio)", "t": "tick_ms"}
+        owidths = {"node": 70, "state": 160, "err": 90, "pos": 120, "vel": 120, "outpos": 150, "t": 90}
         self.odrive_tree = ttk.Treeview(ostat, columns=ocolumns, show="headings", height=4)
         for col in ocolumns:
             self.odrive_tree.heading(col, text=oheaders[col])
@@ -274,17 +277,29 @@ class App(tk.Tk):
         ttk.Label(octrl, text="Node ID:").grid(row=0, column=0, sticky="w")
         self.odrive_node_var = tk.StringVar(value="0")
         ttk.Entry(octrl, textvariable=self.odrive_node_var, width=6).grid(row=0, column=1, padx=4)
-        ttk.Button(octrl, text="Enable (Velocity Control)", command=self.on_odrive_enable).grid(row=0, column=2, padx=4)
-        ttk.Button(octrl, text="Idle (停止)", command=self.on_odrive_idle).grid(row=0, column=3, padx=4)
-        ttk.Label(octrl, text="Velocity [turn/s]:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(octrl, text="Gear Ratio (出力1回転あたりturns):").grid(row=0, column=2, sticky="w")
+        self.odrive_gear_var = tk.StringVar(value="1.0")
+        ttk.Entry(octrl, textvariable=self.odrive_gear_var, width=6).grid(row=0, column=3, padx=4)
+        ttk.Button(octrl, text="Idle (停止)", command=self.on_odrive_idle).grid(row=0, column=4, padx=4)
+
+        ttk.Button(octrl, text="Enable (Velocity Control)", command=self.on_odrive_enable_vel).grid(row=1, column=0, columnspan=2, pady=(4, 0))
+        ttk.Label(octrl, text="Velocity [turn/s] (出力軸換算):").grid(row=1, column=2, sticky="w", pady=(4, 0))
         self.odrive_vel_var = tk.StringVar(value="0.5")
-        ttk.Entry(octrl, textvariable=self.odrive_vel_var, width=8).grid(row=1, column=1, padx=4, pady=(4, 0))
-        ttk.Button(octrl, text="Set Velocity", command=self.on_odrive_set_vel).grid(row=1, column=2, padx=4, pady=(4, 0))
+        ttk.Entry(octrl, textvariable=self.odrive_vel_var, width=8).grid(row=1, column=3, padx=4, pady=(4, 0))
+        ttk.Button(octrl, text="Set Velocity", command=self.on_odrive_set_vel).grid(row=1, column=4, padx=4, pady=(4, 0))
+
+        ttk.Button(octrl, text="Enable (Position Control)", command=self.on_odrive_enable_pos).grid(row=2, column=0, columnspan=2, pady=(4, 0))
+        ttk.Label(octrl, text="Position [turn] (出力軸換算):").grid(row=2, column=2, sticky="w", pady=(4, 0))
+        self.odrive_pos_var = tk.StringVar(value="0.0")
+        ttk.Entry(octrl, textvariable=self.odrive_pos_var, width=8).grid(row=2, column=3, padx=4, pady=(4, 0))
+        ttk.Button(octrl, text="Set Position", command=self.on_odrive_set_pos).grid(row=2, column=4, padx=4, pady=(4, 0))
+
         ttk.Label(
             octrl,
-            text="⚠ 負荷を外した状態・電流制限をかけた電源で、Enable後にまず小さいVelocityから試すこと。",
-            foreground="red",
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            text="⚠ 負荷を外した状態・電流制限をかけた電源で、Enable後にまず小さい値から試すこと。"
+                 "Gear Ratioが実機と違うと指令値と実移動量がずれる(odrive_can.hのコメント参照)。",
+            foreground="red", wraplength=860, justify="left",
+        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
         # --- VESC status ---
         vstat = ttk.LabelFrame(self, text="VESC status (自動収集。比較用の保険)", padding=8)
@@ -371,11 +386,18 @@ class App(tk.Tk):
         self.bridge.connect(self.ip_var.get(), port)
         self.status_var.set(f"接続先: {self.ip_var.get()}:{port} (登録パケット送信済み)")
 
-    def on_odrive_enable(self):
+    def _odrive_node_and_gear(self):
+        node_id = int(self.odrive_node_var.get())
+        gear_ratio = float(self.odrive_gear_var.get())
+        if gear_ratio == 0.0:
+            gear_ratio = 1.0
+        return node_id, gear_ratio
+
+    def on_odrive_enable_vel(self):
         try:
-            node_id = int(self.odrive_node_var.get())
+            node_id, _ = self._odrive_node_and_gear()
         except ValueError:
-            messagebox.showerror("エラー", "Node IDの入力が不正です")
+            messagebox.showerror("エラー", "Node ID / Gear Ratioの入力が不正です")
             return
         # Set_Controller_Mode(VELOCITY_CONTROL, PASSTHROUGH)
         data = odrive_pack_i32(ODRIVE_CONTROL_MODE_VELOCITY_CONTROL) + odrive_pack_i32(ODRIVE_INPUT_MODE_PASSTHROUGH)
@@ -384,24 +406,49 @@ class App(tk.Tk):
         data = odrive_pack_u32(ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL)
         self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_AXIS_STATE), False, data)
 
+    def on_odrive_enable_pos(self):
+        try:
+            node_id, _ = self._odrive_node_and_gear()
+        except ValueError:
+            messagebox.showerror("エラー", "Node ID / Gear Ratioの入力が不正です")
+            return
+        # Set_Controller_Mode(POSITION_CONTROL, POS_FILTER)
+        data = odrive_pack_i32(ODRIVE_CONTROL_MODE_POSITION_CONTROL) + odrive_pack_i32(ODRIVE_INPUT_MODE_POS_FILTER)
+        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_CONTROLLER_MODE), False, data)
+        # Set_Axis_Requested_State(CLOSED_LOOP_CONTROL)
+        data = odrive_pack_u32(ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL)
+        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_AXIS_STATE), False, data)
+
     def on_odrive_idle(self):
         try:
-            node_id = int(self.odrive_node_var.get())
+            node_id, _ = self._odrive_node_and_gear()
         except ValueError:
-            messagebox.showerror("エラー", "Node IDの入力が不正です")
+            messagebox.showerror("エラー", "Node ID / Gear Ratioの入力が不正です")
             return
         data = odrive_pack_u32(ODRIVE_AXIS_STATE_IDLE)
         self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_AXIS_STATE), False, data)
 
     def on_odrive_set_vel(self):
         try:
-            node_id = int(self.odrive_node_var.get())
+            node_id, gear_ratio = self._odrive_node_and_gear()
             vel = float(self.odrive_vel_var.get())
         except ValueError:
-            messagebox.showerror("エラー", "Node IDまたはVelocityの入力が不正です")
+            messagebox.showerror("エラー", "Node ID / Gear Ratio / Velocityの入力が不正です")
             return
-        data = odrive_pack_f32(vel) + odrive_pack_f32(0.0)
+        # 入力欄は出力軸換算[turn/s]。gear_ratioでネイティブ単位に変換して送る
+        data = odrive_pack_f32(vel * gear_ratio) + odrive_pack_f32(0.0)
         self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_INPUT_VEL), False, data)
+
+    def on_odrive_set_pos(self):
+        try:
+            node_id, gear_ratio = self._odrive_node_and_gear()
+            pos = float(self.odrive_pos_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "Node ID / Gear Ratio / Positionの入力が不正です")
+            return
+        # 入力欄は出力軸換算[turn]。gear_ratioでネイティブ単位に変換して送る
+        data = odrive_pack_f32(pos * gear_ratio) + bytes(4)  # Vel_FF=0, Torque_FF=0
+        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_INPUT_POS), False, data)
 
     def on_vesc_send(self):
         try:
@@ -474,7 +521,7 @@ class App(tk.Tk):
     def _update_odrive_row(self, node_id, heartbeat_extra, pos, vel, tick_ms):
         item = self.odrive_rows.get(node_id)
         if item is None:
-            values = (node_id, "", "", "", "", tick_ms)
+            values = (node_id, "", "", "", "", "", tick_ms)
             item = self.odrive_tree.insert("", "end", values=values)
             self.odrive_rows[node_id] = item
 
@@ -486,7 +533,14 @@ class App(tk.Tk):
         if pos is not None:
             cur[3] = f"{pos:.3f}"
             cur[4] = f"{vel:.3f}"
-        cur[5] = tick_ms
+            try:
+                gear_ratio = float(self.odrive_gear_var.get())
+                if gear_ratio == 0.0:
+                    gear_ratio = 1.0
+            except (ValueError, AttributeError):
+                gear_ratio = 1.0
+            cur[5] = f"{pos / gear_ratio:.3f}"
+        cur[6] = tick_ms
         self.odrive_tree.item(item, values=cur)
 
     def _update_vesc_row(self, controller_id, erpm, current, duty, tick_ms):

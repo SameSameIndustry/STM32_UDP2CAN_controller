@@ -77,10 +77,11 @@ static void ODriveCAN_RxHandler(uint32_t id, uint8_t is_extended, uint8_t *data,
     }
 }
 
-void ODriveCAN_Init(ODriveCAN_Axis_t *axis, uint8_t node_id)
+void ODriveCAN_Init(ODriveCAN_Axis_t *axis, uint8_t node_id, float gear_ratio)
 {
     memset(axis, 0, sizeof(*axis));
     axis->node_id = node_id;
+    axis->gear_ratio = gear_ratio;
 
     static uint8_t handler_registered = 0U;
     if (!handler_registered) {
@@ -144,4 +145,32 @@ HAL_StatusTypeDef ODriveCAN_EnableVelocityControl(ODriveCAN_Axis_t *axis)
         return status;
     }
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
+}
+
+HAL_StatusTypeDef ODriveCAN_EnablePositionControl(ODriveCAN_Axis_t *axis)
+{
+    HAL_StatusTypeDef status = ODriveCAN_SetControllerMode(
+        axis, ODRIVE_CONTROL_MODE_POSITION_CONTROL, ODRIVE_INPUT_MODE_POS_FILTER);
+    if (status != HAL_OK) {
+        return status;
+    }
+    return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
+}
+
+HAL_StatusTypeDef ODriveCAN_SetOutputPos(ODriveCAN_Axis_t *axis, float output_turns, float output_vel_ff, float torque_ff)
+{
+    float gear_ratio = (axis->gear_ratio != 0.0f) ? axis->gear_ratio : 1.0f;
+    return ODriveCAN_SetInputPos(axis, output_turns * gear_ratio, output_vel_ff * gear_ratio, torque_ff);
+}
+
+float ODriveCAN_GetOutputPos(const ODriveCAN_Axis_t *axis)
+{
+    float gear_ratio = (axis->gear_ratio != 0.0f) ? axis->gear_ratio : 1.0f;
+    return axis->pos_estimate / gear_ratio;
+}
+
+float ODriveCAN_GetOutputVel(const ODriveCAN_Axis_t *axis)
+{
+    float gear_ratio = (axis->gear_ratio != 0.0f) ? axis->gear_ratio : 1.0f;
+    return axis->vel_estimate / gear_ratio;
 }

@@ -45,6 +45,16 @@
 // node IDを見て、実機に合わせて確認・変更すること。
 #define GIM_NODE_ID 0U
 
+// GIM8018-8は減速比1/8 (モータ8回転 = 出力1回転)。CAN上のturns単位が既に出力軸
+// 換算(SteadyWin側のhardware configでload_encoder=出力側エンコーダに設定済み)なら
+// 1.0f、モータ軸換算のままなら8.0fにする。判別方法はodrive_can.hのコメント参照
+// (出力軸を手でちょうど1回転させ、can_id_scannerのPos[turn]の変化量を見る)。
+// 未確認のため、暫定値は安全側(gear_ratioを誤っていても実際の移動量が指令値より
+// 小さくなる側)である1.0fにしてある。もし実機で1回転が「8.0」と読めたら8.0fに
+// 変更すること (逆にここを先に8.0fにしてしまうと、実は1.0fが正解だった場合に
+// 指令値の8倍動いてしまうため危険)。
+#define GIM_GEAR_RATIO 1.0f
+
 // 比較用: 2025年のM5_Lower-Controller(lib/VescCAN)ではController ID 10, 20が
 // 使われていた形跡があるが、GIM8018-8がこちらの可能性も完全には排除できないため
 // 受信のみ監視する(実際のコマンド送信はしない)。tools/can_id_scanner の
@@ -234,11 +244,12 @@ int main(void)
   DJIC610_Init();
 
   // GIM8018-8の初期化。本命としてODrive CAN Simpleプロトコルで扱う。
-  ODriveCAN_Init(&gim_axis, GIM_NODE_ID);
-  // Velocity Controlに入る (Set_Controller_Mode + Set_Axis_Requested_State(CLOSED_LOOP_CONTROL))。
+  ODriveCAN_Init(&gim_axis, GIM_NODE_ID, GIM_GEAR_RATIO);
+  // Position Controlに入る (Set_Controller_Mode(POSITION, POS_FILTER) +
+  // Set_Axis_Requested_State(CLOSED_LOOP_CONTROL))。
   // モーター/エンコーダのキャリブレーションが済んでいない個体だと失敗するが、その場合も
   // 送信自体は害がなく、失敗はheartbeatのaxis_error/axis_stateから分かる。
-  ODriveCAN_EnableVelocityControl(&gim_axis);
+  ODriveCAN_EnablePositionControl(&gim_axis);
 
   // 比較用: VESCプロトコルだった場合に備え、受信のみ監視する(コマンドは送らない)
   VescCAN_Init(&vesc_test_motor, VESC_TEST_ID);
@@ -298,13 +309,26 @@ int main(void)
 		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // 生存確認用LED (LD2)
 //		HAL_Delay(1000); // 1秒おき
 
-        // GIM8018-8 (ODrive CAN Simple) の回転テスト。速度指令 0.5 turns/s (≒30rpm相当の低速)。
-        // ⚠ GIM_NODE_IDが実機と合っているか、tools/can_id_scanner の
-        //    「ODrive heartbeat」欄(axis_state=8 = CLOSED_LOOP_CONTROLになっているか)で
-        //    確認してから通電すること。負荷を外した状態・電流制限をかけた電源でまず試すこと。
+        // GIM8018-8 (ODrive CAN Simple) の位置制御テスト。
+        // 出力軸換算で 0 turn ⇔ 0.25 turn (90°) を約6秒(ループ4周)ごとに往復する。
+        // ⚠ GIM_NODE_IDが実機と合っているか、GIM_GEAR_RATIOが実機と合っているか
+        //    (odrive_can.hのコメント参照。誤っていると指令値と実移動量が8倍ズレる)、
+        //    tools/can_id_scanner の「ODrive heartbeat」欄(axis_state=8 =
+        //    CLOSED_LOOP_CONTROLになっているか)で確認してから通電すること。
+        //    負荷を外した状態・電流制限をかけた電源でまず試すこと。
         //    axis_errorが非0だったり反応がなければ、モーター/エンコーダのキャリブレーションが
         //    済んでいない可能性がある(ODrive/GIM設定ツール側での作業が必要)。
-        ODriveCAN_SetInputVel(&gim_axis, 0.5f, 0.0f);
+        {
+            static uint8_t pos_toggle_count = 0U;
+            static float pos_target_turns = 0.0f;
+
+            pos_toggle_count++;
+            if (pos_toggle_count >= 4U) {
+                pos_toggle_count = 0U;
+                pos_target_turns = (pos_target_turns == 0.0f) ? 0.25f : 0.0f;
+            }
+            ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
+        }
 
   }
   /* USER CODE END 3 */
