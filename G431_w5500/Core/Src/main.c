@@ -45,15 +45,15 @@
 // node IDを見て、実機に合わせて確認・変更すること。
 #define GIM_NODE_ID 0U
 
-// GIM8018-8は減速比1/8 (モータ8回転 = 出力1回転)。CAN上のturns単位が既に出力軸
-// 換算(SteadyWin側のhardware configでload_encoder=出力側エンコーダに設定済み)なら
-// 1.0f、モータ軸換算のままなら8.0fにする。判別方法はodrive_can.hのコメント参照
-// (出力軸を手でちょうど1回転させ、can_id_scannerのPos[turn]の変化量を見る)。
-// 未確認のため、暫定値は安全側(gear_ratioを誤っていても実際の移動量が指令値より
-// 小さくなる側)である1.0fにしてある。もし実機で1回転が「8.0」と読めたら8.0fに
-// 変更すること (逆にここを先に8.0fにしてしまうと、実は1.0fが正解だった場合に
-// 指令値の8倍動いてしまうため危険)。
-#define GIM_GEAR_RATIO 1.0f
+// GIM8018-8は減速比1/8 (モータ8回転 = 出力1回転)。
+// SteadyWin公式のGIM6010-8マニュアル(同じ駆動基板ファミリー、tools/odrive_setup/
+// odrive_configure.py 冒頭のコメント参照)によれば、このファームウェアには
+// ODrive Pro(v0.6系)にあるload_encoder/commutation_encoderのような「出力軸専用
+// エンコーダ」概念は存在せず、pos_estimate/Input_Posは常にモーター軸(エンコーダ)
+// 基準のturnsである。よってGIM_GEAR_RATIO=8.0fが妥当なはずだが、GIM8018-8固有の
+// マニュアルそのものは未確認なので、念のため出力軸を手でちょうど1回転させ
+// can_id_scannerのPos[turn]の変化量が8.0になることを確認してから運用すること。
+#define GIM_GEAR_RATIO 8.0f
 
 // 比較用: 2025年のM5_Lower-Controller(lib/VescCAN)ではController ID 10, 20が
 // 使われていた形跡があるが、GIM8018-8がこちらの可能性も完全には排除できないため

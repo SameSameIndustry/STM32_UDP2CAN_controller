@@ -19,26 +19,27 @@ extern "C" {
  * からはどちらがGIM8018-8だったか確定できなかったため、vesc_can.hも並行して
  * 残してある。実機の応答で確認すること)。
  *
- * ---- 減速比とデュアルエンコーダについて ----
- * ODrive公式ドキュメント(Encoders / Hardware Configuration)によれば、ギアボックス
- * 付き構成では commutation_encoder (モータ側、転流用) と load_encoder (出力側、
- * 位置フィードバック用) を別々に設定でき、hardware configで「出力軸換算の
- * turnsをユーザー向け単位として使う」ようにも構成できる。GIM8018-8はモータ側・
- * 出力側の両方にエンコーダを持つ構成(いわゆるデュアルエンコーダ)なので、
- * SteadyWin側の出荷設定でload_encoderが出力側エンコーダに向いていれば、
- * Get_Encoder_Estimates(cmd 0x009)は既にバックラッシュ補正済みの出力軸絶対位置を
- * 返しているはずである。
+ * ---- 減速比について ----
+ * SteadyWin公式の"GIM6010-8 Micromotor Instruction Manual"(同じ駆動基板ファミリー、
+ * tools/odrive_setup/odrive_configure.py 冒頭のコメント参照)によれば、この
+ * ファームウェアはODrive公式サイト最新版(v0.6系, ODrive Pro)にある
+ * commutation_encoder/load_encoderのような「出力軸専用エンコーダ」の設定概念を
+ * 持たない、旧世代(legacy)のAPI体系である。ハードウェア上は「Second encoder
+ * interface (I2C/UART)」という拡張コネクタは用意されているが、モータ内蔵の主
+ * エンコーダ1個(16bit絶対値, マニュアル1.2/2.3節)がそのまま位置フィードバックに
+ * 使われる構成がデフォルトと見られる。
  *
- * ただし「出荷設定でCAN上の単位が出力軸換算になっているか、モータ軸換算のままか」
- * はここからは確認できないため、本ドライバでは ODriveCAN_Axis_t::gear_ratio を
- * 明示的なパラメータとして持たせ、ODriveCAN_SetOutputPos()/GetOutputPos()で
- * 出力軸のturns単位に変換してから送受信する。
- *   - デバイス側で既に出力軸換算済みなら gear_ratio = 1.0f
- *   - デバイスがモータ軸換算のままなら gear_ratio = 減速比の分母 (例: 1/8減速なら8.0f)
- * 判別方法: モーターをIDLEにして出力軸を手でちょうど1回転させ、
- * tools/can_id_scanner の「ODrive heartbeat」テーブルのPos[turn]の変化量を見る。
- * 約1.0ならデバイス側で出力軸換算済み(gear_ratio=1.0)、約8.0(減速比なり)なら
- * モータ軸換算のまま(gear_ratio=8.0)。
+ * つまり Get_Encoder_Estimates(cmd 0x009) の Pos_Estimate/Vel_Estimate は常に
+ * モーター軸(エンコーダ)基準のturnsであり、出力軸(減速比分の1)の絶対位置にするには
+ * クライアント側でgear_ratio(減速比の分母。1/8減速なら8.0)で割る必要がある。
+ * 本ドライバはこれを ODriveCAN_Axis_t::gear_ratio として明示的に持たせ、
+ * ODriveCAN_SetOutputPos()/GetOutputPos()で変換する。
+ *
+ * ただしこれはGIM6010-8のマニュアルからの類推であり、GIM8018-8固有のマニュアルは
+ * 未確認。運用前に、モーターをIDLEにして出力軸を手でちょうど1回転させ、
+ * tools/can_id_scanner の「ODrive heartbeat」テーブルのPos[turn]の変化量が
+ * 8.0になることを確認すること(1.0であればデバイス側で既に出力軸換算されている
+ * ことになり、gear_ratio=1.0fに直す必要がある)。
  */
 
 /* Axis Requested State (ODrive公式のAxisState列挙値、よく使うものだけ) */
