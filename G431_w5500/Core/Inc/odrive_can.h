@@ -70,8 +70,14 @@ typedef struct {
     uint8_t  axis_state;      /* Heartbeat(cmd 0x001)から */
     float    pos_estimate;    /* Get_Encoder_Estimates(cmd 0x009)から [turns] */
     float    vel_estimate;    /* Get_Encoder_Estimates(cmd 0x009)から [turns/s] */
+    float    iq_setpoint;     /* Get_Iq(cmd 0x014)から [A] */
+    float    iq_measured;     /* Get_Iq(cmd 0x014)から [A] */
+    float    vbus_voltage;    /* Get_Bus_Voltage(_Current)(cmd 0x017)から [V] */
+    float    ibus_current;    /* 同上 [A]。ODrive 0.5.6未満のFWでは常に0 */
     uint32_t last_heartbeat_tick;
     uint32_t last_encoder_tick;
+    uint32_t last_iq_tick;
+    uint32_t last_vbus_tick;
     uint8_t  connected;
 } ODriveCAN_Axis_t;
 
@@ -100,6 +106,36 @@ HAL_StatusTypeDef ODriveCAN_EnableVelocityControl(ODriveCAN_Axis_t *axis);
 /* Closed Loop Control + Position Control に入るための一連の手順
  * (Set_Controller_Mode(POSITION, POS_FILTER) + Set_Axis_Requested_State(CLOSED_LOOP_CONTROL)) */
 HAL_StatusTypeDef ODriveCAN_EnablePositionControl(ODriveCAN_Axis_t *axis);
+
+/* Closed Loop Control + Torque Control に入るための一連の手順
+ * (Set_Controller_Mode(TORQUE, PASSTHROUGH) + Set_Axis_Requested_State(CLOSED_LOOP_CONTROL)) */
+HAL_StatusTypeDef ODriveCAN_EnableTorqueControl(ODriveCAN_Axis_t *axis);
+
+/* ---- 追加のCAN Simpleコマンド (ODrive 0.5.x / 0.6.x 共通のサブセット) ---- */
+
+/* 即時停止 (Estop, cmd 0x002)。復帰にはODriveCAN_ClearErrors()が必要 */
+HAL_StatusTypeDef ODriveCAN_Estop(ODriveCAN_Axis_t *axis);
+
+/* エラークリア (Clear_Errors, cmd 0x018) */
+HAL_StatusTypeDef ODriveCAN_ClearErrors(ODriveCAN_Axis_t *axis);
+
+/* 再起動 (Reboot, cmd 0x016) */
+HAL_StatusTypeDef ODriveCAN_Reboot(ODriveCAN_Axis_t *axis);
+
+/* 速度上限[turns/s]・電流上限[A]の設定 (Set_Limits, cmd 0x00F)。いずれもネイティブ(モーター軸)単位 */
+HAL_StatusTypeDef ODriveCAN_SetLimits(ODriveCAN_Axis_t *axis, float vel_limit, float current_limit);
+
+/* Trap Traj 用の速度上限 [turns/s] (Set_Traj_Vel_Limit, cmd 0x011) */
+HAL_StatusTypeDef ODriveCAN_SetTrajVelLimit(ODriveCAN_Axis_t *axis, float traj_vel_limit);
+
+/* Trap Traj 用の加速/減速上限 [turns/s^2] (Set_Traj_Accel_Limits, cmd 0x012) */
+HAL_StatusTypeDef ODriveCAN_SetTrajAccelLimits(ODriveCAN_Axis_t *axis, float accel_limit, float decel_limit);
+
+/* 位置ループゲイン (Set_Pos_Gain, cmd 0x01A) */
+HAL_StatusTypeDef ODriveCAN_SetPosGain(ODriveCAN_Axis_t *axis, float pos_gain);
+
+/* 速度ループゲイン (Set_Vel_Gains, cmd 0x01B) */
+HAL_StatusTypeDef ODriveCAN_SetVelGains(ODriveCAN_Axis_t *axis, float vel_gain, float vel_integrator_gain);
 
 /* 出力軸換算での絶対位置指令 [turns] (1.0 = 出力軸1回転)。
  * axis->gear_ratioでネイティブ単位に変換してSet_Input_Posを送る。

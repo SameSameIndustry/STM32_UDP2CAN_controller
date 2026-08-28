@@ -52,6 +52,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/dji_c610.c
     Core/Src/vesc_can.c
     Core/Src/odrive_can.c
+    Core/Src/gim6010.c
+    Core/Src/gim8018.c
 )
 
 # Add include paths

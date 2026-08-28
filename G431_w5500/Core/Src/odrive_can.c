@@ -4,12 +4,22 @@
 
 /* ODrive CAN Simple プロトコルのコマンドID (公式ドキュメント準拠、今回使う分だけ) */
 #define ODRIVE_CMD_HEARTBEAT              0x001U
+#define ODRIVE_CMD_ESTOP                  0x002U
 #define ODRIVE_CMD_SET_AXIS_REQUESTED_STATE 0x007U
 #define ODRIVE_CMD_GET_ENCODER_ESTIMATES  0x009U
 #define ODRIVE_CMD_SET_CONTROLLER_MODE    0x00BU
 #define ODRIVE_CMD_SET_INPUT_POS          0x00CU
 #define ODRIVE_CMD_SET_INPUT_VEL          0x00DU
 #define ODRIVE_CMD_SET_INPUT_TORQUE       0x00EU
+#define ODRIVE_CMD_SET_LIMITS             0x00FU
+#define ODRIVE_CMD_SET_TRAJ_VEL_LIMIT     0x011U
+#define ODRIVE_CMD_SET_TRAJ_ACCEL_LIMITS  0x012U
+#define ODRIVE_CMD_GET_IQ                 0x014U
+#define ODRIVE_CMD_REBOOT                 0x016U
+#define ODRIVE_CMD_GET_BUS_VOLTAGE_CURRENT 0x017U
+#define ODRIVE_CMD_CLEAR_ERRORS          0x018U
+#define ODRIVE_CMD_SET_POS_GAIN          0x01AU
+#define ODRIVE_CMD_SET_VEL_GAINS         0x01BU
 
 #define ODRIVECAN_MAX_TRACKED 8U
 static ODriveCAN_Axis_t *s_axis_table[ODRIVECAN_MAX_TRACKED];
@@ -72,6 +82,16 @@ static void ODriveCAN_RxHandler(uint32_t id, uint8_t is_extended, uint8_t *data,
             axis->pos_estimate = ODriveCAN_GetF32LE(&data[0]);
             axis->vel_estimate = ODriveCAN_GetF32LE(&data[4]);
             axis->last_encoder_tick = HAL_GetTick();
+            axis->connected = 1U;
+        } else if (cmd_id == ODRIVE_CMD_GET_IQ && len >= 8U) {
+            axis->iq_setpoint = ODriveCAN_GetF32LE(&data[0]);
+            axis->iq_measured = ODriveCAN_GetF32LE(&data[4]);
+            axis->last_iq_tick = HAL_GetTick();
+            axis->connected = 1U;
+        } else if (cmd_id == ODRIVE_CMD_GET_BUS_VOLTAGE_CURRENT && len >= 4U) {
+            axis->vbus_voltage = ODriveCAN_GetF32LE(&data[0]);
+            axis->ibus_current = (len >= 8U) ? ODriveCAN_GetF32LE(&data[4]) : 0.0f;
+            axis->last_vbus_tick = HAL_GetTick();
             axis->connected = 1U;
         }
     }
@@ -155,6 +175,72 @@ HAL_StatusTypeDef ODriveCAN_EnablePositionControl(ODriveCAN_Axis_t *axis)
         return status;
     }
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
+}
+
+HAL_StatusTypeDef ODriveCAN_EnableTorqueControl(ODriveCAN_Axis_t *axis)
+{
+    HAL_StatusTypeDef status = ODriveCAN_SetControllerMode(
+        axis, ODRIVE_CONTROL_MODE_TORQUE_CONTROL, ODRIVE_INPUT_MODE_PASSTHROUGH);
+    if (status != HAL_OK) {
+        return status;
+    }
+    return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
+}
+
+HAL_StatusTypeDef ODriveCAN_Estop(ODriveCAN_Axis_t *axis)
+{
+    uint8_t data[8] = {0};
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_ESTOP), data, 0U);
+}
+
+HAL_StatusTypeDef ODriveCAN_ClearErrors(ODriveCAN_Axis_t *axis)
+{
+    uint8_t data[8] = {0};
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_CLEAR_ERRORS), data, 0U);
+}
+
+HAL_StatusTypeDef ODriveCAN_Reboot(ODriveCAN_Axis_t *axis)
+{
+    uint8_t data[8] = {0};
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_REBOOT), data, 0U);
+}
+
+HAL_StatusTypeDef ODriveCAN_SetLimits(ODriveCAN_Axis_t *axis, float vel_limit, float current_limit)
+{
+    uint8_t data[8];
+    ODriveCAN_PutF32LE(&data[0], vel_limit);
+    ODriveCAN_PutF32LE(&data[4], current_limit);
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_LIMITS), data, 8U);
+}
+
+HAL_StatusTypeDef ODriveCAN_SetTrajVelLimit(ODriveCAN_Axis_t *axis, float traj_vel_limit)
+{
+    uint8_t data[4];
+    ODriveCAN_PutF32LE(data, traj_vel_limit);
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_TRAJ_VEL_LIMIT), data, 4U);
+}
+
+HAL_StatusTypeDef ODriveCAN_SetTrajAccelLimits(ODriveCAN_Axis_t *axis, float accel_limit, float decel_limit)
+{
+    uint8_t data[8];
+    ODriveCAN_PutF32LE(&data[0], accel_limit);
+    ODriveCAN_PutF32LE(&data[4], decel_limit);
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_TRAJ_ACCEL_LIMITS), data, 8U);
+}
+
+HAL_StatusTypeDef ODriveCAN_SetPosGain(ODriveCAN_Axis_t *axis, float pos_gain)
+{
+    uint8_t data[4];
+    ODriveCAN_PutF32LE(data, pos_gain);
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_POS_GAIN), data, 4U);
+}
+
+HAL_StatusTypeDef ODriveCAN_SetVelGains(ODriveCAN_Axis_t *axis, float vel_gain, float vel_integrator_gain)
+{
+    uint8_t data[8];
+    ODriveCAN_PutF32LE(&data[0], vel_gain);
+    ODriveCAN_PutF32LE(&data[4], vel_integrator_gain);
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_VEL_GAINS), data, 8U);
 }
 
 HAL_StatusTypeDef ODriveCAN_SetOutputPos(ODriveCAN_Axis_t *axis, float output_turns, float output_vel_ff, float torque_ff)

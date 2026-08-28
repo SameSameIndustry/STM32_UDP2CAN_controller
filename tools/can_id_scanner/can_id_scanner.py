@@ -1,11 +1,14 @@
 """
-CAN <-> UDP ブリッジ用の簡易GUIツール (v3: ODrive CAN Simple + VESC 両対応)。
+CAN <-> UDP ブリッジ用の簡易GUIツール (v4: GIM6010-8 / GIM8018-8 2台の位置制御 + VESC)。
 STM32(G431_w5500)ファームウェア側の CANUDPBridge (Core/Src/can_udp_bridge.c) と
 UDPで通信し、以下を行う:
   - 受信した生CANフレームの一覧表示 (標準/拡張ID・DLC・Data・STM32側tick_ms)
   - ODrive CAN Simple(標準ID)フレームの自動デコードと、Heartbeat放送からのnode ID自動収集
   - VESCプロトコル(拡張ID)フレームの自動デコードと、STATUS放送からのController ID自動収集
-  - ODrive Quick Control / VESC Quick Control: 直接コマンド送信
+  - 位置制御パネル: GIM6010-8 と GIM8018-8 をそれぞれ別のnode_id/gear_ratioで設定し、
+    出力軸(減速後)の絶対角度で位置制御する (Enable / Set角度 / Idle / Clear Errors)。
+    ファーム側ラッパー gim6010.c / gim8018.c と同じ考え方 (odrive_can 共用 + 出力軸換算)。
+  - VESC Quick Control: 直接コマンド送信
   - 任意のCANフレームの手動送信 (標準/拡張どちらも可)
 
 GIM8018-8はODrive互換と認識されているとのことなので、まずODrive CAN Simple
@@ -69,17 +72,19 @@ VESC_COMMANDS = {
 
 # ---- ODrive CAN Simpleプロトコル (ODrive公式ドキュメント準拠) ----
 ODRIVE_CMD_HEARTBEAT = 0x001
+ODRIVE_CMD_ESTOP = 0x002
 ODRIVE_CMD_SET_AXIS_STATE = 0x007
 ODRIVE_CMD_GET_ENCODER_ESTIMATES = 0x009
 ODRIVE_CMD_SET_CONTROLLER_MODE = 0x00B
 ODRIVE_CMD_SET_INPUT_POS = 0x00C
 ODRIVE_CMD_SET_INPUT_VEL = 0x00D
 ODRIVE_CMD_SET_INPUT_TORQUE = 0x00E
+ODRIVE_CMD_CLEAR_ERRORS = 0x018
 
 ODRIVE_CMD_NAMES = {
-    0x001: "Heartbeat", 0x007: "Set_Axis_State", 0x009: "Get_Encoder_Estimates",
+    0x001: "Heartbeat", 0x002: "Estop", 0x007: "Set_Axis_State", 0x009: "Get_Encoder_Estimates",
     0x00B: "Set_Controller_Mode", 0x00C: "Set_Input_Pos", 0x00D: "Set_Input_Vel",
-    0x00E: "Set_Input_Torque",
+    0x00E: "Set_Input_Torque", 0x018: "Clear_Errors",
 }
 
 ODRIVE_AXIS_STATE_NAMES = {
@@ -225,11 +230,125 @@ class Bridge:
                 self.report_cb(r)
 
 
+class ODriveMotorPanel(ttk.LabelFrame):
+    """1台分の ODrive/GIM モーターの位置制御パネル。node_id と gear_ratio を個別に持ち、
+    出力軸(減速後)の絶対角度で位置制御する。GIM6010-8 と GIM8018-8 で1個ずつ生成する。"""
+
+    def __init__(self, parent, app, title, default_node, default_gear, note=""):
+        super().__init__(parent, text=title, padding=6)
+        self.app = app
+        self.node_var = tk.StringVar(value=str(default_node))
+        self.gear_var = tk.StringVar(value=str(default_gear))
+        self.pos_deg_var = tk.StringVar(value="0")
+        self.vel_var = tk.StringVar(value="0.5")
+        self.fb_var = tk.StringVar(value="(heartbeat未受信)")
+        self._fb_state = ""
+        self._fb_pos = ""
+        self._build(note)
+
+    # -- helpers --
+    def node_id_or_none(self):
+        try:
+            return int(self.node_var.get(), 0)
+        except (ValueError, TypeError):
+            return None
+
+    def gear_or_default(self):
+        try:
+            g = float(self.gear_var.get())
+            return g if g != 0.0 else 1.0
+        except (ValueError, TypeError):
+            return 1.0
+
+    # -- UI --
+    def _build(self, note):
+        pad = dict(padx=4, pady=2)
+        ttk.Label(self, text="Node ID:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self, textvariable=self.node_var, width=5).grid(row=0, column=1, **pad)
+        ttk.Label(self, text="Gear Ratio:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(self, textvariable=self.gear_var, width=6).grid(row=0, column=3, **pad)
+        ttk.Button(self, text="Enable (Position)", command=self.enable_position).grid(row=0, column=4, **pad)
+        ttk.Button(self, text="Idle (停止)", command=self.idle).grid(row=0, column=5, **pad)
+        ttk.Button(self, text="Clear Errors", command=self.clear_errors).grid(row=0, column=6, **pad)
+
+        ttk.Label(self, text="出力軸 絶対角 [deg]:").grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Entry(self, textvariable=self.pos_deg_var, width=10).grid(row=1, column=2, **pad)
+        ttk.Button(self, text="Set 角度", command=self.set_position_deg).grid(row=1, column=3, **pad)
+        ttk.Label(self, text="(参考)速度[turn/s]:").grid(row=1, column=4, sticky="w")
+        ttk.Entry(self, textvariable=self.vel_var, width=7).grid(row=1, column=5, **pad)
+        ttk.Button(self, text="Enable+Vel", command=self.enable_and_set_velocity).grid(row=1, column=6, **pad)
+
+        ttk.Label(self, textvariable=self.fb_var, foreground="#0055aa").grid(
+            row=2, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        if note:
+            ttk.Label(self, text=note, foreground="#777777", wraplength=940, justify="left").grid(
+                row=3, column=0, columnspan=7, sticky="w")
+
+    # -- actions --
+    def _send(self, cmd_id, data):
+        node = self.node_id_or_none()
+        if node is None:
+            messagebox.showerror("エラー", "Node ID の入力が不正です")
+            return False
+        self.app.bridge.send_frame(odrive_id(node, cmd_id), False, data)
+        return True
+
+    def enable_position(self):
+        data = odrive_pack_i32(ODRIVE_CONTROL_MODE_POSITION_CONTROL) + odrive_pack_i32(ODRIVE_INPUT_MODE_POS_FILTER)
+        if self._send(ODRIVE_CMD_SET_CONTROLLER_MODE, data):
+            self._send(ODRIVE_CMD_SET_AXIS_STATE, odrive_pack_u32(ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL))
+
+    def idle(self):
+        self._send(ODRIVE_CMD_SET_AXIS_STATE, odrive_pack_u32(ODRIVE_AXIS_STATE_IDLE))
+
+    def clear_errors(self):
+        self._send(ODRIVE_CMD_CLEAR_ERRORS, b"")
+
+    def set_position_deg(self):
+        try:
+            deg = float(self.pos_deg_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "角度の入力が不正です")
+            return
+        # 入力欄は出力軸換算[deg]。turns に直し gear_ratio でネイティブ単位へ変換して Set_Input_Pos。
+        turns_native = (deg / 360.0) * self.gear_or_default()
+        self._send(ODRIVE_CMD_SET_INPUT_POS, odrive_pack_f32(turns_native) + bytes(4))  # Vel_FF=0, Torque_FF=0
+
+    def enable_and_set_velocity(self):
+        try:
+            vel = float(self.vel_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "速度の入力が不正です")
+            return
+        data = odrive_pack_i32(ODRIVE_CONTROL_MODE_VELOCITY_CONTROL) + odrive_pack_i32(ODRIVE_INPUT_MODE_PASSTHROUGH)
+        if not self._send(ODRIVE_CMD_SET_CONTROLLER_MODE, data):
+            return
+        self._send(ODRIVE_CMD_SET_AXIS_STATE, odrive_pack_u32(ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL))
+        gear = self.gear_or_default()
+        self._send(ODRIVE_CMD_SET_INPUT_VEL, odrive_pack_f32(vel * gear) + odrive_pack_f32(0.0))
+
+    # -- フィードバック更新 (App._pump_queue から node ごとに呼ばれる) --
+    def on_frame(self, node_id, extra, tick_ms):
+        if self.node_id_or_none() != node_id:
+            return
+        gear = self.gear_or_default()
+        if "axis_state" in extra:
+            st = ODRIVE_AXIS_STATE_NAMES.get(extra["axis_state"], str(extra["axis_state"]))
+            err = extra["axis_error"]
+            self._fb_state = f"state={st}  err=0x{err:X}" + ("" if err == 0 else "  ⚠エラー")
+        if "pos" in extra:
+            out_turn = extra["pos"] / gear
+            self._fb_pos = (f"出力軸 pos={out_turn:+.4f} turn ({out_turn * 360.0:+.2f} deg)  "
+                            f"vel={extra['vel'] / gear:+.3f} turn/s")
+        self.fb_var.set("   |   ".join(x for x in (self._fb_state, self._fb_pos) if x)
+                        or f"node {node_id} 受信中...")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("GIM8018-8 CAN Tool (ODrive/VESC, CAN <-> UDP)")
-        self.geometry("1040x820")
+        self.title("GIM6010-8 / GIM8018-8 CAN Tool (ODrive/VESC, CAN <-> UDP)")
+        self.geometry("1060x900")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.report_queue: "queue.Queue" = queue.Queue()
@@ -237,6 +356,7 @@ class App(tk.Tk):
         self.rx_count = 0
         self.odrive_rows = {}  # node_id -> treeview item id
         self.vesc_rows = {}    # controller_id -> treeview item id
+        self.motor_panels = []  # [ODriveMotorPanel, ...]
 
         self._build_ui()
         self.after(50, self._pump_queue)
@@ -271,35 +391,33 @@ class App(tk.Tk):
             self.odrive_tree.column(col, width=owidths[col], anchor="w")
         self.odrive_tree.pack(fill="x")
 
-        # --- ODrive Quick Control ---
-        octrl = ttk.LabelFrame(self, text="ODrive Quick Control", padding=8)
+        # --- 位置制御 (GIM6010-8 / GIM8018-8 の2台対応) ---
+        octrl = ttk.LabelFrame(
+            self, text="位置制御 — 出力軸(減速後)の絶対角度で指令。GIM6010-8 / GIM8018-8 を個別設定",
+            padding=6)
         octrl.pack(fill="x", padx=8, pady=4)
-        ttk.Label(octrl, text="Node ID:").grid(row=0, column=0, sticky="w")
-        self.odrive_node_var = tk.StringVar(value="0")
-        ttk.Entry(octrl, textvariable=self.odrive_node_var, width=6).grid(row=0, column=1, padx=4)
-        ttk.Label(octrl, text="Gear Ratio (出力1回転あたりturns):").grid(row=0, column=2, sticky="w")
-        self.odrive_gear_var = tk.StringVar(value="1.0")
-        ttk.Entry(octrl, textvariable=self.odrive_gear_var, width=6).grid(row=0, column=3, padx=4)
-        ttk.Button(octrl, text="Idle (停止)", command=self.on_odrive_idle).grid(row=0, column=4, padx=4)
 
-        ttk.Button(octrl, text="Enable (Velocity Control)", command=self.on_odrive_enable_vel).grid(row=1, column=0, columnspan=2, pady=(4, 0))
-        ttk.Label(octrl, text="Velocity [turn/s] (出力軸換算):").grid(row=1, column=2, sticky="w", pady=(4, 0))
-        self.odrive_vel_var = tk.StringVar(value="0.5")
-        ttk.Entry(octrl, textvariable=self.odrive_vel_var, width=8).grid(row=1, column=3, padx=4, pady=(4, 0))
-        ttk.Button(octrl, text="Set Velocity", command=self.on_odrive_set_vel).grid(row=1, column=4, padx=4, pady=(4, 0))
+        self.gim6010_panel = ODriveMotorPanel(
+            octrl, self, "GIM6010-8", default_node=1, default_gear=8.0,
+            note="減速比: 公称8.0。デュアルエンコーダで ODrive が出力軸エンコーダを位置FBに使う設定なら"
+                 "1.0 にする(IDLEで出力軸を手でちょうど1回転させ、上の表 Pos[turn] の変化量が8.0か1.0かで判定)。")
+        self.gim6010_panel.pack(fill="x", pady=2)
+        self.motor_panels.append(self.gim6010_panel)
 
-        ttk.Button(octrl, text="Enable (Position Control)", command=self.on_odrive_enable_pos).grid(row=2, column=0, columnspan=2, pady=(4, 0))
-        ttk.Label(octrl, text="Position [turn] (出力軸換算):").grid(row=2, column=2, sticky="w", pady=(4, 0))
-        self.odrive_pos_var = tk.StringVar(value="0.0")
-        ttk.Entry(octrl, textvariable=self.odrive_pos_var, width=8).grid(row=2, column=3, padx=4, pady=(4, 0))
-        ttk.Button(octrl, text="Set Position", command=self.on_odrive_set_pos).grid(row=2, column=4, padx=4, pady=(4, 0))
+        self.gim8018_panel = ODriveMotorPanel(
+            octrl, self, "GIM8018-8", default_node=0, default_gear=8.0,
+            note="node_id の既定はファーム main.c の GIM_NODE_ID(=0) 準拠。実機の node_id は上の表で確認。"
+                 "減速比の考え方は GIM6010-8 と同じ。")
+        self.gim8018_panel.pack(fill="x", pady=2)
+        self.motor_panels.append(self.gim8018_panel)
 
         ttk.Label(
             octrl,
-            text="⚠ 負荷を外した状態・電流制限をかけた電源で、Enable後にまず小さい値から試すこと。"
-                 "Gear Ratioが実機と違うと指令値と実移動量がずれる(odrive_can.hのコメント参照)。",
-            foreground="red", wraplength=860, justify="left",
-        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(4, 0))
+            text="⚠ 負荷を外し電流制限をかけた電源で、Enable後にまず小さい角度から試すこと。"
+                 "Gear Ratio が実機と違うと指令値と実移動量がずれる(odrive_can.h / gim8018.h のコメント参照)。"
+                 "絶対角なので Set した角度へそのまま動く(相対移動ではない)。",
+            foreground="red", wraplength=1000, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
 
         # --- VESC status ---
         vstat = ttk.LabelFrame(self, text="VESC status (自動収集。比較用の保険)", padding=8)
@@ -386,69 +504,11 @@ class App(tk.Tk):
         self.bridge.connect(self.ip_var.get(), port)
         self.status_var.set(f"接続先: {self.ip_var.get()}:{port} (登録パケット送信済み)")
 
-    def _odrive_node_and_gear(self):
-        node_id = int(self.odrive_node_var.get())
-        gear_ratio = float(self.odrive_gear_var.get())
-        if gear_ratio == 0.0:
-            gear_ratio = 1.0
-        return node_id, gear_ratio
-
-    def on_odrive_enable_vel(self):
-        try:
-            node_id, _ = self._odrive_node_and_gear()
-        except ValueError:
-            messagebox.showerror("エラー", "Node ID / Gear Ratioの入力が不正です")
-            return
-        # Set_Controller_Mode(VELOCITY_CONTROL, PASSTHROUGH)
-        data = odrive_pack_i32(ODRIVE_CONTROL_MODE_VELOCITY_CONTROL) + odrive_pack_i32(ODRIVE_INPUT_MODE_PASSTHROUGH)
-        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_CONTROLLER_MODE), False, data)
-        # Set_Axis_Requested_State(CLOSED_LOOP_CONTROL)
-        data = odrive_pack_u32(ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL)
-        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_AXIS_STATE), False, data)
-
-    def on_odrive_enable_pos(self):
-        try:
-            node_id, _ = self._odrive_node_and_gear()
-        except ValueError:
-            messagebox.showerror("エラー", "Node ID / Gear Ratioの入力が不正です")
-            return
-        # Set_Controller_Mode(POSITION_CONTROL, POS_FILTER)
-        data = odrive_pack_i32(ODRIVE_CONTROL_MODE_POSITION_CONTROL) + odrive_pack_i32(ODRIVE_INPUT_MODE_POS_FILTER)
-        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_CONTROLLER_MODE), False, data)
-        # Set_Axis_Requested_State(CLOSED_LOOP_CONTROL)
-        data = odrive_pack_u32(ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL)
-        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_AXIS_STATE), False, data)
-
-    def on_odrive_idle(self):
-        try:
-            node_id, _ = self._odrive_node_and_gear()
-        except ValueError:
-            messagebox.showerror("エラー", "Node ID / Gear Ratioの入力が不正です")
-            return
-        data = odrive_pack_u32(ODRIVE_AXIS_STATE_IDLE)
-        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_AXIS_STATE), False, data)
-
-    def on_odrive_set_vel(self):
-        try:
-            node_id, gear_ratio = self._odrive_node_and_gear()
-            vel = float(self.odrive_vel_var.get())
-        except ValueError:
-            messagebox.showerror("エラー", "Node ID / Gear Ratio / Velocityの入力が不正です")
-            return
-        # 入力欄は出力軸換算[turn/s]。gear_ratioでネイティブ単位に変換して送る
-        data = odrive_pack_f32(vel * gear_ratio) + odrive_pack_f32(0.0)
-        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_INPUT_VEL), False, data)
-
-    def on_odrive_set_pos(self):
-        try:
-            node_id, gear_ratio = self._odrive_node_and_gear()
-            pos = float(self.odrive_pos_var.get())
-        except ValueError:
-            messagebox.showerror("エラー", "Node ID / Gear Ratio / Positionの入力が不正です")
-            return
-        # 入力欄は出力軸換算[turn]。gear_ratioでネイティブ単位に変換して送る
-        data = odrive_pack_f32(pos * gear_ratio) + bytes(4)  # Vel_FF=0, Torque_FF=0
-        self.bridge.send_frame(odrive_id(node_id, ODRIVE_CMD_SET_INPUT_POS), False, data)
+    def _gear_for_node(self, node_id):
+        for panel in self.motor_panels:
+            if panel.node_id_or_none() == node_id:
+                return panel.gear_or_default()
+        return 1.0
 
     def on_vesc_send(self):
         try:
@@ -500,6 +560,8 @@ class App(tk.Tk):
                         self._update_odrive_row(node_id, extra, None, None, tick_ms)
                     elif "pos" in extra:
                         self._update_odrive_row(node_id, None, extra["pos"], extra["vel"], tick_ms)
+                    for panel in self.motor_panels:
+                        panel.on_frame(node_id, extra, tick_ms)
 
                 vesc = decode_vesc(can_id, is_extended, data)
                 if vesc:
@@ -533,13 +595,7 @@ class App(tk.Tk):
         if pos is not None:
             cur[3] = f"{pos:.3f}"
             cur[4] = f"{vel:.3f}"
-            try:
-                gear_ratio = float(self.odrive_gear_var.get())
-                if gear_ratio == 0.0:
-                    gear_ratio = 1.0
-            except (ValueError, AttributeError):
-                gear_ratio = 1.0
-            cur[5] = f"{pos / gear_ratio:.3f}"
+            cur[5] = f"{pos / self._gear_for_node(node_id):.3f}"
         cur[6] = tick_ms
         self.odrive_tree.item(item, values=cur)
 
