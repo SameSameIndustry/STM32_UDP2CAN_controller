@@ -244,6 +244,13 @@ class ODriveMotorPanel(ttk.LabelFrame):
         self.fb_var = tk.StringVar(value="(heartbeat未受信)")
         self._fb_state = ""
         self._fb_pos = ""
+        # ゼロ点校正 (旧コードの offset_ax4 等を模倣): 「現在位置を出力軸0度とする」を
+        # 押した瞬間の生pos_estimate(ネイティブturns)を記憶し、以後はこれを基準にした
+        # 相対角度で位置指令・位置表示を行う。素の絶対エンコーダ値は個体差・据付角度で
+        # バラバラなので、これが無いと「0度を指令」しても意味のある物理角度にならない。
+        self.zero_offset_native = 0.0
+        self.zero_offset_var = tk.StringVar(value="0.0")
+        self._last_pos_native = None  # 直近受信したネイティブ(モーター軸)pos_estimate
         self._build(note)
 
     # -- helpers --
@@ -278,11 +285,18 @@ class ODriveMotorPanel(ttk.LabelFrame):
         ttk.Entry(self, textvariable=self.vel_var, width=7).grid(row=1, column=5, **pad)
         ttk.Button(self, text="Enable+Vel", command=self.enable_and_set_velocity).grid(row=1, column=6, **pad)
 
+        # ゼロ点校正: 現在位置を出力軸0度として覚えさせる (旧コードの手動オフセット定数に相当)
+        ttk.Button(self, text="現在位置をゼロ設定", command=self.set_zero_here).grid(row=2, column=0, columnspan=2, **pad)
+        ttk.Label(self, text="オフセット[turn,native]:").grid(row=2, column=2, sticky="w")
+        ttk.Entry(self, textvariable=self.zero_offset_var, width=10).grid(row=2, column=3, **pad)
+        ttk.Button(self, text="適用", command=self.apply_zero_offset_entry).grid(row=2, column=4, **pad)
+        ttk.Button(self, text="ゼロ解除(0に戻す)", command=self.clear_zero_offset).grid(row=2, column=5, columnspan=2, **pad)
+
         ttk.Label(self, textvariable=self.fb_var, foreground="#0055aa").grid(
-            row=2, column=0, columnspan=7, sticky="w", pady=(4, 0))
+            row=3, column=0, columnspan=7, sticky="w", pady=(4, 0))
         if note:
             ttk.Label(self, text=note, foreground="#777777", wraplength=940, justify="left").grid(
-                row=3, column=0, columnspan=7, sticky="w")
+                row=4, column=0, columnspan=7, sticky="w")
 
     # -- actions --
     def _send(self, cmd_id, data):
@@ -310,9 +324,31 @@ class ODriveMotorPanel(ttk.LabelFrame):
         except ValueError:
             messagebox.showerror("エラー", "角度の入力が不正です")
             return
-        # 入力欄は出力軸換算[deg]。turns に直し gear_ratio でネイティブ単位へ変換して Set_Input_Pos。
-        turns_native = (deg / 360.0) * self.gear_or_default()
+        # 入力欄は「ゼロ設定した基準からの」出力軸絶対角[deg]。
+        # turns に直しgear_ratioでネイティブ単位へ変換したうえで、zero_offset_native
+        # (「現在位置をゼロ設定」した時点の生pos_estimate)を足してSet_Input_Posへ送る。
+        # これが無いと、送る値は常にエンコーダの生ゼロ点基準になり、据付角度・個体差の
+        # ぶんだけ実際の物理角とずれる(旧コードのoffset_ax4/offset_ax5と同じ役割)。
+        turns_native = self.zero_offset_native + (deg / 360.0) * self.gear_or_default()
         self._send(ODRIVE_CMD_SET_INPUT_POS, odrive_pack_f32(turns_native) + bytes(4))  # Vel_FF=0, Torque_FF=0
+
+    def set_zero_here(self):
+        if self._last_pos_native is None:
+            messagebox.showerror("エラー", "まだこのnode_idからのGet_Encoder_Estimatesを受信していません。"
+                                            "接続・node_idを確認してください。")
+            return
+        self.zero_offset_native = self._last_pos_native
+        self.zero_offset_var.set(f"{self.zero_offset_native:.4f}")
+
+    def apply_zero_offset_entry(self):
+        try:
+            self.zero_offset_native = float(self.zero_offset_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "オフセットの入力が不正です")
+
+    def clear_zero_offset(self):
+        self.zero_offset_native = 0.0
+        self.zero_offset_var.set("0.0")
 
     def enable_and_set_velocity(self):
         try:
@@ -337,9 +373,12 @@ class ODriveMotorPanel(ttk.LabelFrame):
             err = extra["axis_error"]
             self._fb_state = f"state={st}  err=0x{err:X}" + ("" if err == 0 else "  ⚠エラー")
         if "pos" in extra:
-            out_turn = extra["pos"] / gear
-            self._fb_pos = (f"出力軸 pos={out_turn:+.4f} turn ({out_turn * 360.0:+.2f} deg)  "
-                            f"vel={extra['vel'] / gear:+.3f} turn/s")
+            self._last_pos_native = extra["pos"]
+            # ゼロ設定した基準からの相対角度で表示 (Set 角度 に入れる値と同じ基準)
+            rel_turn = (extra["pos"] - self.zero_offset_native) / gear
+            abs_turn = extra["pos"] / gear
+            self._fb_pos = (f"出力軸 pos(ゼロ基準)={rel_turn:+.4f} turn ({rel_turn * 360.0:+.2f} deg)  "
+                            f"[絶対:{abs_turn:+.4f} turn]  vel={extra['vel'] / gear:+.3f} turn/s")
         self.fb_var.set("   |   ".join(x for x in (self._fb_state, self._fb_pos) if x)
                         or f"node {node_id} 受信中...")
 
