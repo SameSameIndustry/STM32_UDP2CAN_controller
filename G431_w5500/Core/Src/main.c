@@ -177,10 +177,18 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
 
+  // 修正2: W5500の電源投入/リセット解除タイミング競合対策。
+  //   基板は バッテリ→XL1509(5V)→AMS1117(3.3V) で大容量コンデンサ(C4 470uF等)を
+  //   充電するため、3.3Vレールの立ち上がりに数十msかかる。MCUはそれより速く起動
+  //   するので、電源が規定電圧に達する前にRSTnを解除するとW5500内部PLL/PHYが
+  //   ロックできず、以後SPIは一見応答するのに通信できない状態(電源再投入まで復帰
+  //   しない)になる。まずレール安定を待ってからリセットし、解除後の待ちも延ばす。
+  HAL_Delay(200);                                        // 3.3Vレール安定待ち
+
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);
-  HAL_Delay(10);
+  HAL_Delay(10);                                         // RSTn Low (最低500us、余裕をみて10ms)
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
-  HAL_Delay(50);
+  HAL_Delay(150);                                        // PLLロック+安定待ち (旧50ms→150ms)
   // 初期色
 
   for (int i = 0; i < LED_NUM; i++) {

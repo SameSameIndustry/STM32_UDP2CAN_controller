@@ -197,7 +197,16 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* USER CODE BEGIN SPI1_MspInit 1 */
-
+    /* 修正1: W5500のSPIは24MHz動作。CubeMX既定の GPIO_SPEED_FREQ_LOW
+       (STM32G4で~2MHz相当のスルーレート) ではSCK/MOSIのエッジが鈍り、
+       電源投入直後のSPI通信が個体差・温度で不安定になる。
+       SCK/MISO/MOSI を VERY_HIGH に上書きする (CubeMX再生成でこのブロックは保持される)。 */
+    GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
     /* USER CODE END SPI1_MspInit 1 */
 
   }
