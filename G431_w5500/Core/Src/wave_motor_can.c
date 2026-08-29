@@ -25,6 +25,7 @@ void WaveMotorCAN_Init(WaveMotorCAN_t *m, uint32_t node_id)
     m->toggle_count = 0U;
     m->at_plus = 0U;
     m->started = 0U;
+    m->swinging = 0U;
     m->finished = 0U;
 }
 
@@ -72,12 +73,27 @@ void WaveMotorCAN_UpdateSwingThenHome(WaveMotorCAN_t *m, float amplitude_deg,
     now = HAL_GetTick();
 
     if (!m->started) {
-        /* 初回呼び出し: +amplitude側から動作を開始する */
+        /* 初回呼び出し: いきなり±amplitude_degへ動かすと、起動直後の実位置が
+         * 0度からズレている場合に一瞬逆向きに動いてから戻るような不自然な動きに
+         * なることがある(実機で確認)。まず明示的に0度(絶対原点)へ戻すコマンドを
+         * 送り、半周期分待って実位置が落ち着いてから実際のスイングを開始する。 */
+        WaveMotorCAN_SetTargetOffsetDeg(m, 0.0f);
+        m->swinging = 0U;
+        m->last_tick = now;
+        m->started = 1U;
+        return;
+    }
+
+    if (!m->swinging) {
+        if ((now - m->last_tick) < half_period_ms) {
+            return;
+        }
+        /* 0度復帰の待ちが終わった。ここから実際のスイングを開始する */
         WaveMotorCAN_SetTargetOffsetDeg(m, amplitude_deg);
         m->at_plus = 1U;
         m->toggle_count = 0U;
         m->last_tick = now;
-        m->started = 1U;
+        m->swinging = 1U;
         return;
     }
 

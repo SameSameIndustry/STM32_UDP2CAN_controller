@@ -31,7 +31,8 @@ typedef struct {
     uint32_t last_tick;           /* WaveMotorCAN_UpdateSwingThenHome() が使う内部状態 */
     uint32_t toggle_count;        /* これまでに送った半周期分の切替回数 */
     uint8_t  at_plus;             /* 1=現在+amplitude側を指令済み, 0=-amplitude側 */
-    uint8_t  started;             /* 初回呼び出し判定 */
+    uint8_t  started;             /* 初回呼び出し判定(0度への原点復帰コマンド送信済みか) */
+    uint8_t  swinging;            /* 原点復帰の待ちが終わり、実際のスイングを開始したか */
     uint8_t  finished;            /* 指定回数のスイングを終え0度に戻したら1、以後は何もしない */
 } WaveMotorCAN_t;
 
@@ -48,13 +49,18 @@ HAL_StatusTypeDef WaveMotorCAN_SetTargetOffsetCount(WaveMotorCAN_t *m, int16_t o
 HAL_StatusTypeDef WaveMotorCAN_SetTargetOffsetDeg(WaveMotorCAN_t *m, float offset_deg);
 
 /*
- * +amplitude_deg ⇔ -amplitude_deg を period_ms周期でcycle_count回スイングした後、
- * オフセット0(絶対原点)へ戻して停止する一連の動作。呼び出し側はメインループ毎回
- * これを呼ぶだけでよい(非ブロッキング)。指定回数のスイングを終えて0度に戻した後は
- * 何もしない(再度動かしたい場合はWaveMotorCAN_Init()でリセットすること)。
+ * まず0度(絶対原点)へ戻すコマンドを送り、半周期(period_ms/2)待って実位置が
+ * 落ち着いてから、+amplitude_deg ⇔ -amplitude_deg を period_ms周期でcycle_count回
+ * スイングし、最後にオフセット0(絶対原点)へ戻して停止する一連の動作。呼び出し側は
+ * メインループ毎回これを呼ぶだけでよい(非ブロッキング)。指定回数のスイングを終えて
+ * 0度に戻した後は何もしない(再度動かしたい場合はWaveMotorCAN_Init()でリセットすること)。
+ * ⚠ 起動直後の実位置が0度からズレていると、いきなり±amplitude_degへ動かした際に
+ *   一瞬逆向きに動いてから戻るような不自然な動きになることがあるため、必ず先に
+ *   0度復帰を挟む(実機で確認された挙動)。
  *   例:「±90度のスイングを10秒周期で5回実行した後0度に戻す」
  *      = WaveMotorCAN_UpdateSwingThenHome(m, 90.0f, 10000U, 5U)
- *      (+90°から動作開始、5秒ごとに±90°を切替え、5周期(50秒)後に0°へ)
+ *      (まず0°へ復帰命令→5秒待ち→+90°から動作開始、5秒ごとに±90°を切替え、
+ *       5周期(50秒)後に0°へ)
  */
 void WaveMotorCAN_UpdateSwingThenHome(WaveMotorCAN_t *m, float amplitude_deg,
                                        uint32_t period_ms, uint32_t cycle_count);

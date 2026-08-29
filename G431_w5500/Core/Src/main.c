@@ -392,18 +392,10 @@ int main(void)
         // (ループ1周分)ずれるだけで、動作自体はほぼそのまま。
         if ((hb_seq % 2U) == 0U) {
 #if TTL_SERVO_SEND_ENABLED
-            // OPEN(Data[0]=0x02)/CLOSE(Data[0]=0x03)固定コマンドではなく、
-            // SET_TARGET(Data[0]=0x01)でOPEN(+50°)/CLOSE(-25°)と同じ移動量を再現する。
-            // (OPENのコマンドバイト0x02が旧wave motorプロトコルのSET_ORIGINと
-            // 衝突していた可能性の切り分けのため。SET_TARGETならコマンドバイトは
-            // 常に0x01で、旧wave motorプロトコルのRESET/SET_TARGET/SET_ORIGINの
-            // いずれとも衝突しない)
-            // ⚠ TTLServoCAN_UpdateTargetToggleDeg()は"絶対位置"を交互に送るため
-            //    移動量が|50-(-25)|=75°になってしまい、OPEN/CLOSE本来の移動量
-            //    (50°→-25°の相対、実測で移動量が倍近くに感じられた)と違ってしまう。
-            //    TTLServoCAN_UpdateTargetDeltaToggleDeg()はSTM32側で目標値を積算して
-            //    送るので、OPEN/CLOSEを直接送った場合と同じ移動量になる。
-            TTLServoCAN_UpdateTargetDeltaToggleDeg(&ttl_servo, 50.0f, -25.0f, WAVE_MOTOR_SWING_PERIOD_MS);
+            // TTLサーボの新プロトコル(CAN_PROTOCOL_TTL-SERVO.md): OPEN/CLOSEは廃止され、
+            // SET_TARGET(Data[0]=0x01固定)で絶対原点(180°)からの符号付きオフセットのみ。
+            // +50°/-25°を交互に送る。
+            TTLServoCAN_UpdateTargetOffsetToggleDeg(&ttl_servo, 50.0f, -25.0f, WAVE_MOTOR_SWING_PERIOD_MS);
 #endif
         } else {
             // wave motor基板 (CAN ID 0x11, 0x12) を±90°で5周期(10秒周期)スイングさせた後、
