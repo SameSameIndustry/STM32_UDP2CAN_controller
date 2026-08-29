@@ -20,6 +20,9 @@ static HAL_StatusTypeDef TTLServoCAN_SendCmd(const TTLServoCAN_t *s, uint8_t cmd
 void TTLServoCAN_Init(TTLServoCAN_t *s, uint32_t node_id)
 {
     s->node_id = node_id;
+    s->last_toggle_tick = 0U;
+    s->open_next = 1U;
+    s->started = 0U;
 }
 
 HAL_StatusTypeDef TTLServoCAN_Reset(TTLServoCAN_t *s)
@@ -61,4 +64,29 @@ HAL_StatusTypeDef TTLServoCAN_Open(TTLServoCAN_t *s)
 HAL_StatusTypeDef TTLServoCAN_Close(TTLServoCAN_t *s)
 {
     return TTLServoCAN_SendCmd(s, TTL_SERVO_CMD_CLOSE, NULL, 0U);
+}
+
+void TTLServoCAN_UpdateOpenCloseToggle(TTLServoCAN_t *s, uint32_t period_ms)
+{
+    uint32_t half_period_ms = period_ms / 2U;
+    uint32_t now = HAL_GetTick();
+
+    if (!s->started) {
+        /* 初回呼び出し: OPENから動作を開始する */
+        TTLServoCAN_Open(s);
+        s->open_next = 0U;
+        s->last_toggle_tick = now;
+        s->started = 1U;
+        return;
+    }
+
+    if ((now - s->last_toggle_tick) >= half_period_ms) {
+        if (s->open_next) {
+            TTLServoCAN_Open(s);
+        } else {
+            TTLServoCAN_Close(s);
+        }
+        s->open_next = (uint8_t)(!s->open_next);
+        s->last_toggle_tick = now;
+    }
 }

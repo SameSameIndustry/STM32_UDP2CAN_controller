@@ -3,6 +3,8 @@
 static FDCAN_HandleTypeDef *s_hfdcan = NULL;
 static CANBus_RxHandler_t s_rx_handlers[CANBUS_MAX_RX_HANDLERS];
 static uint8_t s_rx_handler_count = 0U;
+static uint32_t s_bus_off_recoveries = 0U;
+static uint32_t s_tx_queue_failures = 0U;
 
 void CANBus_Init(FDCAN_HandleTypeDef *hfdcan)
 {
@@ -44,7 +46,16 @@ static HAL_StatusTypeDef CANBus_Send(uint32_t id, uint32_t id_type, const uint8_
     TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     TxHeader.MessageMarker = 0;
 
-    return HAL_FDCAN_AddMessageToTxFifoQ(s_hfdcan, &TxHeader, (uint8_t *)data);
+    {
+        HAL_StatusTypeDef status = HAL_FDCAN_AddMessageToTxFifoQ(s_hfdcan, &TxHeader, (uint8_t *)data);
+        if (status != HAL_OK) {
+            /* Tx FIFO/Queueは3要素しかない(STM32G4 HW仕様)。ここに来る主な原因は
+             * FIFO満杯(先行フレームがまだ送信/破棄されていない)。呼び出し側は戻り値を
+             * 見ていないことが多いので、ここでカウンタに残して診断可能にしておく。 */
+            s_tx_queue_failures++;
+        }
+        return status;
+    }
 }
 
 HAL_StatusTypeDef CANBus_SendStd(uint32_t std_id, const uint8_t *data, uint8_t len)
@@ -55,6 +66,37 @@ HAL_StatusTypeDef CANBus_SendStd(uint32_t std_id, const uint8_t *data, uint8_t l
 HAL_StatusTypeDef CANBus_SendExt(uint32_t ext_id, const uint8_t *data, uint8_t len)
 {
     return CANBus_Send(ext_id, FDCAN_EXTENDED_ID, data, len);
+}
+
+void CANBus_Poll(void)
+{
+    FDCAN_ProtocolStatusTypeDef proto_status;
+
+    if (s_hfdcan == NULL) {
+        return;
+    }
+    if (HAL_FDCAN_GetProtocolStatus(s_hfdcan, &proto_status) != HAL_OK) {
+        return;
+    }
+    if (proto_status.BusOff) {
+        /* Bus-Offはハードウェアが勝手に復帰しない。INITビットを一度立ててから
+         * 下ろす(Stop->Start)とBus-Off回復シーケンスが走り、送受信を再開できる。
+         * HAL_FDCAN_Stop/Start はIE(割り込み有効化)やフィルタ設定には触れないので
+         * 再度ActivateNotification等をやり直す必要はない。 */
+        HAL_FDCAN_Stop(s_hfdcan);
+        HAL_FDCAN_Start(s_hfdcan);
+        s_bus_off_recoveries++;
+    }
+}
+
+uint32_t CANBus_GetBusOffRecoveries(void)
+{
+    return s_bus_off_recoveries;
+}
+
+uint32_t CANBus_GetTxQueueFailures(void)
+{
+    return s_tx_queue_failures;
 }
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)

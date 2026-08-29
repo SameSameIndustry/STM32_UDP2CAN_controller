@@ -30,7 +30,6 @@
 #include "dji_c610.h"
 #include "odrive_can.h"
 #include "vesc_can.h"
-#include "ttl_servo_can.h"
 #include "wave_motor_can.h"
 /* USER CODE END Includes */
 
@@ -65,15 +64,14 @@
 
 #define C610_ESC_ID  1U   // C610本体のダイヤル/DIPスイッチで設定したID (1-8)
 
-// TTLサーボ基板 (プロジェクトルートの CAN_PROTOCOL_TTL-SERVO.md 参照、受信専用)。
-// この基板の node_id (仕様書の既定値は0x21)。
-#define TTL_SERVO_NODE_ID 0x21U
-
 // wave motor基板 (プロジェクトルートの CAN_PROTOCOL_wave_motor.md 参照、受信専用)。
-// この基板の node_id (仕様書の既定値は0x11)。
-#define WAVE_MOTOR_NODE_ID 0x11U
-#define WAVE_MOTOR_SWING_AMPLITUDE_DEG 90.0f    // 0°⇔90°のスイング
-#define WAVE_MOTOR_SWING_PERIOD_MS     10000U   // 1往復(10秒)で1周期
+// 同じ機種がnode_id 0x11と0x12の2台接続されている。2台目(0x12)は振幅の符号を
+// 反転させて呼ぶことで、同じタイミングで逆向きにスイングさせる。
+#define WAVE_MOTOR_1_NODE_ID 0x11U
+#define WAVE_MOTOR_2_NODE_ID 0x12U
+#define WAVE_MOTOR_SWING_AMPLITUDE_DEG 90.0f    // ±90°のスイング
+#define WAVE_MOTOR_SWING_PERIOD_MS     10000U   // 1周期10秒 (+90°⇔-90°を5秒ごとに切替)
+#define WAVE_MOTOR_SWING_CYCLE_COUNT   5U       // 5周期実行したら0°に戻して停止
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U
 /* USER CODE END PD */
@@ -94,8 +92,8 @@ DMA_HandleTypeDef hdma_tim1_ch1;
 /* USER CODE BEGIN PV */
 ODriveCAN_Axis_t gim_axis;         // GIM8018-8 (本命: ODrive CAN Simple)
 VescCAN_Motor_t vesc_test_motor;   // 比較用 (受信のみ監視、VESCプロトコルだった場合の保険)
-TTLServoCAN_t ttl_servo;           // TTLサーボ基板 (CAN_PROTOCOL_TTL-SERVO.md, node_id=0x21)
-WaveMotorCAN_t wave_motor;         // wave motor基板 (CAN_PROTOCOL_wave_motor.md, node_id=0x11)
+WaveMotorCAN_t wave_motor;         // wave motor基板 1台目 (CAN_PROTOCOL_wave_motor.md, node_id=0x11)
+WaveMotorCAN_t wave_motor2;        // wave motor基板 2台目 (同一機種, node_id=0x12、逆向きにスイング)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -143,13 +141,15 @@ void W5500_WriteByte(uint8_t wb) {
     HAL_SPI_Transmit(&hspi1, &wb, 1, HAL_MAX_DELAY);
 }
 
-// HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングを
-// 挟むことで、PCからのCAN送信コマンドへの応答性を確保する (数msの粒度)
+// HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングと
+// CANBus_Poll()(Bus-Off検出・自動復帰)を挟むことで、PCからのCAN送信コマンドへの
+// 応答性と、CAN通信が止まったままにならないことを確保する (数msの粒度)
 static void Delay_WithCANPoll(uint32_t ms)
 {
     uint32_t start = HAL_GetTick();
     while ((HAL_GetTick() - start) < ms) {
         CANUDPBridge_Poll();
+        CANBus_Poll();
         HAL_Delay(5);
     }
 }
@@ -276,11 +276,9 @@ int main(void)
   // 比較用: VESCプロトコルだった場合に備え、受信のみ監視する(コマンドは送らない)
   VescCAN_Init(&vesc_test_motor, VESC_TEST_ID);
 
-  // TTLサーボ基板 (受信専用) の初期化。実機へは何も送信しない。
-  TTLServoCAN_Init(&ttl_servo, TTL_SERVO_NODE_ID);
-
   // wave motor基板 (受信専用) の初期化。実機へは何も送信しない。
-  WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_NODE_ID);
+  WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_1_NODE_ID);
+  WaveMotorCAN_Init(&wave_motor2, WAVE_MOTOR_2_NODE_ID);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -292,11 +290,19 @@ int main(void)
     /* USER CODE BEGIN 3 */
 	    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
 
-        // ハートビート送信 (ループ1周につき1回、約1.5秒間隔)
+        // ハートビート送信 (ループ1周につき1回、約1.5秒間隔)。
+        // canBusOff はCAN Bus-Offからの自動復帰回数(CANBus_Poll()参照)。0以外なら
+        // どこかのCANノード宛の送信でACKが返らずBus-Offになったことがある = 配線/
+        // 相手側の設定(ボーレート・node_id)を疑うべきサイン。
+        // txQFail はTx FIFO満杯等でCAN送信キューへの投入自体に失敗した回数
+        // (CANBus_GetTxQueueFailures()参照)。増え続けているなら、どこかのノード宛の
+        // 送信が詰まって他ノードの送信も巻き添えで失敗している可能性が高い。
         {
-            char hb_msg[48];
-            int hb_len = snprintf(hb_msg, sizeof(hb_msg), "HB seq=%lu tick=%lu\r\n",
-                                   (unsigned long)hb_seq++, (unsigned long)HAL_GetTick());
+            char hb_msg[80];
+            int hb_len = snprintf(hb_msg, sizeof(hb_msg), "HB seq=%lu tick=%lu canBusOff=%lu txQFail=%lu\r\n",
+                                   (unsigned long)hb_seq++, (unsigned long)HAL_GetTick(),
+                                   (unsigned long)CANBus_GetBusOffRecoveries(),
+                                   (unsigned long)CANBus_GetTxQueueFailures());
             if (hb_len > 0) {
                 sendto(HEARTBEAT_SN, (uint8_t*)hb_msg, (uint16_t)hb_len, hb_broadcast_ip, HEARTBEAT_PORT);
             }
@@ -358,28 +364,15 @@ int main(void)
             ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
         }
 
-        // TTLサーボ基板 (CAN ID 0x21) へOPEN/CLOSEを交互に送信する動作確認コード。
-        // ループ2周(約3秒: Delay_WithCANPoll(500)×3 が1周)ごとに切り替える。
-        {
-            static uint8_t ttl_toggle_count = 0U;
-            static uint8_t ttl_open_next = 1U;   // 次に送るのがOPENなら1、CLOSEなら0
-
-            ttl_toggle_count++;
-            if (ttl_toggle_count >= 2U) {
-                ttl_toggle_count = 0U;
-                if (ttl_open_next) {
-                    TTLServoCAN_Open(&ttl_servo);
-                } else {
-                    TTLServoCAN_Close(&ttl_servo);
-                }
-                ttl_open_next = !ttl_open_next;
-            }
-        }
-
-        // wave motor基板 (CAN ID 0x11) を90°⇔0°で往復させる (10秒周期)。
-        // WaveMotorCAN_UpdateSwing()内部でHAL_GetTick()を見て非ブロッキングに
-        // 送信するので、ここでは毎ループ呼ぶだけでよい。
-        WaveMotorCAN_UpdateSwing(&wave_motor, WAVE_MOTOR_SWING_AMPLITUDE_DEG, WAVE_MOTOR_SWING_PERIOD_MS);
+        // wave motor基板 (CAN ID 0x11, 0x12) を±90°で5周期(10秒周期)スイングさせた後、
+        // 0°に戻して停止する。WaveMotorCAN_UpdateSwingThenHome()内部でHAL_GetTick()を
+        // 見て非ブロッキングに送信し、完了後は何もしなくなるので、ここでは毎ループ
+        // 呼ぶだけでよい。2台目(0x12)は振幅の符号を反転させて呼ぶだけで、同じタイミング
+        // で逆向きにスイングする(両方とも同じループ周回内で呼ぶので開始tickもほぼ揃う)。
+        WaveMotorCAN_UpdateSwingThenHome(&wave_motor, WAVE_MOTOR_SWING_AMPLITUDE_DEG,
+                                          WAVE_MOTOR_SWING_PERIOD_MS, WAVE_MOTOR_SWING_CYCLE_COUNT);
+        WaveMotorCAN_UpdateSwingThenHome(&wave_motor2, -WAVE_MOTOR_SWING_AMPLITUDE_DEG,
+                                          WAVE_MOTOR_SWING_PERIOD_MS, WAVE_MOTOR_SWING_CYCLE_COUNT);
 
   }
   /* USER CODE END 3 */
@@ -443,13 +436,20 @@ static void MX_FDCAN1_Init(void)
   /* USER CODE END FDCAN1_Init 0 */
 
   /* USER CODE BEGIN FDCAN1_Init 1 */
-
+  // ⚠ CubeMX再生成でここが書き換わったら要注意: AutoRetransmissionは意図的にDISABLE
+  // にしている。STM32G4のFDCAN Tx FIFO/QueueはHW的に3要素しかない(HALの
+  // SRAMCAN_TFQ_NBR=3固定)。ENABLEだとACKが返らない(未配線/未設定/電源off等の)
+  // ノード宛のフレームが無限リトライされ続けてFIFOの先頭を永久に占有し、その後ろに
+  // 積んだ他ノード宛のフレームがHAL_FDCAN_AddMessageToTxFifoQ()でHAL_ERROR(満杯)を
+  // 返して黙って送信キューに入れなくなる(＝一部のノードだけ動かなくなる)。DISABLEなら
+  // 1回失敗した時点でそのフレームを諦めてFIFOを空けるので、この詰まりが起きない。
+  // 位置制御コマンドはどうせ毎ループ再送しているので、単発のロストがあっても実害は無い。
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = ENABLE;
+  hfdcan1.Init.AutoRetransmission = DISABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
   hfdcan1.Init.NominalPrescaler = 3;

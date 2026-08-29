@@ -31,6 +31,24 @@ HAL_StatusTypeDef CANBus_SendStd(uint32_t std_id, const uint8_t *data, uint8_t l
  * (例: VESCプロトコル / GIM8018-8) */
 HAL_StatusTypeDef CANBus_SendExt(uint32_t ext_id, const uint8_t *data, uint8_t len);
 
+/* Bus-Off状態を検出したら自動復帰(Stop->Start)する。main.cのメインループから
+ * 定期的に(Delay_WithCANPoll()の中など)呼ぶこと。
+ *
+ * AutoRetransmission=ENABLEのため、配線ミス・未接続・ボーレート不一致などで
+ * ACKが返らないノード宛に送信し続けるとTxErrorCntが積み上がりBus-Offに陥る。
+ * FDCANペリフェラルはBus-Offになってもハードウェアが勝手に復帰せず、放置すると
+ * (このノード宛だけでなく)送受信が全て完全に止まったままになるので要注意。 */
+void CANBus_Poll(void);
+
+/* Bus-Offから自動復帰した回数(診断用)。0のままなら一度も発生していない。 */
+uint32_t CANBus_GetBusOffRecoveries(void);
+
+/* HAL_FDCAN_AddMessageToTxFifoQ()が失敗した回数(診断用、主にTx FIFO満杯)。
+ * STM32G4のTx FIFO/Queueは3要素しかないため、AutoRetransmission有効時にACKが
+ * 返らないノード宛のフレームが先頭に詰まると、この値が増え続けて他ノード宛の
+ * 送信が投入すらできなくなる(0のままなら発生していない)。 */
+uint32_t CANBus_GetTxQueueFailures(void);
+
 #ifdef __cplusplus
 }
 #endif

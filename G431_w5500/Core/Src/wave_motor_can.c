@@ -21,9 +21,11 @@ static HAL_StatusTypeDef WaveMotorCAN_SendCmd(const WaveMotorCAN_t *m, uint8_t c
 void WaveMotorCAN_Init(WaveMotorCAN_t *m, uint32_t node_id)
 {
     m->node_id = node_id;
-    m->swing_last_toggle_tick = 0U;
-    m->swing_at_amplitude = 0U;
-    m->swing_started = 0U;
+    m->last_tick = 0U;
+    m->toggle_count = 0U;
+    m->at_plus = 0U;
+    m->started = 0U;
+    m->finished = 0U;
 }
 
 HAL_StatusTypeDef WaveMotorCAN_Reset(WaveMotorCAN_t *m)
@@ -31,54 +33,66 @@ HAL_StatusTypeDef WaveMotorCAN_Reset(WaveMotorCAN_t *m)
     return WaveMotorCAN_SendCmd(m, WAVE_MOTOR_CMD_RESET, NULL, 0U);
 }
 
-HAL_StatusTypeDef WaveMotorCAN_SetOrigin(WaveMotorCAN_t *m)
-{
-    return WaveMotorCAN_SendCmd(m, WAVE_MOTOR_CMD_SET_ORIGIN, NULL, 0U);
-}
-
-HAL_StatusTypeDef WaveMotorCAN_SetTargetCount(WaveMotorCAN_t *m, uint16_t count)
+HAL_StatusTypeDef WaveMotorCAN_SetTargetOffsetCount(WaveMotorCAN_t *m, int16_t offset_count)
 {
     uint8_t payload[2];
+    uint16_t raw = (uint16_t)offset_count;   /* 符号付き値をそのまま2の補数LEで送る */
 
-    if (count > WAVE_MOTOR_COUNT_MAX) {
-        count = WAVE_MOTOR_COUNT_MAX;
-    }
-    payload[0] = (uint8_t)(count & 0xFFU);
-    payload[1] = (uint8_t)((count >> 8) & 0xFFU);
+    payload[0] = (uint8_t)(raw & 0xFFU);
+    payload[1] = (uint8_t)((raw >> 8) & 0xFFU);
     return WaveMotorCAN_SendCmd(m, WAVE_MOTOR_CMD_SET_TARGET, payload, 2U);
 }
 
-HAL_StatusTypeDef WaveMotorCAN_SetTargetDeg(WaveMotorCAN_t *m, float deg)
+HAL_StatusTypeDef WaveMotorCAN_SetTargetOffsetDeg(WaveMotorCAN_t *m, float offset_deg)
 {
-    uint16_t count;
+    float counts_f = offset_deg * WAVE_MOTOR_COUNTS_PER_DEG;
+    int32_t count = (int32_t)(counts_f + ((counts_f >= 0.0f) ? 0.5f : -0.5f));
 
-    if (deg < 0.0f) {
-        deg = 0.0f;
+    /* int16の範囲にだけ収める (±180°相当の±2048よりだいぶ余裕がある)。
+     * ±180°を超えるオフセット自体は仕様上ラップして解釈されるので許容する。 */
+    if (count > 32767) {
+        count = 32767;
+    } else if (count < -32768) {
+        count = -32768;
     }
-    if (deg > 360.0f) {
-        deg = 360.0f;
-    }
-    count = (uint16_t)(deg * 4096.0f / 360.0f + 0.5f);
-    return WaveMotorCAN_SetTargetCount(m, count);
+    return WaveMotorCAN_SetTargetOffsetCount(m, (int16_t)count);
 }
 
-void WaveMotorCAN_UpdateSwing(WaveMotorCAN_t *m, float amplitude_deg, uint32_t period_ms)
+void WaveMotorCAN_UpdateSwingThenHome(WaveMotorCAN_t *m, float amplitude_deg,
+                                       uint32_t period_ms, uint32_t cycle_count)
 {
     uint32_t half_period_ms = period_ms / 2U;
-    uint32_t now = HAL_GetTick();
+    uint32_t total_toggles = cycle_count * 2U;   /* 1周期(+→-→+)につき半周期の切替が2回 */
+    uint32_t now;
 
-    if (!m->swing_started) {
-        /* 初回呼び出し: 0°側から動作を開始する */
-        WaveMotorCAN_SetTargetDeg(m, 0.0f);
-        m->swing_at_amplitude = 0U;
-        m->swing_last_toggle_tick = now;
-        m->swing_started = 1U;
+    if (m->finished) {
         return;
     }
 
-    if ((now - m->swing_last_toggle_tick) >= half_period_ms) {
-        m->swing_at_amplitude = (uint8_t)(!m->swing_at_amplitude);
-        WaveMotorCAN_SetTargetDeg(m, m->swing_at_amplitude ? amplitude_deg : 0.0f);
-        m->swing_last_toggle_tick = now;
+    now = HAL_GetTick();
+
+    if (!m->started) {
+        /* 初回呼び出し: +amplitude側から動作を開始する */
+        WaveMotorCAN_SetTargetOffsetDeg(m, amplitude_deg);
+        m->at_plus = 1U;
+        m->toggle_count = 0U;
+        m->last_tick = now;
+        m->started = 1U;
+        return;
+    }
+
+    if ((now - m->last_tick) < half_period_ms) {
+        return;
+    }
+    m->last_tick = now;
+
+    if (m->toggle_count < total_toggles) {
+        m->at_plus = (uint8_t)(!m->at_plus);
+        WaveMotorCAN_SetTargetOffsetDeg(m, m->at_plus ? amplitude_deg : -amplitude_deg);
+        m->toggle_count++;
+    } else {
+        /* 指定回数のスイングが完了。0度(絶対原点)へ戻して以後は何もしない */
+        WaveMotorCAN_SetTargetOffsetDeg(m, 0.0f);
+        m->finished = 1U;
     }
 }
