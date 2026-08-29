@@ -30,6 +30,8 @@
 #include "dji_c610.h"
 #include "odrive_can.h"
 #include "vesc_can.h"
+#include "ttl_servo_can.h"
+#include "wave_motor_can.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,6 +64,16 @@
 #define VESC_TEST_ID 10U
 
 #define C610_ESC_ID  1U   // C610本体のダイヤル/DIPスイッチで設定したID (1-8)
+
+// TTLサーボ基板 (プロジェクトルートの CAN_PROTOCOL_TTL-SERVO.md 参照、受信専用)。
+// この基板の node_id (仕様書の既定値は0x21)。
+#define TTL_SERVO_NODE_ID 0x21U
+
+// wave motor基板 (プロジェクトルートの CAN_PROTOCOL_wave_motor.md 参照、受信専用)。
+// この基板の node_id (仕様書の既定値は0x11)。
+#define WAVE_MOTOR_NODE_ID 0x11U
+#define WAVE_MOTOR_SWING_AMPLITUDE_DEG 90.0f    // 0°⇔90°のスイング
+#define WAVE_MOTOR_SWING_PERIOD_MS     10000U   // 1往復(10秒)で1周期
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U
 /* USER CODE END PD */
@@ -82,6 +94,8 @@ DMA_HandleTypeDef hdma_tim1_ch1;
 /* USER CODE BEGIN PV */
 ODriveCAN_Axis_t gim_axis;         // GIM8018-8 (本命: ODrive CAN Simple)
 VescCAN_Motor_t vesc_test_motor;   // 比較用 (受信のみ監視、VESCプロトコルだった場合の保険)
+TTLServoCAN_t ttl_servo;           // TTLサーボ基板 (CAN_PROTOCOL_TTL-SERVO.md, node_id=0x21)
+WaveMotorCAN_t wave_motor;         // wave motor基板 (CAN_PROTOCOL_wave_motor.md, node_id=0x11)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -261,6 +275,12 @@ int main(void)
 
   // 比較用: VESCプロトコルだった場合に備え、受信のみ監視する(コマンドは送らない)
   VescCAN_Init(&vesc_test_motor, VESC_TEST_ID);
+
+  // TTLサーボ基板 (受信専用) の初期化。実機へは何も送信しない。
+  TTLServoCAN_Init(&ttl_servo, TTL_SERVO_NODE_ID);
+
+  // wave motor基板 (受信専用) の初期化。実機へは何も送信しない。
+  WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_NODE_ID);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -337,6 +357,29 @@ int main(void)
             }
             ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
         }
+
+        // TTLサーボ基板 (CAN ID 0x21) へOPEN/CLOSEを交互に送信する動作確認コード。
+        // ループ2周(約3秒: Delay_WithCANPoll(500)×3 が1周)ごとに切り替える。
+        {
+            static uint8_t ttl_toggle_count = 0U;
+            static uint8_t ttl_open_next = 1U;   // 次に送るのがOPENなら1、CLOSEなら0
+
+            ttl_toggle_count++;
+            if (ttl_toggle_count >= 2U) {
+                ttl_toggle_count = 0U;
+                if (ttl_open_next) {
+                    TTLServoCAN_Open(&ttl_servo);
+                } else {
+                    TTLServoCAN_Close(&ttl_servo);
+                }
+                ttl_open_next = !ttl_open_next;
+            }
+        }
+
+        // wave motor基板 (CAN ID 0x11) を90°⇔0°で往復させる (10秒周期)。
+        // WaveMotorCAN_UpdateSwing()内部でHAL_GetTick()を見て非ブロッキングに
+        // 送信するので、ここでは毎ループ呼ぶだけでよい。
+        WaveMotorCAN_UpdateSwing(&wave_motor, WAVE_MOTOR_SWING_AMPLITUDE_DEG, WAVE_MOTOR_SWING_PERIOD_MS);
 
   }
   /* USER CODE END 3 */
