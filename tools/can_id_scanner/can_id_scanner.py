@@ -100,6 +100,14 @@ ODRIVE_CONTROL_MODE_POSITION_CONTROL = 3
 ODRIVE_INPUT_MODE_PASSTHROUGH = 1
 ODRIVE_INPUT_MODE_POS_FILTER = 3
 
+# ---- 高レベル制御UDP (STM32側 Core/Src/hl_control_udp.c と対応) ----
+# CAN-UDPブリッジ(pack_command/unpack_report, ポート5001)とは別の専用ポート。
+# 仕様: tools/hl_control/PROTOCOL_HL_CONTROL_UDP.md
+HLCONTROL_CMD_SET_PITCH_TARGET = 0x01  # payload: float32 LE, deg (-100〜100, STM32側でクランプ)
+HLCONTROL_CMD_TTL_OPEN = 0x02          # payloadなし。0x21へ-25deg
+HLCONTROL_CMD_TTL_CLOSE = 0x03         # payloadなし。0x21へ+50deg
+HLCONTROL_DEFAULT_PORT = 5003
+
 
 def pack_command(can_id: int, is_extended: bool, data: bytes) -> bytes:
     dlc = len(data)
@@ -228,6 +236,72 @@ class Bridge:
             r = unpack_report(pkt)
             if r:
                 self.report_cb(r)
+
+
+class HLControlPanel(ttk.LabelFrame):
+    """高レベル制御UDP (hl_control_udp.c) 送信パネル。
+    OPEN/CLOSEボタン(TTLサーボ 0x21向け、絶対原点からのオフセット -25deg/+50deg)と
+    ピッチ角目標値(wave motor 0x11/0x12向け、-100〜100deg)を送る。
+    CAN-UDPブリッジ(Bridgeクラス、ポート5001)とは別の専用UDPソケット・ポート(既定5003)
+    を使う単方向(PC→STM32のみ)送信。角度の範囲チェック(クランプ)はSTM32側で行うため、
+    ここでは行わない。
+    """
+
+    def __init__(self, parent, app):
+        super().__init__(parent, text="高レベル制御 (UDP, TTLサーボ0x21 / wave motor 0x11,0x12)", padding=8)
+        self.app = app
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        row = ttk.Frame(self)
+        row.pack(fill="x")
+        ttk.Label(row, text="Port:").pack(side="left")
+        self.port_var = tk.StringVar(value=str(HLCONTROL_DEFAULT_PORT))
+        ttk.Entry(row, textvariable=self.port_var, width=6).pack(side="left", padx=4)
+        ttk.Button(row, text="OPEN (0x21: -25deg)", command=self.on_open).pack(side="left", padx=8)
+        ttk.Button(row, text="CLOSE (0x21: +50deg)", command=self.on_close).pack(side="left", padx=4)
+
+        row2 = ttk.Frame(self)
+        row2.pack(fill="x", pady=(6, 0))
+        ttk.Label(row2, text="ピッチ角目標値 [deg] (-100〜100、範囲外はSTM32側でクランプ):").pack(side="left")
+        self.pitch_var = tk.StringVar(value="0")
+        ttk.Entry(row2, textvariable=self.pitch_var, width=8).pack(side="left", padx=4)
+        ttk.Button(row2, text="送信", command=self.on_send_pitch).pack(side="left", padx=4)
+        ttk.Label(row2, text="(0x11へ符号反転した値、0x12へそのままの値が送られる)").pack(side="left", padx=4)
+
+    def _target(self):
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "ポート番号が不正です")
+            return None
+        ip = self.app.ip_var.get().strip()
+        if not ip:
+            messagebox.showerror("エラー", "STM32 IPが未設定です(上部の欄を確認)")
+            return None
+        return (ip, port)
+
+    def _send(self, payload: bytes):
+        target = self._target()
+        if target is None:
+            return
+        try:
+            self.sock.sendto(payload, target)
+        except OSError as e:
+            messagebox.showerror("エラー", f"送信に失敗しました: {e}")
+
+    def on_open(self):
+        self._send(struct.pack("<B", HLCONTROL_CMD_TTL_OPEN))
+
+    def on_close(self):
+        self._send(struct.pack("<B", HLCONTROL_CMD_TTL_CLOSE))
+
+    def on_send_pitch(self):
+        try:
+            deg = float(self.pitch_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "ピッチ角の入力が不正です")
+            return
+        self._send(struct.pack("<Bf", HLCONTROL_CMD_SET_PITCH_TARGET, deg))
 
 
 class ODriveMotorPanel(ttk.LabelFrame):
@@ -457,6 +531,10 @@ class App(tk.Tk):
                  "絶対角なので Set した角度へそのまま動く(相対移動ではない)。",
             foreground="red", wraplength=1000, justify="left",
         ).pack(anchor="w", pady=(4, 0))
+
+        # --- 高レベル制御 (TTLサーボ0x21 / wave motor 0x11,0x12、専用UDPポート) ---
+        self.hl_control_panel = HLControlPanel(self, self)
+        self.hl_control_panel.pack(fill="x", padx=8, pady=4)
 
         # --- VESC status ---
         vstat = ttk.LabelFrame(self, text="VESC status (自動収集。比較用の保険)", padding=8)

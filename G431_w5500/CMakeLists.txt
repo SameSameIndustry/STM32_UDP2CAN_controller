@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/gim8018.c
     Core/Src/ttl_servo_can.c
     Core/Src/wave_motor_can.c
+    Core/Src/hl_control_udp.c
 )
 
 # Add include paths

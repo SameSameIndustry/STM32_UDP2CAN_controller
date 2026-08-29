@@ -32,6 +32,7 @@
 #include "vesc_can.h"
 #include "ttl_servo_can.h"
 #include "wave_motor_can.h"
+#include "hl_control_udp.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -69,23 +70,20 @@
 // この基板の node_id (仕様書の既定値は0x21)。
 #define TTL_SERVO_NODE_ID 0x21U
 
-// 切り分け用スイッチ: 0x21への送信を完全に止める(1で送信、0で送信しない)。
-// 「0x21へ送信すると0x12(wave motor)が目標値と無関係に誤動作する」現象の原因が
-// 本当に0x21宛のCAN送信にあるのかを確定させるため、一時的に0にして0x12の
-// 挙動を見る。0にしてもTTL_SERVO_NODE_ID宛の初期化(受信は元々していない)は
-// そのまま行われるが、CAN上に0x21のフレームは一切出なくなる。
-#define TTL_SERVO_SEND_ENABLED 1
-
 // wave motor基板 (プロジェクトルートの CAN_PROTOCOL_wave_motor.md 参照、受信専用)。
-// 同じ機種がnode_id 0x11と0x12の2台接続されている。2台目(0x12)は振幅の符号を
-// 反転させて呼ぶことで、同じタイミングで逆向きにスイングさせる。
+// 同じ機種がnode_id 0x11と0x12の2台接続されている。0x11と0x12は常に逆方向に
+// 同じ角度だけ回転させる運用 (HLControlUDP_Poll()参照)。
 #define WAVE_MOTOR_1_NODE_ID 0x11U
 #define WAVE_MOTOR_2_NODE_ID 0x12U
-#define WAVE_MOTOR_SWING_AMPLITUDE_DEG 90.0f    // ±90°のスイング
-#define WAVE_MOTOR_SWING_PERIOD_MS     10000U   // 1周期10秒 (+90°⇔-90°を5秒ごとに切替)
-#define WAVE_MOTOR_SWING_CYCLE_COUNT   5U       // 5周期実行したら0°に戻して停止
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U
+
+// 高レベル制御UDP (tools/hl_control/PROTOCOL_HL_CONTROL_UDP.md 参照)。
+// PythonのGUIからOPEN/CLOSEボタン・ピッチ角目標値を受け取り、TTLサーボ(0x21)/
+// wave motor(0x11, 0x12)へのCAN送信に変換する。CAN-UDPブリッジ(ソケット1, ポート5001)
+// やハートビート(ソケット2, ポート5002)とは別の専用ソケット・ポートを使う。
+#define HLCONTROL_SN    3U
+#define HLCONTROL_PORT  5003U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -163,6 +161,7 @@ static void Delay_WithCANPoll(uint32_t ms)
     while ((HAL_GetTick() - start) < ms) {
         CANUDPBridge_Poll();
         CANBus_Poll();
+        HLControlUDP_Poll();
         HAL_Delay(5);
     }
 }
@@ -295,6 +294,9 @@ int main(void)
   // wave motor基板 (受信専用) の初期化。実機へは何も送信しない。
   WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_1_NODE_ID);
   WaveMotorCAN_Init(&wave_motor2, WAVE_MOTOR_2_NODE_ID);
+
+  // 高レベル制御UDP (Python GUIのOPEN/CLOSEボタン・ピッチ角目標値を受け取る)
+  HLControlUDP_Init(HLCONTROL_SN, HLCONTROL_PORT, &ttl_servo, &wave_motor, &wave_motor2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -380,34 +382,12 @@ int main(void)
             ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
         }
 
-        // TTLサーボ基板(0x21)と wave motor基板(0x11, 0x12)へのCAN送信は、CANバスを
-        // 同時に使わないよう完全に分離する: 同じループ周回では絶対にどちらか片方
-        // しか送信しない(ループ周回ごとに交互に評価する)。0x21へ送信した直後だけ
-        // 0x12が誤動作する現象が、開始位相を半周期(5秒)ずらしても再現したため
-        // (=たまたま同時に送信していただけの偶然の一致ではなかった)、そもそも
-        // 同じ瞬間(同じループ周回)に両者がCAN送信を試みること自体を無くす。
-        // hb_seqは既にループ先頭で毎周回インクリメント済みなので、それをそのまま
-        // 交互判定に使う(新しい変数は増やさない)。それぞれの内部タイマー
-        // (HAL_GetTick()ベース)自体は影響を受けないので、周期は最大でも約1.5秒
-        // (ループ1周分)ずれるだけで、動作自体はほぼそのまま。
-        if ((hb_seq % 2U) == 0U) {
-#if TTL_SERVO_SEND_ENABLED
-            // TTLサーボの新プロトコル(CAN_PROTOCOL_TTL-SERVO.md): OPEN/CLOSEは廃止され、
-            // SET_TARGET(Data[0]=0x01固定)で絶対原点(180°)からの符号付きオフセットのみ。
-            // +50°/-25°を交互に送る。
-            TTLServoCAN_UpdateTargetOffsetToggleDeg(&ttl_servo, 50.0f, -25.0f, WAVE_MOTOR_SWING_PERIOD_MS);
-#endif
-        } else {
-            // wave motor基板 (CAN ID 0x11, 0x12) を±90°で5周期(10秒周期)スイングさせた後、
-            // 0°に戻して停止する。WaveMotorCAN_UpdateSwingThenHome()内部でHAL_GetTick()を
-            // 見て非ブロッキングに送信し、完了後は何もしなくなる。
-            // 2台目(0x12)は振幅の符号を反転させて呼ぶことで、0x11とは逆向きに
-            // (同じタイミングで)スイングさせる。
-            WaveMotorCAN_UpdateSwingThenHome(&wave_motor, WAVE_MOTOR_SWING_AMPLITUDE_DEG,
-                                              WAVE_MOTOR_SWING_PERIOD_MS, WAVE_MOTOR_SWING_CYCLE_COUNT);
-            WaveMotorCAN_UpdateSwingThenHome(&wave_motor2, -WAVE_MOTOR_SWING_AMPLITUDE_DEG,
-                                              WAVE_MOTOR_SWING_PERIOD_MS, WAVE_MOTOR_SWING_CYCLE_COUNT);
-        }
+        // 固定の振り付けシーケンス(Sequence_Update()/s_seq_steps[])は無効化し、
+        // 代わりにPython GUIからの高レベル制御UDP(OPEN/CLOSEボタン・ピッチ角目標値)を
+        // その場で処理する。HLControlUDP_Poll()はDelay_WithCANPoll()内でも呼んでいる
+        // (数ms粒度の応答性確保)ので、ここでの呼び出しは無くても実用上問題ないが、
+        // Delay_WithCANPoll()を挟まない一瞬の間も取りこぼさないよう念のため呼ぶ。
+        HLControlUDP_Poll();
 
   }
   /* USER CODE END 3 */
