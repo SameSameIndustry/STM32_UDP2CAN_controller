@@ -28,9 +28,10 @@ extern "C" {
 
 typedef struct {
     uint32_t node_id;          /* 送信先の標準CAN ID (仕様書の既定値は0x21) */
-    uint32_t last_toggle_tick; /* TTLServoCAN_UpdateOpenCloseToggle() が使う内部状態 */
-    uint8_t  open_next;        /* 1=次に送るのはOPEN, 0=CLOSE */
-    uint8_t  started;          /* UpdateOpenCloseToggleの初回呼び出し判定 */
+    uint32_t last_toggle_tick; /* TTLServoCAN_UpdateOpenCloseToggle() 等が使う内部状態 */
+    uint8_t  open_next;        /* 1=次に送るのはOPEN(またはdelta_a)側, 0=CLOSE(delta_b)側 */
+    uint8_t  started;          /* Update系の初回呼び出し判定 */
+    float    target_deg_accum; /* TTLServoCAN_UpdateTargetDeltaToggleDeg() が積算する目標角度[°] */
 } TTLServoCAN_t;
 
 /* 初期化。実機へは何も送信しない。 */
@@ -59,6 +60,34 @@ HAL_StatusTypeDef TTLServoCAN_Close(TTLServoCAN_t *s);
  *       TTLServoCAN_UpdateOpenCloseToggle(s, WAVE_MOTOR_SWING_PERIOD_MS)
  */
 void TTLServoCAN_UpdateOpenCloseToggle(TTLServoCAN_t *s, uint32_t period_ms);
+
+/*
+ * OPEN/CLOSEコマンド(Data[0]=0x02/0x03)の代わりに、SET_TARGET(Data[0]=0x01)で
+ * 絶対角度deg_a/deg_bをperiod_ms周期で交互に送信し続けるヘルパー。呼び出し側は
+ * メインループ毎回これを呼ぶだけでよい(非ブロッキング)。deg_a/deg_bは0-360°の
+ * 範囲外でもTTLServoCAN_SetTargetDeg()側で自動的に回り込ませる
+ * (例: -25°は335°として送られる)。
+ * ⚠ deg_a/deg_bは"絶対位置"として交互に送られるため、移動量は|deg_a - deg_b|に
+ *   なる。OPEN(+50°)/CLOSE(-25°)相当の"移動量"を再現したい場合は
+ *   TTLServoCAN_UpdateTargetDeltaToggleDeg() を使うこと(こちらは移動量が
+ *   deg_a/deg_bそのものになる別物なので混同しないこと)。
+ */
+void TTLServoCAN_UpdateTargetToggleDeg(TTLServoCAN_t *s, float deg_a, float deg_b, uint32_t period_ms);
+
+/*
+ * OPEN(現在の目標値にdelta_aを加算)/CLOSE(delta_bを加算)と全く同じ"相対移動"の
+ * 挙動を、SET_TARGET(Data[0]=0x01固定)で再現するヘルパー。呼び出し側はメインループ
+ * 毎回これを呼ぶだけでよい(非ブロッキング)。内部でSTM32側が目標角度を0°起点で
+ * 積算し(s->target_deg_accum、0-360°に回り込む)、その絶対値をSET_TARGETで送る。
+ * OPEN/CLOSEをそのまま送るのと違い、コマンドバイトは常に0x01になる。
+ *   例: OPEN(+50°)/CLOSE(-25°)を再現したい場合は
+ *       TTLServoCAN_UpdateTargetDeltaToggleDeg(s, 50.0f, -25.0f, WAVE_MOTOR_SWING_PERIOD_MS)
+ *       (1回目 +50° → 目標50°, 2回目 -25° → 目標25°, 3回目 +50° → 目標75°, ... と
+ *       OPEN/CLOSEを交互に送った場合と同じ移動量・同じ位置を辿る。ただし実機の
+ *       電源投入時の実位置を0°と仮定しているため、実機側の真の起点とはずれる
+ *       可能性がある点はOPEN/CLOSEを直接使う場合には無い制約)
+ */
+void TTLServoCAN_UpdateTargetDeltaToggleDeg(TTLServoCAN_t *s, float delta_a, float delta_b, uint32_t period_ms);
 
 #ifdef __cplusplus
 }

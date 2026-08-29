@@ -30,6 +30,7 @@
 #include "dji_c610.h"
 #include "odrive_can.h"
 #include "vesc_can.h"
+#include "ttl_servo_can.h"
 #include "wave_motor_can.h"
 /* USER CODE END Includes */
 
@@ -64,6 +65,17 @@
 
 #define C610_ESC_ID  1U   // C610本体のダイヤル/DIPスイッチで設定したID (1-8)
 
+// TTLサーボ基板 (プロジェクトルートの CAN_PROTOCOL_TTL-SERVO.md 参照、受信専用)。
+// この基板の node_id (仕様書の既定値は0x21)。
+#define TTL_SERVO_NODE_ID 0x21U
+
+// 切り分け用スイッチ: 0x21への送信を完全に止める(1で送信、0で送信しない)。
+// 「0x21へ送信すると0x12(wave motor)が目標値と無関係に誤動作する」現象の原因が
+// 本当に0x21宛のCAN送信にあるのかを確定させるため、一時的に0にして0x12の
+// 挙動を見る。0にしてもTTL_SERVO_NODE_ID宛の初期化(受信は元々していない)は
+// そのまま行われるが、CAN上に0x21のフレームは一切出なくなる。
+#define TTL_SERVO_SEND_ENABLED 1
+
 // wave motor基板 (プロジェクトルートの CAN_PROTOCOL_wave_motor.md 参照、受信専用)。
 // 同じ機種がnode_id 0x11と0x12の2台接続されている。2台目(0x12)は振幅の符号を
 // 反転させて呼ぶことで、同じタイミングで逆向きにスイングさせる。
@@ -92,6 +104,7 @@ DMA_HandleTypeDef hdma_tim1_ch1;
 /* USER CODE BEGIN PV */
 ODriveCAN_Axis_t gim_axis;         // GIM8018-8 (本命: ODrive CAN Simple)
 VescCAN_Motor_t vesc_test_motor;   // 比較用 (受信のみ監視、VESCプロトコルだった場合の保険)
+TTLServoCAN_t ttl_servo;           // TTLサーボ基板 (CAN_PROTOCOL_TTL-SERVO.md, node_id=0x21)
 WaveMotorCAN_t wave_motor;         // wave motor基板 1台目 (CAN_PROTOCOL_wave_motor.md, node_id=0x11)
 WaveMotorCAN_t wave_motor2;        // wave motor基板 2台目 (同一機種, node_id=0x12、逆向きにスイング)
 /* USER CODE END PV */
@@ -276,6 +289,9 @@ int main(void)
   // 比較用: VESCプロトコルだった場合に備え、受信のみ監視する(コマンドは送らない)
   VescCAN_Init(&vesc_test_motor, VESC_TEST_ID);
 
+  // TTLサーボ基板 (受信専用) の初期化。実機へは何も送信しない。
+  TTLServoCAN_Init(&ttl_servo, TTL_SERVO_NODE_ID);
+
   // wave motor基板 (受信専用) の初期化。実機へは何も送信しない。
   WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_1_NODE_ID);
   WaveMotorCAN_Init(&wave_motor2, WAVE_MOTOR_2_NODE_ID);
@@ -364,15 +380,42 @@ int main(void)
             ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
         }
 
-        // wave motor基板 (CAN ID 0x11, 0x12) を±90°で5周期(10秒周期)スイングさせた後、
-        // 0°に戻して停止する。WaveMotorCAN_UpdateSwingThenHome()内部でHAL_GetTick()を
-        // 見て非ブロッキングに送信し、完了後は何もしなくなるので、ここでは毎ループ
-        // 呼ぶだけでよい。2台目(0x12)は振幅の符号を反転させて呼ぶだけで、同じタイミング
-        // で逆向きにスイングする(両方とも同じループ周回内で呼ぶので開始tickもほぼ揃う)。
-        WaveMotorCAN_UpdateSwingThenHome(&wave_motor, WAVE_MOTOR_SWING_AMPLITUDE_DEG,
-                                          WAVE_MOTOR_SWING_PERIOD_MS, WAVE_MOTOR_SWING_CYCLE_COUNT);
-        WaveMotorCAN_UpdateSwingThenHome(&wave_motor2, -WAVE_MOTOR_SWING_AMPLITUDE_DEG,
-                                          WAVE_MOTOR_SWING_PERIOD_MS, WAVE_MOTOR_SWING_CYCLE_COUNT);
+        // TTLサーボ基板(0x21)と wave motor基板(0x11, 0x12)へのCAN送信は、CANバスを
+        // 同時に使わないよう完全に分離する: 同じループ周回では絶対にどちらか片方
+        // しか送信しない(ループ周回ごとに交互に評価する)。0x21へ送信した直後だけ
+        // 0x12が誤動作する現象が、開始位相を半周期(5秒)ずらしても再現したため
+        // (=たまたま同時に送信していただけの偶然の一致ではなかった)、そもそも
+        // 同じ瞬間(同じループ周回)に両者がCAN送信を試みること自体を無くす。
+        // hb_seqは既にループ先頭で毎周回インクリメント済みなので、それをそのまま
+        // 交互判定に使う(新しい変数は増やさない)。それぞれの内部タイマー
+        // (HAL_GetTick()ベース)自体は影響を受けないので、周期は最大でも約1.5秒
+        // (ループ1周分)ずれるだけで、動作自体はほぼそのまま。
+        if ((hb_seq % 2U) == 0U) {
+#if TTL_SERVO_SEND_ENABLED
+            // OPEN(Data[0]=0x02)/CLOSE(Data[0]=0x03)固定コマンドではなく、
+            // SET_TARGET(Data[0]=0x01)でOPEN(+50°)/CLOSE(-25°)と同じ移動量を再現する。
+            // (OPENのコマンドバイト0x02が旧wave motorプロトコルのSET_ORIGINと
+            // 衝突していた可能性の切り分けのため。SET_TARGETならコマンドバイトは
+            // 常に0x01で、旧wave motorプロトコルのRESET/SET_TARGET/SET_ORIGINの
+            // いずれとも衝突しない)
+            // ⚠ TTLServoCAN_UpdateTargetToggleDeg()は"絶対位置"を交互に送るため
+            //    移動量が|50-(-25)|=75°になってしまい、OPEN/CLOSE本来の移動量
+            //    (50°→-25°の相対、実測で移動量が倍近くに感じられた)と違ってしまう。
+            //    TTLServoCAN_UpdateTargetDeltaToggleDeg()はSTM32側で目標値を積算して
+            //    送るので、OPEN/CLOSEを直接送った場合と同じ移動量になる。
+            TTLServoCAN_UpdateTargetDeltaToggleDeg(&ttl_servo, 50.0f, -25.0f, WAVE_MOTOR_SWING_PERIOD_MS);
+#endif
+        } else {
+            // wave motor基板 (CAN ID 0x11, 0x12) を±90°で5周期(10秒周期)スイングさせた後、
+            // 0°に戻して停止する。WaveMotorCAN_UpdateSwingThenHome()内部でHAL_GetTick()を
+            // 見て非ブロッキングに送信し、完了後は何もしなくなる。
+            // 2台目(0x12)は振幅の符号を反転させて呼ぶことで、0x11とは逆向きに
+            // (同じタイミングで)スイングさせる。
+            WaveMotorCAN_UpdateSwingThenHome(&wave_motor, WAVE_MOTOR_SWING_AMPLITUDE_DEG,
+                                              WAVE_MOTOR_SWING_PERIOD_MS, WAVE_MOTOR_SWING_CYCLE_COUNT);
+            WaveMotorCAN_UpdateSwingThenHome(&wave_motor2, -WAVE_MOTOR_SWING_AMPLITUDE_DEG,
+                                              WAVE_MOTOR_SWING_PERIOD_MS, WAVE_MOTOR_SWING_CYCLE_COUNT);
+        }
 
   }
   /* USER CODE END 3 */
