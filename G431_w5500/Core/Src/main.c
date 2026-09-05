@@ -454,18 +454,33 @@ int main(void)
         {
             static uint8_t gim_reassert_idx = 0U;
 
+            /* EnterPositionControl()は呼ぶたびに無条件で2フレーム
+             * (Set_Controller_Mode + Set_Axis_Requested_State)を送るため、既に
+             * CLOSED_LOOP_CONTROLに入っている軸に対しても毎回送ってしまうと、
+             * gim_axisの1フレーム+ここの2フレーム+ResendLastTargetの1フレーム=
+             * 4フレームが同一ループでFDCAN TxFIFO(3要素)を溢れさせる。まだ
+             * CLOSED_LOOP_CONTROLでない軸だけ送るようにし、通常運用時は
+             * ResendLastTargetの1フレームのみにする。 */
             switch (gim_reassert_idx) {
                 case 0U:
-                    GIM6010_EnterPositionControl(&gim6010_a);
+                    if (gim6010_a.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
+                        GIM6010_EnterPositionControl(&gim6010_a);
+                    }
                     break;
                 case 1U:
-                    GIM6010_EnterPositionControl(&gim6010_b);
+                    if (gim6010_b.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
+                        GIM6010_EnterPositionControl(&gim6010_b);
+                    }
                     break;
                 case 2U:
-                    GIM8018_EnterPositionControl(&gim8018_c);
+                    if (gim8018_c.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
+                        GIM8018_EnterPositionControl(&gim8018_c);
+                    }
                     break;
                 default:
-                    GIM8018_EnterPositionControl(&gim8018_d);
+                    if (gim8018_d.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
+                        GIM8018_EnterPositionControl(&gim8018_d);
+                    }
                     break;
             }
             HLControlUDP_ResendLastTarget(gim_reassert_idx);

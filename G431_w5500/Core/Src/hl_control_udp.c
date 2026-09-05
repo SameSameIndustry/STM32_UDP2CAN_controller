@@ -114,12 +114,23 @@ static void HLControl_EnsureGim8018ClosedLoop(GIM8018_t *g)
 }
 
 /* s_gim6010_a/b_base_native と s_gim6010_sync_trim_native から実際に送る絶対位置を
- * 計算し直し、両軸へSet_Input_Posで送る。ベース値・トリムのどちらが変わった後も
- * これを呼べば良い。 */
-static void HLControl_ApplyGim6010Targets(void)
+ * 計算し直すだけで、CAN送信はしない。呼ぶだけならFDCAN TxFIFOを消費しないので、
+ * 毎ループ呼ばれるHLControlUDP_UpdateGim6010Sync()から使う(送信は既存のラウンド
+ * ロビン(main.cのHLControlUDP_ResendLastTarget呼び出し)が担当し、最大でも約6秒
+ * 以内に反映される)。 */
+static void HLControl_RecomputeGim6010Targets(void)
 {
     s_gim6010_a_last_target = s_gim6010_a_base_native + (s_gim6010_sync_trim_native * 0.5f);
     s_gim6010_b_last_target = s_gim6010_b_base_native - (s_gim6010_sync_trim_native * 0.5f);
+}
+
+/* 上記の再計算に加えて、両軸へSet_Input_Posを即座に送る。GUIから新規コマンドを
+ * 受信した直後(HLControl_HandlePacket、単発イベント)にのみ使うこと。毎ループ
+ * 呼ぶとFDCAN TxFIFO(HW上3要素)を超えて他フレームを溢れさせる原因になるので、
+ * 周期呼び出しにはHLControl_RecomputeGim6010Targets()を使うこと。 */
+static void HLControl_ApplyGim6010Targets(void)
+{
+    HLControl_RecomputeGim6010Targets();
     if (s_gim6010_a != NULL) {
         HLControl_EnsureGim6010ClosedLoop(s_gim6010_a);
         ODriveCAN_SetInputPos(&s_gim6010_a->odrv, s_gim6010_a_last_target, 0.0f, 0.0f);
@@ -324,5 +335,7 @@ void HLControlUDP_UpdateGim6010Sync(void)
         s_gim6010_sync_trim_native = -HLCONTROL_GIM6010_SYNC_TRIM_MAX_NATIVE;
     }
 
-    HLControl_ApplyGim6010Targets();
+    /* ここではCAN送信はせず値の再計算のみ。実際の送信はmain.cのラウンドロビンが
+     * HLControlUDP_ResendLastTarget()経由で担当する(FDCAN TxFIFO溢れ対策)。 */
+    HLControl_RecomputeGim6010Targets();
 }

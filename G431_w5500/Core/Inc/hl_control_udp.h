@@ -104,7 +104,9 @@ void HLControlUDP_ResendLastTarget(uint8_t index);
  * 消しきれない定常偏差)。これを補正するため、A/Bの実際の出力角度差
  * (GIM6010_GetOutputPosDeg)を見て、両軸の目標値に少しずつ逆向きのトリムを
  * 足し込む低速な積分補正。GIM6010_A/B_INITIAL_NATIVE_TURNS(OFFSET)自体は
- * 書き換えない。メインループから低頻度(概ね数百ms〜数秒に1回)で呼ぶこと。
+ * 書き換えない。この関数自体はCAN送信を行わず目標値(last_target)の再計算のみ
+ * 行う。実際の送信はmain.cのラウンドロビン経由のHLControlUDP_ResendLastTarget()
+ * が担当するため、毎メインループ呼んでもFDCAN TxFIFO(HW上3要素)を圧迫しない。
  * 両軸がCLOSED_LOOP_CONTROLでない間は何もしない。 */
 void HLControlUDP_UpdateGim6010Sync(void);
 
