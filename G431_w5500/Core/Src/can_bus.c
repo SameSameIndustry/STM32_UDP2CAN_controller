@@ -47,11 +47,27 @@ static HAL_StatusTypeDef CANBus_Send(uint32_t id, uint32_t id_type, const uint8_
     TxHeader.MessageMarker = 0;
 
     {
-        HAL_StatusTypeDef status = HAL_FDCAN_AddMessageToTxFifoQ(s_hfdcan, &TxHeader, (uint8_t *)data);
+        HAL_StatusTypeDef status;
+        uint8_t retry;
+
+        /* Tx FIFO/Queueは3要素しかない(STM32G4 HW仕様)。直前に別のフレームを積んだ
+         * 直後だと空きが無く送信に失敗することがある(例: hl_control_udp.cが
+         * GIM8018 C(0x04)・D(0x05)を立て続けに送るケースで、後発のDの方が弾かれ
+         * やすく、その分だけ反映が遅れる不具合として実機で確認した)。1フレームは
+         * バス速度で見れば数百us程度で送信完了するはずなので、わずかに待って
+         * 空きができるのを待ってからリトライする。それでも空かなければ本当に
+         * 詰まっている(Bus-Off等)ので諦めてカウンタに記録する。 */
+        for (retry = 0U; retry < 3U; retry++) {
+            if (HAL_FDCAN_GetTxFifoFreeLevel(s_hfdcan) > 0U) {
+                break;
+            }
+            HAL_Delay(1);
+        }
+
+        status = HAL_FDCAN_AddMessageToTxFifoQ(s_hfdcan, &TxHeader, (uint8_t *)data);
         if (status != HAL_OK) {
-            /* Tx FIFO/Queueは3要素しかない(STM32G4 HW仕様)。ここに来る主な原因は
-             * FIFO満杯(先行フレームがまだ送信/破棄されていない)。呼び出し側は戻り値を
-             * 見ていないことが多いので、ここでカウンタに残して診断可能にしておく。 */
+            /* 呼び出し側は戻り値を見ていないことが多いので、ここでカウンタに
+             * 残して診断可能にしておく。 */
             s_tx_queue_failures++;
         }
         return status;
