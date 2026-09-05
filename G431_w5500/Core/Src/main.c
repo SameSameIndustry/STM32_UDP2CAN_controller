@@ -170,14 +170,36 @@ void W5500_Unselect(void) {
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
 }
 
+// SPI転送のタイムアウト[ms]。以前はHAL_MAX_DELAY(無制限待ち)だったため、モーター
+// 駆動時の電気的ノイズ等でSPI転送が完了しなくなると、この呼び出しから二度と
+// 戻らずメインループ全体が完全にハングする不具合が実機で複数回再現した
+// (ハートビート・CAN中継とも無応答になる)。有限のタイムアウトにすることで
+// 必ず呼び出し元に制御を返すようにする。
+#define W5500_SPI_TIMEOUT_MS 20U
+
+// SPI転送がタイムアウトした後の復旧処理。CSを確実にHighへ戻し、SPIペリフェラルを
+// 再初期化することで、次回以降の呼び出しがブロックされ続けないようにする。
+// 今回失敗した1バイト分のデータは失われるが、wizchip側は上位のソケット層で
+// 通信が続かなければ再送・タイムアウト処理される想定。
+static void W5500_SPI_Recover(void)
+{
+    W5500_Unselect();
+    HAL_SPI_DeInit(&hspi1);
+    MX_SPI1_Init();
+}
+
 uint8_t W5500_ReadByte(void) {
-    uint8_t rb;
-    HAL_SPI_Receive(&hspi1, &rb, 1, HAL_MAX_DELAY);
+    uint8_t rb = 0xFFU;
+    if (HAL_SPI_Receive(&hspi1, &rb, 1, W5500_SPI_TIMEOUT_MS) != HAL_OK) {
+        W5500_SPI_Recover();
+    }
     return rb;
 }
 
 void W5500_WriteByte(uint8_t wb) {
-    HAL_SPI_Transmit(&hspi1, &wb, 1, HAL_MAX_DELAY);
+    if (HAL_SPI_Transmit(&hspi1, &wb, 1, W5500_SPI_TIMEOUT_MS) != HAL_OK) {
+        W5500_SPI_Recover();
+    }
 }
 
 // HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングと
