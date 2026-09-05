@@ -32,6 +32,8 @@
 #include "vesc_can.h"
 #include "ttl_servo_can.h"
 #include "wave_motor_can.h"
+#include "gim6010.h"
+#include "gim8018.h"
 #include "hl_control_udp.h"
 /* USER CODE END Includes */
 
@@ -75,6 +77,28 @@
 // 同じ角度だけ回転させる運用 (HLControlUDP_Poll()参照)。
 #define WAVE_MOTOR_1_NODE_ID 0x11U
 #define WAVE_MOTOR_2_NODE_ID 0x12U
+
+// GIM6010-8 2台 (node_id 0x06, 0x07)。初期位置(ネイティブturns)からの出力角の偏差を
+// 目標値として送る。目標値は0x06・0x07とも全く同じ値 (HLControlUDP_Poll()参照)。
+#define GIM6010_A_NODE_ID 0x06U
+#define GIM6010_B_NODE_ID 0x07U
+
+// 0x06/0x07の「初期位置」(ネイティブ=モーター軸turns基準)。GUIからは設定できず、
+// ここを編集して書き込むことで変更する。実機の電源投入時の実位置とは無関係
+// (単なる目標値計算の基準点オフセット)。
+#define GIM6010_A_INITIAL_NATIVE_TURNS 0.0f
+#define GIM6010_B_INITIAL_NATIVE_TURNS 0.0f
+
+// GIM8018-8 2台 (node_id 0x04, 0x05)。GIM6010(0x06/0x07)と同じ考え方だが、
+// こちらは目標値が互い違い(符号反転・同じ大きさ)になる (HLControlUDP_Poll()参照)。
+#define GIM8018_C_NODE_ID 0x04U
+#define GIM8018_D_NODE_ID 0x05U
+
+// 0x04/0x05の「初期位置」(ネイティブturns基準)。GIM6010と同様GUIからは設定できず、
+// ここを編集して書き込むことで変更する。
+#define GIM8018_C_INITIAL_NATIVE_TURNS 0.0f
+#define GIM8018_D_INITIAL_NATIVE_TURNS 0.0f
+
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U
 
@@ -105,6 +129,10 @@ VescCAN_Motor_t vesc_test_motor;   // 比較用 (受信のみ監視、VESCプロ
 TTLServoCAN_t ttl_servo;           // TTLサーボ基板 (CAN_PROTOCOL_TTL-SERVO.md, node_id=0x21)
 WaveMotorCAN_t wave_motor;         // wave motor基板 1台目 (CAN_PROTOCOL_wave_motor.md, node_id=0x11)
 WaveMotorCAN_t wave_motor2;        // wave motor基板 2台目 (同一機種, node_id=0x12、逆向きにスイング)
+GIM6010_t gim6010_a;               // GIM6010-8 1台目 (node_id=0x06)
+GIM6010_t gim6010_b;               // GIM6010-8 2台目 (node_id=0x07、Aと全く同じ目標値)
+GIM8018_t gim8018_c;               // GIM8018-8 1台目 (node_id=0x04)
+GIM8018_t gim8018_d;               // GIM8018-8 2台目 (node_id=0x05、Cと符号反転の偏差)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -215,13 +243,15 @@ int main(void)
   HAL_Delay(10);                                         // RSTn Low (最低500us、余裕をみて10ms)
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
   HAL_Delay(150);                                        // PLLロック+安定待ち (旧50ms→150ms)
-  // 初期色
-
+  // 初期色: UDPのポートを開く(socket()を呼ぶ)前は赤。通信状態表示LEDの
+  // 「未通信」状態としてここで先に点灯させておく(以後は while(1) ループ内で
+  // CANUDPBridge_HasClient()/HLControlUDP_HasReceived()を見て赤/青を切り替える)。
   for (int i = 0; i < LED_NUM; i++) {
-      led_data[i][0] = 0;
-      led_data[i][1] = 0;
-      led_data[i][2] = 0;
+      led_data[i][0] = 0;    // G
+      led_data[i][1] = 100;  // R
+      led_data[i][2] = 0;    // B
   }
+  ws2812_show();
 
   // 1. ネットワーク情報の定義
   wiz_NetInfo gWIZNETINFO = {
@@ -295,8 +325,39 @@ int main(void)
   WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_1_NODE_ID);
   WaveMotorCAN_Init(&wave_motor2, WAVE_MOTOR_2_NODE_ID);
 
-  // 高レベル制御UDP (Python GUIのOPEN/CLOSEボタン・ピッチ角目標値を受け取る)
-  HLControlUDP_Init(HLCONTROL_SN, HLCONTROL_PORT, &ttl_servo, &wave_motor, &wave_motor2);
+  // GIM6010-8 2台 (node_id 0x06, 0x07) / GIM8018-8 2台 (node_id 0x04, 0x05)。
+  // ODrive CAN SimpleのPosition Control(POS_FILTER)へ入れる。
+  // ⚠ 4軸分をノーウェイトで連続送信すると、STM32G4のTx FIFO(HW的に3要素しか
+  //   ない、can_bus.cのコメント参照)が溢れ、後方の軸(0x07以降)ほど設定フレームが
+  //   欠落しやすいため、各軸の間にHAL_Delay()を挟む(メインループ開始前で
+  //   CANUDPBridge_Poll等はまだ呼べないため、CANBus_Poll付きのDelay_WithCANPoll()
+  //   ではなく単純なHAL_Delay()を使う。FDCANの送信自体はソフトのポーリングと
+  //   無関係にハードウェアが自動で行うので、ここで待つだけでFIFOは空く)。
+  GIM6010_Init(&gim6010_a, GIM6010_A_NODE_ID);
+  GIM6010_EnterPositionControl(&gim6010_a);
+  HAL_Delay(10);
+
+  GIM6010_Init(&gim6010_b, GIM6010_B_NODE_ID);
+  GIM6010_EnterPositionControl(&gim6010_b);
+  HAL_Delay(10);
+
+  GIM8018_Init(&gim8018_c, GIM8018_C_NODE_ID);
+  GIM8018_EnterPositionControl(&gim8018_c);
+  HAL_Delay(10);
+
+  GIM8018_Init(&gim8018_d, GIM8018_D_NODE_ID);
+  GIM8018_EnterPositionControl(&gim8018_d);
+  HAL_Delay(10);
+
+  // 高レベル制御UDP (Python GUIのOPEN/CLOSEボタン・ピッチ角目標値・GIM6010/GIM8018
+  // ピッチ角目標値を受け取る)。GIM6010/GIM8018の初期位置はGUIから設定するのでは
+  // なく、ここでプログラム側の定数(GIM6010_*_INITIAL_NATIVE_TURNS /
+  // GIM8018_*_INITIAL_NATIVE_TURNS)として渡す。
+  HLControlUDP_Init(HLCONTROL_SN, HLCONTROL_PORT, &ttl_servo, &wave_motor, &wave_motor2,
+                     &gim6010_a, &gim6010_b,
+                     GIM6010_A_INITIAL_NATIVE_TURNS, GIM6010_B_INITIAL_NATIVE_TURNS,
+                     &gim8018_c, &gim8018_d,
+                     GIM8018_C_INITIAL_NATIVE_TURNS, GIM8018_D_INITIAL_NATIVE_TURNS);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -326,28 +387,20 @@ int main(void)
             }
         }
 
-        for (int i = 0; i < LED_NUM; i++) {
-            led_data[i][1] = 100;
-            led_data[i][2] = 0;
+        // 通信状態表示LED: 生CANブリッジ(can_udp_bridge.c)または高レベル制御UDP
+        // (hl_control_udp.c)のどちらかでPCから1度でもUDPを受信していれば青、
+        // まだ一度も受信していなければ赤 (どちらのgetterも一度1になったら以後
+        // 0に戻らないラッチ式なので、通信が一瞬でも成立すればそれ以降ずっと青のまま)。
+        {
+            uint8_t udp_active = (uint8_t)(CANUDPBridge_HasClient() || HLControlUDP_HasReceived());
+            for (int i = 0; i < LED_NUM; i++) {
+                led_data[i][0] = 0;                       // G
+                led_data[i][1] = udp_active ? 0U : 100U;   // R (未通信=赤)
+                led_data[i][2] = udp_active ? 100U : 0U;   // B (通信あり=青)
+            }
         }
         ws2812_show();
-        Delay_WithCANPoll(500);
-
-        // 緑
-        for (int i = 0; i < LED_NUM; i++) {
-            led_data[i][0] = 100;
-            led_data[i][1] = 0;
-        }
-        ws2812_show();
-        Delay_WithCANPoll(500);
-
-        // 青
-        for (int i = 0; i < LED_NUM; i++) {
-            led_data[i][0] = 0;
-            led_data[i][2] = 100;
-        }
-        ws2812_show();
-        Delay_WithCANPoll(500);
+        Delay_WithCANPoll(1500);
 
         // ソケットが開いていなければ開く
 		if (getSn_SR(sn) == SOCK_CLOSED) {
@@ -380,6 +433,38 @@ int main(void)
                 pos_target_turns = (pos_target_turns == 0.0f) ? 0.25f : 0.0f;
             }
             ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
+        }
+
+        // GIM6010-8 2台 (0x06, 0x07) / GIM8018-8 2台 (0x04, 0x05) を起動時から確実に
+        // クローズドループ(位置制御)で回し続けるため、Set_Controller_Mode +
+        // Set_Axis_Requested_State(CLOSED_LOOP) を定期的に再送する。起動時に1回だけ
+        // 送る実装だと、AutoRetransmission=DISABLE + ACK無し等でその1フレームが
+        // ロストした場合に永久にIDLEのままになってしまうため、GIM8018-8(gim_axis)の
+        // 位置指令と同様に継続的に送り直して確実性を上げる。
+        // ⚠ 4軸分を同じループ周回で一気に送ると、STM32G4のTx FIFOがHW的に3要素しか
+        //   ないため(can_bus.cのコメント参照)、CPU側がノーウェイトで積もうとして
+        //   溢れ、一部のフレームがHAL_FDCAN_AddMessageToTxFifoQ()の失敗で静かに
+        //   消えることがある(実際に0x07だけクローズドループに入らない不具合として
+        //   発現した)。1周回につき1軸だけラウンドロビンで送ることでburstサイズを
+        //   抑える(各軸は約4周回=6秒に1回の再送になるが、通常運用では十分な頻度)。
+        {
+            static uint8_t gim_reassert_idx = 0U;
+
+            switch (gim_reassert_idx) {
+                case 0U:
+                    GIM6010_EnterPositionControl(&gim6010_a);
+                    break;
+                case 1U:
+                    GIM6010_EnterPositionControl(&gim6010_b);
+                    break;
+                case 2U:
+                    GIM8018_EnterPositionControl(&gim8018_c);
+                    break;
+                default:
+                    GIM8018_EnterPositionControl(&gim8018_d);
+                    break;
+            }
+            gim_reassert_idx = (uint8_t)((gim_reassert_idx + 1U) % 4U);
         }
 
         // 固定の振り付けシーケンス(Sequence_Update()/s_seq_steps[])は無効化し、

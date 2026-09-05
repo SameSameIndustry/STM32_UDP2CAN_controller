@@ -42,6 +42,10 @@ void CANUDPBridge_Init(uint8_t sn, uint16_t listen_port);
  */
 void CANUDPBridge_Poll(void);
 
+/* PCから1度でもUDPパケットを受信済み(=送信元IP:portを記憶済み)なら1を返す。
+ * 通信状態表示LED等に使う診断用。一度1になったら以後0に戻ることはない。 */
+uint8_t CANUDPBridge_HasClient(void);
+
 #ifdef __cplusplus
 }
 #endif

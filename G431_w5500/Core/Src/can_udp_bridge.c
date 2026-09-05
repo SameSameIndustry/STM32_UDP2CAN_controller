@@ -115,3 +115,8 @@ void CANUDPBridge_Poll(void)
 
     CANUDPBridge_Drain();
 }
+
+uint8_t CANUDPBridge_HasClient(void)
+{
+    return s_have_dest;
+}

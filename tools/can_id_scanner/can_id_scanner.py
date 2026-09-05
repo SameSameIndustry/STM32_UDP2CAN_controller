@@ -103,9 +103,11 @@ ODRIVE_INPUT_MODE_POS_FILTER = 3
 # ---- 高レベル制御UDP (STM32側 Core/Src/hl_control_udp.c と対応) ----
 # CAN-UDPブリッジ(pack_command/unpack_report, ポート5001)とは別の専用ポート。
 # 仕様: tools/hl_control/PROTOCOL_HL_CONTROL_UDP.md
-HLCONTROL_CMD_SET_PITCH_TARGET = 0x01  # payload: float32 LE, deg (-100〜100, STM32側でクランプ)
-HLCONTROL_CMD_TTL_OPEN = 0x02          # payloadなし。0x21へ-25deg
-HLCONTROL_CMD_TTL_CLOSE = 0x03         # payloadなし。0x21へ+50deg
+HLCONTROL_CMD_SET_PITCH_TARGET = 0x01             # payload: float32 LE, deg (-100〜100, STM32側でクランプ)
+HLCONTROL_CMD_TTL_OPEN = 0x02                      # payloadなし。0x21へ-25deg
+HLCONTROL_CMD_TTL_CLOSE = 0x03                     # payloadなし。0x21へ+50deg
+HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG = 0x04  # payload: float32 LE, deg。0x06/0x07へ全く同じ目標値
+HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG = 0x05  # payload: float32 LE, deg。0x04は+偏差、0x05は-偏差(互い違い)
 HLCONTROL_DEFAULT_PORT = 5003
 
 
@@ -240,15 +242,20 @@ class Bridge:
 
 class HLControlPanel(ttk.LabelFrame):
     """高レベル制御UDP (hl_control_udp.c) 送信パネル。
-    OPEN/CLOSEボタン(TTLサーボ 0x21向け、絶対原点からのオフセット -25deg/+50deg)と
-    ピッチ角目標値(wave motor 0x11/0x12向け、-100〜100deg)を送る。
-    CAN-UDPブリッジ(Bridgeクラス、ポート5001)とは別の専用UDPソケット・ポート(既定5003)
-    を使う単方向(PC→STM32のみ)送信。角度の範囲チェック(クランプ)はSTM32側で行うため、
-    ここでは行わない。
+    OPEN/CLOSEボタン(TTLサーボ 0x21向け、絶対原点からのオフセット -25deg/+50deg)、
+    ピッチ角目標値(wave motor 0x11/0x12向け、-100〜100deg)、GIM6010-8(0x06/0x07、
+    全く同じ目標値)・GIM8018-8(0x04/0x05、符号反転で互い違いの目標値)のピッチ角
+    目標値を送る。GIM6010/GIM8018の初期位置はGUIからは設定できず、STM32側(main.c)の
+    プログラム定数で決まる。CAN-UDPブリッジ(Bridgeクラス、ポート5001)とは別の専用
+    UDPソケット・ポート(既定5003)を使う単方向(PC→STM32のみ)送信。角度の範囲チェック
+    (クランプ)はSTM32側で行うため、ここでは行わない。
     """
 
     def __init__(self, parent, app):
-        super().__init__(parent, text="高レベル制御 (UDP, TTLサーボ0x21 / wave motor 0x11,0x12)", padding=8)
+        super().__init__(
+            parent,
+            text="高レベル制御 (UDP, TTLサーボ0x21 / wave motor 0x11,0x12 / GIM6010 0x06,0x07 / GIM8018 0x04,0x05)",
+            padding=8)
         self.app = app
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -267,6 +274,26 @@ class HLControlPanel(ttk.LabelFrame):
         ttk.Entry(row2, textvariable=self.pitch_var, width=8).pack(side="left", padx=4)
         ttk.Button(row2, text="送信", command=self.on_send_pitch).pack(side="left", padx=4)
         ttk.Label(row2, text="(0x11へ符号反転した値、0x12へそのままの値が送られる)").pack(side="left", padx=4)
+
+        ttk.Separator(self, orient="horizontal").pack(fill="x", pady=6)
+
+        row4 = ttk.Frame(self)
+        row4.pack(fill="x")
+        ttk.Label(row4, text="GIM6010 ピッチ角目標値 [deg] (-100〜100、範囲外はSTM32側でクランプ):").pack(side="left")
+        self.gim_pitch_var = tk.StringVar(value="0")
+        ttk.Entry(row4, textvariable=self.gim_pitch_var, width=8).pack(side="left", padx=4)
+        ttk.Button(row4, text="送信", command=self.on_send_gim_pitch).pack(side="left", padx=4)
+        ttk.Label(row4, text="(0x06・0x07とも全く同じ目標値=各軸の初期位置+偏差。偏差=角度/360×8。"
+                              "初期位置はSTM32側のプログラム定数)").pack(side="left", padx=4)
+
+        row5 = ttk.Frame(self)
+        row5.pack(fill="x", pady=(4, 0))
+        ttk.Label(row5, text="GIM8018 ピッチ角目標値 [deg] (-100〜100、範囲外はSTM32側でクランプ):").pack(side="left")
+        self.gim8018_pitch_var = tk.StringVar(value="0")
+        ttk.Entry(row5, textvariable=self.gim8018_pitch_var, width=8).pack(side="left", padx=4)
+        ttk.Button(row5, text="送信", command=self.on_send_gim8018_pitch).pack(side="left", padx=4)
+        ttk.Label(row5, text="(0x04は初期位置+偏差、0x05は初期位置-偏差 と互い違いの目標値になる)").pack(
+            side="left", padx=4)
 
     def _target(self):
         try:
@@ -302,6 +329,22 @@ class HLControlPanel(ttk.LabelFrame):
             messagebox.showerror("エラー", "ピッチ角の入力が不正です")
             return
         self._send(struct.pack("<Bf", HLCONTROL_CMD_SET_PITCH_TARGET, deg))
+
+    def on_send_gim_pitch(self):
+        try:
+            deg = float(self.gim_pitch_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "GIM6010ピッチ角の入力が不正です")
+            return
+        self._send(struct.pack("<Bf", HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG, deg))
+
+    def on_send_gim8018_pitch(self):
+        try:
+            deg = float(self.gim8018_pitch_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "GIM8018ピッチ角の入力が不正です")
+            return
+        self._send(struct.pack("<Bf", HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG, deg))
 
 
 class ODriveMotorPanel(ttk.LabelFrame):
