@@ -171,32 +171,49 @@ void     WIZCHIP_WRITE_BUF(uint32_t AddrSel, uint8_t* pBuf, uint16_t len) {
 }
 
 
+// 元は`do{...}while(val != val1);`で、2回連続で同じ値が読めるまで無条件に
+// リトライしていた(レジスタ更新中の中途半端な値を読むのを防ぐ意図)。ノイズ等で
+// 毎回違う値が返り続けると、ここが無限ループしてsendto/recvfrom(このプロジェクトの
+// 全UDP送受信のホットパス)経由でメインループ全体が止まる不具合の一因になって
+// いた。上限を設け、それでも安定しなければ直近の読み取り値で妥協する。
+#define W5500_REG16_STABLE_MAX_RETRY 50U
+
 uint16_t getSn_TX_FSR(uint8_t sn) {
     uint16_t val = 0, val1 = 0;
+    uint16_t retry;
 
-    do {
+    for (retry = 0U; retry < W5500_REG16_STABLE_MAX_RETRY; retry++) {
         val1 = WIZCHIP_READ(Sn_TX_FSR(sn));
         val1 = (val1 << 8) + WIZCHIP_READ(WIZCHIP_OFFSET_INC(Sn_TX_FSR(sn), 1));
-        if (val1 != 0) {
-            val = WIZCHIP_READ(Sn_TX_FSR(sn));
-            val = (val << 8) + WIZCHIP_READ(WIZCHIP_OFFSET_INC(Sn_TX_FSR(sn), 1));
+        if (val1 == 0) {
+            return 0;
         }
-    } while (val != val1);
+        val = WIZCHIP_READ(Sn_TX_FSR(sn));
+        val = (val << 8) + WIZCHIP_READ(WIZCHIP_OFFSET_INC(Sn_TX_FSR(sn), 1));
+        if (val == val1) {
+            return val;
+        }
+    }
     return val;
 }
 
 
 uint16_t getSn_RX_RSR(uint8_t sn) {
     uint16_t val = 0, val1 = 0;
+    uint16_t retry;
 
-    do {
+    for (retry = 0U; retry < W5500_REG16_STABLE_MAX_RETRY; retry++) {
         val1 = WIZCHIP_READ(Sn_RX_RSR(sn));
         val1 = (val1 << 8) + WIZCHIP_READ(WIZCHIP_OFFSET_INC(Sn_RX_RSR(sn), 1));
-        if (val1 != 0) {
-            val = WIZCHIP_READ(Sn_RX_RSR(sn));
-            val = (val << 8) + WIZCHIP_READ(WIZCHIP_OFFSET_INC(Sn_RX_RSR(sn), 1));
+        if (val1 == 0) {
+            return 0;
         }
-    } while (val != val1);
+        val = WIZCHIP_READ(Sn_RX_RSR(sn));
+        val = (val << 8) + WIZCHIP_READ(WIZCHIP_OFFSET_INC(Sn_RX_RSR(sn), 1));
+        if (val == val1) {
+            return val;
+        }
+    }
     return val;
 }
 

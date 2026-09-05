@@ -92,6 +92,29 @@ static void wait_Sn_CR_clear(uint8_t sn)
     }
 }
 
+// 同じ理由(ノイズ等でSn_SRがいつまでも期待した状態にならないと無限ループする)で、
+// socket()/close()にあった`while (getSn_SR(sn) == X);`/`while (getSn_SR(sn) != X);`
+// を置き換えるための上限付き待機。
+static void wait_Sn_SR_not(uint8_t sn, uint8_t state)
+{
+    uint16_t i;
+    for (i = 0; i < SN_CR_WAIT_MAX_ITER; i++) {
+        if (getSn_SR(sn) != state) {
+            return;
+        }
+    }
+}
+
+static void wait_Sn_SR_is(uint8_t sn, uint8_t state)
+{
+    uint16_t i;
+    for (i = 0; i < SN_CR_WAIT_MAX_ITER; i++) {
+        if (getSn_SR(sn) == state) {
+            return;
+        }
+    }
+}
+
 //A20150601 : For integrating with W5300
 #if _WIZCHIP_ == 5300
 uint8_t sock_remained_byte[_WIZCHIP_SOCK_NUM_] = {0,}; // set by wiz_recv_data()
@@ -367,7 +390,7 @@ int8_t socket(uint8_t sn, uint8_t protocol, uint16_t port, uint8_t flag) {
     //sock_pack_info[sn] = 0;
     sock_pack_info[sn] = PACK_COMPLETED;//PACK_COMPLETED //TODO::need verify:LINAN 20250421
     //
-    while (getSn_SR(sn) == SOCK_CLOSED);
+    wait_Sn_SR_not(sn, SOCK_CLOSED);
     return (int8_t)sn;
 }
 
@@ -408,7 +431,7 @@ int8_t close(uint8_t sn) {
     sock_is_sending &= ~(1 << sn);
     sock_remained_size[sn] = 0;
     sock_pack_info[sn] = PACK_NONE;
-    while (getSn_SR(sn) != SOCK_CLOSED);
+    wait_Sn_SR_is(sn, SOCK_CLOSED);
     return SOCK_OK;
 }
 
@@ -492,14 +515,21 @@ static int8_t connect_IO_6(uint8_t sn, uint8_t * addr, uint16_t port, uint8_t ad
     if (sock_io_mode & (1 << sn)) {
         return SOCK_BUSY;
     }
-    while (getSn_SR(sn) != SOCK_ESTABLISHED) {
-        if (getSn_IR(sn) & Sn_IR_TIMEOUT) {
-            setSn_IR(sn, Sn_IR_TIMEOUT);
-            return SOCKERR_TIMEOUT;
-        }
-
-        if (getSn_SR(sn) == SOCK_CLOSED) {
-            return SOCKERR_SOCKCLOSED;
+    /* 本プロジェクトはUDPのみでconnect()(TCP専用)自体を使っていないが、念のため
+     * 他の箇所と同様に上限を設けておく。 */
+    {
+        uint16_t wait_i;
+        for (wait_i = 0U; wait_i < SN_CR_WAIT_MAX_ITER; wait_i++) {
+            if (getSn_SR(sn) == SOCK_ESTABLISHED) {
+                break;
+            }
+            if (getSn_IR(sn) & Sn_IR_TIMEOUT) {
+                setSn_IR(sn, Sn_IR_TIMEOUT);
+                return SOCKERR_TIMEOUT;
+            }
+            if (getSn_SR(sn) == SOCK_CLOSED) {
+                return SOCKERR_SOCKCLOSED;
+            }
         }
     }
 
@@ -517,10 +547,18 @@ int8_t disconnect(uint8_t sn) {
         if (sock_io_mode & (1 << sn)) {
             return SOCK_BUSY;
         }
-        while (getSn_SR(sn) != SOCK_CLOSED) {
-            if (getSn_IR(sn) & Sn_IR_TIMEOUT) {
-                close(sn);
-                return SOCKERR_TIMEOUT;
+        /* 本プロジェクトはUDPのみでdisconnect()(TCP専用)自体を使っていないが、
+         * 念のため他の箇所と同様に上限を設けておく。 */
+        {
+            uint16_t wait_i;
+            for (wait_i = 0U; wait_i < SN_CR_WAIT_MAX_ITER; wait_i++) {
+                if (getSn_SR(sn) == SOCK_CLOSED) {
+                    break;
+                }
+                if (getSn_IR(sn) & Sn_IR_TIMEOUT) {
+                    close(sn);
+                    return SOCKERR_TIMEOUT;
+                }
             }
         }
     }
@@ -909,27 +947,38 @@ static int32_t sendto_IO_6(uint8_t sn, uint8_t * buf, uint16_t len, uint8_t * ad
 #endif
     /* wait to process the command... */
     wait_Sn_CR_clear(sn);
-    while (1) {
-        tmp = getSn_IR(sn);
-        if (tmp & Sn_IR_SENDOK) {
-            setSn_IR(sn, Sn_IR_SENDOK);
-            break;
-        }
-        //M:20131104
-        //else if(tmp & Sn_IR_TIMEOUT) return SOCKERR_TIMEOUT;
-        else if (tmp & Sn_IR_TIMEOUT) {
-            setSn_IR(sn, Sn_IR_TIMEOUT);
-            //M20150409 : Fixed the lost of sign bits by type casting.
-            //len = (uint16_t)SOCKERR_TIMEOUT;
-            //break;
-#if _WIZCHIP_ < 5500   //M20150401 : for WIZCHIP Errata #4, #5 (ARP errata)
-            if (taddr) {
-                setSUBR((uint8_t*)&taddr);
+    /* Sn_IR_SENDOK(送信完了)にもSn_IR_TIMEOUTにも他の非ブロッキング用エスケープが
+     * 無く、元は`while(1)`で無条件に待ち続けていた。ノイズ等でSn_CRの書き込み自体が
+     * 化けて実際には送信要求が処理されず、どちらのフラグも一切立たないままになると
+     * ここが無限ループしてsendto()を呼んだ側(main.cのメインループ全体)が永久に
+     * 止まる不具合が実機で複数回再現した。sendto()は本プロジェクトの全UDP送信
+     * (ハートビート・CAN-UDPブリッジ中継等)が毎ループ通る経路なので影響が大きい。
+     * SN_CR_WAIT_MAX_ITER回待っても決着しなければ諦めて抜ける(呼び出し側の多くは
+     * 戻り値を見ておらず、1回の送信ロストは実害が小さいため)。 */
+    {
+        uint16_t send_wait_iter;
+        for (send_wait_iter = 0U; send_wait_iter < SN_CR_WAIT_MAX_ITER; send_wait_iter++) {
+            tmp = getSn_IR(sn);
+            if (tmp & Sn_IR_SENDOK) {
+                setSn_IR(sn, Sn_IR_SENDOK);
+                break;
             }
+            //M:20131104
+            //else if(tmp & Sn_IR_TIMEOUT) return SOCKERR_TIMEOUT;
+            else if (tmp & Sn_IR_TIMEOUT) {
+                setSn_IR(sn, Sn_IR_TIMEOUT);
+                //M20150409 : Fixed the lost of sign bits by type casting.
+                //len = (uint16_t)SOCKERR_TIMEOUT;
+                //break;
+#if _WIZCHIP_ < 5500   //M20150401 : for WIZCHIP Errata #4, #5 (ARP errata)
+                if (taddr) {
+                    setSUBR((uint8_t*)&taddr);
+                }
 #endif
-            return SOCKERR_TIMEOUT;
+                return SOCKERR_TIMEOUT;
+            }
+            ////////////
         }
-        ////////////
     }
 #if _WIZCHIP_ < 5500   //M20150401 : for WIZCHIP Errata #4, #5 (ARP errata)
     if (taddr) {

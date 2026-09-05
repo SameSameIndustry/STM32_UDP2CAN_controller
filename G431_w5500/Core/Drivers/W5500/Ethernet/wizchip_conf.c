@@ -1280,6 +1280,35 @@ void wizphy_setphypmode(uint8_t pmode) {
 #endif
 }
 
+// wizchip_arp/ping/dad/slaac/unsolicited(いずれも本プロジェクトからは未使用、ARP/PING/
+// IPv6手動問い合わせ用)は元々`wait_SLCR_clear();`と`tmp = wait_SLIR_nonzero();`
+// で無条件に無限ループしていた。他のwhile(getSn_CR)等と同様、SPI/チップ側の不調で
+// 条件が満たされないと永久ハングしうるため、他の箇所に合わせて上限付きに揃えておく。
+#define SLCR_WAIT_MAX_ITER 50U
+
+static void wait_SLCR_clear(void)
+{
+    uint16_t i;
+    for (i = 0; i < SLCR_WAIT_MAX_ITER; i++) {
+        if (getSLCR() == 0) {
+            return;
+        }
+    }
+}
+
+static uint8_t wait_SLIR_nonzero(void)
+{
+    uint16_t i;
+    uint8_t tmp;
+    for (i = 0; i < SLCR_WAIT_MAX_ITER; i++) {
+        tmp = getSLIR();
+        if (tmp != 0x00) {
+            return tmp;
+        }
+    }
+    return 0x00;
+}
+
 int8_t wizchip_arp(wiz_ARP* arp) {
     uint8_t tmp;
     if (arp->destinfo.len == 16) {
@@ -1289,8 +1318,8 @@ int8_t wizchip_arp(wiz_ARP* arp) {
         setSLDIP4R(arp->destinfo.ip);
         setSLCR(SLCR_ARP4);
     }
-    while (getSLCR());
-    while ((tmp = getSLIR()) == 0x00);
+    wait_SLCR_clear();
+    tmp = wait_SLIR_nonzero();
     setSLIRCLR(~SLIR_RA);
     if (tmp & (SLIR_ARP4 | SLIR_ARP6)) {
         getSLDHAR(arp->dha);
@@ -1310,8 +1339,8 @@ int8_t wizchip_ping(wiz_PING* ping) {
         setSLDIP4R(ping->destinfo.ip);
         setSLCR(SLCR_PING4);
     }
-    while (getSLCR());
-    while ((tmp = getSLIR()) == 0x00);
+    wait_SLCR_clear();
+    tmp = wait_SLIR_nonzero();
     setSLIRCLR(~SLIR_RA);
     if (tmp & (SLIR_PING4 | SLIR_PING6)) {
         return 0;
@@ -1323,8 +1352,8 @@ int8_t wizchip_dad(uint8_t* ipv6) {
     uint8_t tmp;
     setSLDIP6R(ipv6);
     setSLCR(SLCR_NS);
-    while (getSLCR());
-    while ((tmp = getSLIR()) == 0x00);
+    wait_SLCR_clear();
+    tmp = wait_SLIR_nonzero();
     setSLIRCLR(~SLIR_RA);
     if (tmp & SLIR_TOUT) {
         return 0;
@@ -1335,8 +1364,8 @@ int8_t wizchip_dad(uint8_t* ipv6) {
 int8_t wizchip_slaac(wiz_Prefix* prefix) {
     uint8_t tmp;
     setSLCR(SLCR_RS);
-    while (getSLCR());
-    while ((tmp = getSLIR()) == 0x00);
+    wait_SLCR_clear();
+    tmp = wait_SLIR_nonzero();
     setSLIRCLR(~SLIR_RA);
     if (tmp & SLIR_RS) {
         prefix->len = getPLR();
@@ -1352,8 +1381,8 @@ int8_t wizchip_slaac(wiz_Prefix* prefix) {
 int8_t wizchip_unsolicited(void) {
     uint8_t tmp;
     setSLCR(SLCR_UNA);
-    while (getSLCR());
-    while ((tmp = getSLIR()) == 0x00);
+    wait_SLCR_clear();
+    tmp = wait_SLIR_nonzero();
     setSLIRCLR(~SLIR_RA);
     if (tmp & SLIR_TOUT) {
         return 0;
