@@ -86,8 +86,8 @@
 // 0x06/0x07の「初期位置」(ネイティブ=モーター軸turns基準)。GUIからは設定できず、
 // ここを編集して書き込むことで変更する。実機の電源投入時の実位置とは無関係
 // (単なる目標値計算の基準点オフセット)。
-#define GIM6010_A_INITIAL_NATIVE_TURNS -0.44f
-#define GIM6010_B_INITIAL_NATIVE_TURNS -0.22f
+#define GIM6010_A_INITIAL_NATIVE_TURNS -0.62f
+#define GIM6010_B_INITIAL_NATIVE_TURNS -0.485f
 
 // GIM8018-8 2台 (node_id 0x04, 0x05)。GIM6010(0x06/0x07)と同じ考え方だが、
 // こちらは目標値が互い違い(符号反転・同じ大きさ)になる (HLControlUDP_Poll()参照)。
