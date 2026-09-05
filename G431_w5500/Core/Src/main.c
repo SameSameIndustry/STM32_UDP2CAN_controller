@@ -86,8 +86,8 @@
 // 0x06/0x07の「初期位置」(ネイティブ=モーター軸turns基準)。GUIからは設定できず、
 // ここを編集して書き込むことで変更する。実機の電源投入時の実位置とは無関係
 // (単なる目標値計算の基準点オフセット)。
-#define GIM6010_A_INITIAL_NATIVE_TURNS 0.0f
-#define GIM6010_B_INITIAL_NATIVE_TURNS 0.0f
+#define GIM6010_A_INITIAL_NATIVE_TURNS -0.44f
+#define GIM6010_B_INITIAL_NATIVE_TURNS -0.22f
 
 // GIM8018-8 2台 (node_id 0x04, 0x05)。GIM6010(0x06/0x07)と同じ考え方だが、
 // こちらは目標値が互い違い(符号反転・同じ大きさ)になる (HLControlUDP_Poll()参照)。
@@ -447,6 +447,10 @@ int main(void)
         //   消えることがある(実際に0x07だけクローズドループに入らない不具合として
         //   発現した)。1周回につき1軸だけラウンドロビンで送ることでburstサイズを
         //   抑える(各軸は約4周回=6秒に1回の再送になるが、通常運用では十分な頻度)。
+        // 同じ番の軸に、HLControlUDP_ResendLastTarget()でSet_Input_Posも併せて
+        // 再送する。GUIから新規コマンドが来ない間もgim_axis(node0)と同様に目標値を
+        // 送り続けることで、GIM8108-8側の入力タイムアウト等により単発コマンドだけ
+        // では目標を見失ってしまう(と疑われる)問題に対応する。
         {
             static uint8_t gim_reassert_idx = 0U;
 
@@ -464,8 +468,15 @@ int main(void)
                     GIM8018_EnterPositionControl(&gim8018_d);
                     break;
             }
+            HLControlUDP_ResendLastTarget(gim_reassert_idx);
             gim_reassert_idx = (uint8_t)((gim_reassert_idx + 1U) % 4U);
         }
+
+        // GIM6010 A(0x06)/B(0x07)は常に同じ目標値を送っているが、実機で出力角に
+        // 定常的なズレが残る場合があるため、実測角度差から低速に補正する
+        // (GIM6010_A/B_INITIAL_NATIVE_TURNSのOFFSETは変更しない。詳細は
+        // hl_control_udp.hのコメント参照)。メインループ1周(約1.5秒)に1回で十分。
+        HLControlUDP_UpdateGim6010Sync();
 
         // 固定の振り付けシーケンス(Sequence_Update()/s_seq_steps[])は無効化し、
         // 代わりにPython GUIからの高レベル制御UDP(OPEN/CLOSEボタン・ピッチ角目標値)を

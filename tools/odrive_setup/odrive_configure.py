@@ -35,6 +35,11 @@ USB経由でodrivetoolのPythonライブラリ(`odrive`パッケージ)を使っ
     python odrive_configure.py --can-id 1
     python odrive_configure.py --can-id 2 --current-lim 15 --vel-limit 20
 
+    # GIM8108-8(旧称GIM8018-8と混同されていたモデル)の場合は極対数・トルク定数・
+    # 電流上限の絶対上限が違うので、必ず以下のように指定すること
+    python odrive_configure.py --can-id 4 --pole-pairs 21 --torque-constant 1.00 \\
+        --current-lim-hard-max 25 --current-lim 15
+
     全オプションは python odrive_configure.py --help を参照。
 
 Windowsでのセットアップ (マニュアル3.1.2節準拠):
@@ -61,12 +66,15 @@ import odrive
 from odrive.utils import dump_errors
 
 # ============================================================================
-# GIM6010-8のデータシート値(マニュアル1.2/1.3節)。モーター固有の固定値なので
-# コマンドライン引数にはしていない。別モデルを使う場合はここを直すこと。
+# データシート値のデフォルト(GIM6010-8, マニュアル1.2/1.3節基準)。
+# GIM8108-8(旧称"GIM8018-8"と混同されていたが正しくは8108)等、別モデルの場合は
+# --pole-pairs/--torque-constant/--current-lim-hard-max で上書きすること。
+#   GIM8108-8の実測値: pole_pairs=21, torque_constant=1.00 N.m/A,
+#   定格電流7A, 最大(ストール)電流25A (SteadyWin公式 steadywin.cn 掲載マニュアル準拠)
 # ============================================================================
-POLE_PAIRS = 14         # マニュアル1.3節 "polar logarithm": 14 pairs
-TORQUE_CONSTANT = 0.47  # マニュアル1.2節 "torque constant": 0.47 N.m/A (実測値)
-CURRENT_LIM_HARD_MAX = 50.0  # マニュアル本文の明記: GIM6010-8はこれを超えないこと
+POLE_PAIRS = 14         # マニュアル1.3節 "polar logarithm": 14 pairs (GIM6010-8既定値)
+TORQUE_CONSTANT = 0.47  # マニュアル1.2節 "torque constant": 0.47 N.m/A (GIM6010-8既定値)
+CURRENT_LIM_HARD_MAX = 50.0  # マニュアル本文の明記: GIM6010-8はこれを超えないこと(既定値)
 
 
 def parse_args():
@@ -84,7 +92,22 @@ def parse_args():
     p.add_argument("--current-lim", "--current_lim", dest="current_lim",
                     type=float, default=10.0,
                     help="Q軸電流上限[A] (デフォルト10A)。GIM6010-8は50Aを超えないこと"
-                         "(マニュアル本文に明記)。定格電流6A・ブロッキング電流25Aが目安")
+                         "(マニュアル本文に明記)。定格電流6A・ブロッキング電流25Aが目安。"
+                         "GIM8108-8の場合は--current-lim-hard-maxも25に変更すること")
+    p.add_argument("--pole-pairs", "--pole_pairs", dest="pole_pairs",
+                    type=int, default=POLE_PAIRS,
+                    help=f"モーターの極対数 (デフォルト{POLE_PAIRS}=GIM6010-8の値)。"
+                         "GIM8108-8(旧称GIM8018-8と混同されていたモデル)の場合は21を指定すること"
+                         "(SteadyWin公式マニュアル steadywin.cn 掲載値)")
+    p.add_argument("--torque-constant", "--torque_constant", dest="torque_constant",
+                    type=float, default=TORQUE_CONSTANT,
+                    help=f"トルク定数[N.m/A] (デフォルト{TORQUE_CONSTANT}=GIM6010-8の値)。"
+                         "GIM8108-8の場合は1.00を指定すること")
+    p.add_argument("--current-lim-hard-max", "--current_lim_hard_max", dest="current_lim_hard_max",
+                    type=float, default=CURRENT_LIM_HARD_MAX,
+                    help=f"--current-limの絶対上限[A] (デフォルト{CURRENT_LIM_HARD_MAX}A="
+                         "GIM6010-8の値)。GIM8108-8は最大(ストール)電流25Aなので"
+                         "25を指定すること")
     p.add_argument("--calibration-current", "--calibration_current", dest="calibration_current",
                     type=float, default=5.0,
                     help="較正時に流す電流[A] (デフォルト5A、マニュアルのデフォルト値)")
@@ -120,9 +143,9 @@ def wait_for_idle(odrv0, label, timeout_s=60):
 def main():
     args = parse_args()
 
-    if args.current_lim > CURRENT_LIM_HARD_MAX:
-        print(f"--current-lim が {CURRENT_LIM_HARD_MAX}A を超えています。"
-              f"GIM6010-8のマニュアルにより {CURRENT_LIM_HARD_MAX}A 以下にしてください。")
+    if args.current_lim > args.current_lim_hard_max:
+        print(f"--current-lim が --current-lim-hard-max({args.current_lim_hard_max}A) を"
+              f"超えています。{args.current_lim_hard_max}A 以下にしてください。")
         sys.exit(1)
 
     print("ODriveを検索中... (USB接続を確認してください)")
@@ -142,9 +165,10 @@ def main():
         odrv0.axis0.requested_state = 1
         time.sleep(0.5)
 
-    print("\nモーター設定を書き込みます...")
-    odrv0.axis0.motor.config.pole_pairs = POLE_PAIRS
-    odrv0.axis0.motor.config.torque_constant = TORQUE_CONSTANT
+    print(f"\nモーター設定を書き込みます (pole_pairs={args.pole_pairs}, "
+          f"torque_constant={args.torque_constant})...")
+    odrv0.axis0.motor.config.pole_pairs = args.pole_pairs
+    odrv0.axis0.motor.config.torque_constant = args.torque_constant
     odrv0.axis0.motor.config.current_lim = args.current_lim
     odrv0.axis0.motor.config.calibration_current = args.calibration_current
     odrv0.axis0.motor.config.resistance_calib_max_voltage = resistance_calib_max_voltage

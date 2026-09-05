@@ -30,8 +30,10 @@ extern "C" {
  *   HLCONTROL_CMD_TTL_CLOSE (0x03): payloadなし。0x21(TTLサーボ)へ
  *     オフセット HLCONTROL_TTL_CLOSE_DEG を送る。
  *   HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG (0x04): payload = float32 LE、
- *     角度[deg]。ネイティブ換算の偏差 = deg/360*GIM6010_GEAR_RATIO(=8) を計算し、
- *     0x06・0x07とも「各軸の初期位置 + 偏差」(全く同じ値)をSet_Input_Pos(絶対位置、
+ *     角度[deg]。まず入力値を HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG〜MAX_DEG
+ *     (既定 0〜60deg) にクランプし、それを符号反転(=出力角として-60〜0degに
+ *     なる)してから偏差計算に使う(deg/360*GIM6010_GEAR_RATIO(=8))。0x06・0x07
+ *     とも「各軸の初期位置 + 偏差」(全く同じ値)をSet_Input_Pos(絶対位置、
  *     ネイティブturns)として送る。初期位置はGUIから設定するのではなく、main.cの
  *     GIM6010_A_INITIAL_NATIVE_TURNS / GIM6010_B_INITIAL_NATIVE_TURNS を編集して
  *     HLControlUDP_Init()に渡す(プログラム側の定数)。
@@ -60,9 +62,11 @@ extern "C" {
 #define HLCONTROL_TTL_CLOSE_DEG   (50.0f)
 
 /* GIM6010/GIM8018ピッチ角目標値のクランプ範囲。wave motorのピッチ角目標値とは別の値
- * (減速比8なので角度指定の実質可動範囲がwave motorと異なるため)。 */
-#define HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG (-100.0f)
-#define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (100.0f)
+ * (減速比8なので角度指定の実質可動範囲がwave motorと異なるため)。
+ * GIM6010は実機の出力角可動範囲が-60〜0degのため、符号反転する前の「入力値」
+ * としては0〜60degを有効範囲としてクランプする(反転後に-60〜0degになる)。 */
+#define HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG (0.0f)
+#define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (60.0f)
 #define HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG (-100.0f)
 #define HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG  (100.0f)
 
@@ -86,6 +90,23 @@ void HLControlUDP_Poll(void);
 /* PCから1度でも高レベル制御コマンドを受信済みなら1を返す。通信状態表示LED等に
  * 使う診断用。一度1になったら以後0に戻ることはない。 */
 uint8_t HLControlUDP_HasReceived(void);
+
+/* index番目の軸(0=gim6010_a, 1=gim6010_b, 2=gim8018_c, 3=gim8018_d)に、最後に
+ * 指令した絶対目標位置(ネイティブturns、GUIからまだ何も来ていなければ初期位置)を
+ * Set_Input_Posで再送する。main.cのラウンドロビン(EnterPositionControlと同じ
+ * indexの並び)から毎ループその軸の番が来るたびに呼ぶことを想定している。
+ * GUIからの新規コマンドが来ない間も目標値を送り続けることで、旧gim_axis(node0)の
+ * 実装と同様の継続的な送信を再現する(GIM8108-8側の入力タイムアウト対策)。 */
+void HLControlUDP_ResendLastTarget(uint8_t index);
+
+/* GIM6010 A(0x06)/B(0x07)は常に同じ絶対目標値を送っているにもかかわらず、実機の
+ * 出力角に定常的なズレが残る場合がある(負荷差・個体差等でODrive内部PIDだけでは
+ * 消しきれない定常偏差)。これを補正するため、A/Bの実際の出力角度差
+ * (GIM6010_GetOutputPosDeg)を見て、両軸の目標値に少しずつ逆向きのトリムを
+ * 足し込む低速な積分補正。GIM6010_A/B_INITIAL_NATIVE_TURNS(OFFSET)自体は
+ * 書き換えない。メインループから低頻度(概ね数百ms〜数秒に1回)で呼ぶこと。
+ * 両軸がCLOSED_LOOP_CONTROLでない間は何もしない。 */
+void HLControlUDP_UpdateGim6010Sync(void);
 
 #ifdef __cplusplus
 }
