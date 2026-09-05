@@ -141,6 +141,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_SPI1_Init(void);
+static HAL_StatusTypeDef SPI1_Configure(void);
 static void MX_FDCAN1_Init(void);
 /* USER CODE BEGIN PFP */
 void ws2812_show(void);
@@ -185,7 +186,11 @@ static void W5500_SPI_Recover(void)
 {
     W5500_Unselect();
     HAL_SPI_DeInit(&hspi1);
-    MX_SPI1_Init();
+    /* MX_SPI1_Init()は失敗するとError_Handler()(=while(1)の永久ハング)を呼ぶため
+     * ここでは使わない。SPI1_Configure()を直接呼び、失敗しても戻り値を無視して
+     * 呼び出し元へ制御を返す(次回のSPI呼び出しのタイムアウトで再度ここに来て
+     * 再試行するだけにとどめる)。 */
+    (void)SPI1_Configure();
 }
 
 uint8_t W5500_ReadByte(void) {
@@ -626,16 +631,12 @@ static void MX_FDCAN1_Init(void)
   * @param None
   * @retval None
   */
-static void MX_SPI1_Init(void)
+// SPI1のフィールド設定+HAL_SPI_Init()呼び出しだけを切り出したもの。MX_SPI1_Init()
+// (起動時、失敗したらError_Handler()=while(1)の永久ハングで停止して構わない)と、
+// W5500_SPI_Recover()(実行時のSPIタイムアウト復旧、失敗してもハングさせては
+// いけない)の両方から使う。
+static HAL_StatusTypeDef SPI1_Configure(void)
 {
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
   /* SPI1 parameter configuration*/
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
@@ -651,7 +652,20 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CRCPolynomial = 7;
   hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
   hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  return HAL_SPI_Init(&hspi1);
+}
+
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  if (SPI1_Configure() != HAL_OK)
   {
     Error_Handler();
   }
