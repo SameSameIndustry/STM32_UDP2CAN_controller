@@ -235,20 +235,40 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&pitch_deg, &buf[1], sizeof(float));
-        /* GIM8018(GIM8108-8)は角度クランプなし。入力値をそのまま偏差計算に使う。 */
+        /* GIM8018(GIM8108-8)は角度クランプなし。deg -> ネイティブ(モーター軸)turns。
+         * deg/360*8 = deg/45 (= 旧コードの ax_target[rad]/M_PI*4 と等価)。 */
         native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
-        /* GIM6010(0x06/0x07)とは逆に、0x04には「初期位置C + 偏差」、0x05には
-         * 「初期位置D - 偏差」(符号反転・同じ大きさ)を送る = 目標値を互い違いにする。 */
+        /* 旧コードと同じ計算・同じ向き:
+         *   node4 (CAN ID 0x8C = Set_Input_Pos) <- native_delta + 1.3
+         *   node5 (CAN ID 0xAC = Set_Input_Pos) <- native_delta - 1.3
+         * 固定オフセット +1.3 / -1.3 は GIM8018_C/D_INITIAL_NATIVE_TURNS で持つ。
+         * (旧コードの offset_ax4/ax5 は 0 とみなす = キャプチャなし) */
         s_gim8018_c_last_target = s_gim8018_c_initial_native + native_delta;
-        s_gim8018_d_last_target = s_gim8018_d_initial_native - native_delta;
-        if (s_gim8018_c != NULL) {
-            HLControl_EnsureGim8018ClosedLoop(s_gim8018_c);
-            ODriveCAN_SetInputPos(&s_gim8018_c->odrv, s_gim8018_c_last_target, 0.0f, 0.0f);
-        }
-        if (s_gim8018_d != NULL) {
-            HLControl_EnsureGim8018ClosedLoop(s_gim8018_d);
-            ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_last_target, 0.0f, 0.0f);
+        s_gim8018_d_last_target = s_gim8018_d_initial_native + native_delta;
+
+        /* GIM6010 と同じく、目標を送る直前に axis_state を見てクローズドループで
+         * なければモードを再設定する(既にクローズドループなら 0 フレーム)。
+         * ★バス混雑対策: 毎回 C→D の順で立て続けに送ると、後発の D のフレームが
+         *   FDCAN TxFIFO(3段)溢れで弾かれやすい(can_bus.c のコメント参照)。
+         *   受信のたびに送信順を入れ替えて、D が常に後ろにならないようにする。
+         *   周期再送は main.c のラウンドロビン(1周1軸)が担当するので、ここは
+         *   GUI コマンド受信時の単発イベントのみ。 */
+        {
+            static uint8_t d_first = 0U;
+            if (d_first && (s_gim8018_d != NULL)) {
+                HLControl_EnsureGim8018ClosedLoop(s_gim8018_d);
+                ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_last_target, 0.0f, 0.0f);
+            }
+            if (s_gim8018_c != NULL) {
+                HLControl_EnsureGim8018ClosedLoop(s_gim8018_c);
+                ODriveCAN_SetInputPos(&s_gim8018_c->odrv, s_gim8018_c_last_target, 0.0f, 0.0f);
+            }
+            if (!d_first && (s_gim8018_d != NULL)) {
+                HLControl_EnsureGim8018ClosedLoop(s_gim8018_d);
+                ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_last_target, 0.0f, 0.0f);
+            }
+            d_first = (uint8_t)(!d_first);
         }
     }
     /* 未知のコマンドは無視する */
@@ -291,7 +311,7 @@ void HLControlUDP_ResendLastTarget(uint8_t index)
                 ODriveCAN_SetInputPos(&s_gim8018_c->odrv, s_gim8018_c_last_target, 0.0f, 0.0f);
             }
             break;
-        default:
+        default:  /* index 3 */
             if (s_gim8018_d != NULL) {
                 ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_last_target, 0.0f, 0.0f);
             }

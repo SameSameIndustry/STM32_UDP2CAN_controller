@@ -22,6 +22,18 @@ odrive_configure.py の較正で作り直します。
 2. 中身を確認(エンコーダ関連だけ抜粋表示):
        python odrive_clone_encoder_config.py --show gim6010_ref.json
 
+2b. 設定の差分を取る(--diff):
+       # JSON 2つを比較 (USB不要)
+       python odrive_clone_encoder_config.py --diff good.json bad.json
+       # 保存済み JSON と「いま USB 接続中の個体」を比較
+       python odrive_clone_encoder_config.py --diff good.json device --can-id 4
+       # 較正前後の自分自身を比較
+       python odrive_clone_encoder_config.py --dump before.json --can-id 4
+       # ...較正...
+       python odrive_clone_encoder_config.py --diff before.json device --can-id 4
+       # .config. だけでなく全項目(毎回変わるライブ値は自動除外):
+       python odrive_clone_encoder_config.py --diff a.json b.json --all
+
 3. GIM8108-8 を USB 接続し、エンコーダ関連設定を「ドライラン」で差分確認:
        python odrive_clone_encoder_config.py --apply gim6010_ref.json --can-id 4
 
@@ -67,9 +79,11 @@ def parse_args():
         description="動いているGIM6010-8のODrive設定をダンプし、エンコーダ関連だけをGIM8108-8へclone書き込みする")
     p.add_argument("--dump", metavar="FILE", help="接続中の個体の全設定をFILE(JSON)へ書き出す")
     p.add_argument("--show", metavar="FILE", help="ダンプ済みJSONのエンコーダ関連だけを表示して終了(USB不要)")
-    p.add_argument("--diff", nargs=2, metavar=("A.json", "B.json"),
-                    help="ダンプ済みJSON 2つの .config. 値の差分を表示(USB不要)。"
-                         "動いている個体とダメな個体の設定差を見るのに使う")
+    p.add_argument("--diff", nargs=2, metavar=("A", "B"),
+                    help="設定の差分を表示。A/B はダンプ済みJSONファイル、または 'device'(=いま"
+                         "USB接続中の個体をその場で走査)。例: --diff good.json device / "
+                         "--diff good.json bad.json。既定は .config. 値のみ比較(--all で全項目、"
+                         "ただし毎回変わるライブ値は自動除外)。--include/--exclude も効く")
     p.add_argument("--apply", metavar="FILE", help="ダンプ済みJSONのエンコーダ関連を接続中の個体へ反映する")
     p.add_argument("--write", action="store_true",
                     help="--apply 時、実際に書き込む(付けないとドライラン=差分表示のみ)")
@@ -217,27 +231,82 @@ def cmd_show(path):
     show_encoder_subset(data.get("values", {}))
 
 
-def cmd_diff(path_a, path_b):
-    with open(path_a, encoding="utf-8") as f:
-        a = json.load(f)
-    with open(path_b, encoding="utf-8") as f:
-        b = json.load(f)
-    va, vb = a.get("values", {}), b.get("values", {})
-    print(f"A = {path_a}  meta={a.get('meta')}")
-    print(f"B = {path_b}  meta={b.get('meta')}")
+# --all 時、毎回の読み取りで変動するライブ値(設定ではない)を差分から除外するための正規表現
+NOISE_LIVE = re.compile(
+    r"(task_times|\.times\.|uptime|timestamp|n_evt|loop_time|"
+    r"pos_estimate|vel_estimate|pos_circular|pos_cpr_counts|pos_estimate_counts|pos_abs|"
+    r"count_in_cpr|shadow_count|delta_pos|\.phase$|\.phase_vel$|interpolation|calib_scan_response|"
+    r"temperature|vbus_voltage|ibus|_measured$|Iq_|Id_|electrical_power|mechanical_power|"
+    r"sensorless_estimator\.(pll_pos|vel_estimate|phase)|"
+    r"\.is_ready$|\.index_found$|\.hall_state$|spi_error|"
+    r"controller\.(pos_setpoint|vel_setpoint|torque_setpoint|input_pos|input_vel|input_torque|"
+    r"effective_current_limit|trajectory|autotuning|mechanical_power|electrical_power)|"
+    r"current_control\.|\.error$|\.disarm_reason$|current_state$|requested_state$|is_armed$)"
+)
 
-    keys = sorted(k for k in set(va) | set(vb) if ".config." in k)
+
+def load_diff_side(spec, args):
+    """spec が 'device'/'live' なら USB 接続してその場で走査、そうでなければ JSON ファイルとして読む。
+    戻り値: (label, meta, values_dict)"""
+    if spec.lower() in ("device", "live", "-"):
+        odrv0 = connect_and_check(args.can_id, args.force)
+        print(f"  ('{spec}') 全ツリーを走査中...")
+        values = walk(odrv0)
+        meta = {
+            "source": "device",
+            "node_id": get_safe(odrv0, "axis0.config.can.node_id"),
+            "fw_version": ".".join(str(getattr(odrv0, f"fw_version_{k}", "?"))
+                                    for k in ("major", "minor", "revision")),
+            "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return f"device({meta['node_id']})", meta, values
+    with open(spec, encoding="utf-8") as f:
+        data = json.load(f)
+    return spec, data.get("meta"), data.get("values", {})
+
+
+def cmd_diff(spec_a, spec_b, args):
+    label_a, meta_a, va = load_diff_side(spec_a, args)
+    label_b, meta_b, vb = load_diff_side(spec_b, args)
+    print(f"\nA = {label_a}  meta={meta_a}")
+    print(f"B = {label_b}  meta={meta_b}")
+
+    # --include は既定値(エンコーダ用)を明示的に上書きした時だけ diff に効かせる
+    inc = re.compile(args.include) if (args.include and args.include != DEFAULT_INCLUDE) else None
+    exc = re.compile(args.exclude) if (args.exclude and args.exclude != DEFAULT_EXCLUDE) else None
+
+    def want(k):
+        if not args.all and ".config." not in k:
+            return False
+        if args.all and NOISE_LIVE.search(k):
+            return False
+        if inc is not None and not inc.search(k):
+            return False
+        if exc is not None and exc.search(k):
+            return False
+        return True
+
+    keys = sorted(k for k in (set(va) | set(vb)) if want(k))
     MISS = "<なし>"
-    n_diff = 0
-    print("\n--- .config. の差分 (A | B) ---")
+    changed = only_a = only_b = 0
+    scope = "全項目(ライブ値除く)" if args.all else ".config."
+    print(f"\n--- {scope} の差分 (A | B) ---")
     for k in keys:
         x, y = va.get(k, MISS), vb.get(k, MISS)
-        if x != y:
-            n_diff += 1
-            print(f"  {k}\n      A: {x!r}\n      B: {y!r}")
-    print(f"\n差分 {n_diff} 項目 / config 合計 {len(keys)} 項目")
-    if n_diff == 0:
-        print("→ 設定は完全に一致。差は設定ではなく、機械/ファーム動作/指令経路の側にある。")
+        if x == y:
+            continue
+        if x is MISS:
+            only_b += 1
+        elif y is MISS:
+            only_a += 1
+        else:
+            changed += 1
+        print(f"  {k}\n      A: {x!r}\n      B: {y!r}")
+    total = changed + only_a + only_b
+    print(f"\n差分 {total} 項目 (値違い {changed} / Aのみ {only_a} / Bのみ {only_b}) "
+          f"/ 比較対象 {len(keys)} 項目")
+    if total == 0:
+        print("→ 完全に一致。差は設定ではなく、機械/ファーム動作/指令経路の側にある。")
 
 
 def select_targets(ref_values, include, exclude, all_paths):
@@ -350,7 +419,7 @@ def main():
     if args.show:
         cmd_show(args.show)
     elif args.diff:
-        cmd_diff(args.diff[0], args.diff[1])
+        cmd_diff(args.diff[0], args.diff[1], args)
     elif args.dump:
         cmd_dump(args.dump, args.can_id, args.force)
     else:

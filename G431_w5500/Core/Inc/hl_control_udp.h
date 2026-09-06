@@ -37,12 +37,19 @@ extern "C" {
  *     ネイティブturns)として送る。初期位置はGUIから設定するのではなく、main.cの
  *     GIM6010_A_INITIAL_NATIVE_TURNS / GIM6010_B_INITIAL_NATIVE_TURNS を編集して
  *     HLControlUDP_Init()に渡す(プログラム側の定数)。
- *   HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG (0x05): payload = float32 LE、
- *     角度[deg]。クランプせず、ネイティブ換算の偏差 = deg/360*GIM8018_GEAR_RATIO_NOMINAL(=8) を計算し、
- *     0x04へ「初期位置C + 偏差」、0x05へ「初期位置D - 偏差」(符号反転、同じ大きさ、
- *     GIM6010とは逆で目標値を互い違いにする)をSet_Input_Pos(絶対位置、ネイティブturns)
- *     として送る。初期位置はGIM6010と同様main.cのプログラム側定数
- *     (GIM8018_C_INITIAL_NATIVE_TURNS / GIM8018_D_INITIAL_NATIVE_TURNS)で決まる。
+ *   HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG (0x05): payload = float32 LE、角度[deg]。
+ *     クランプなし。ネイティブ(モーター軸)turns へ換算: deg/360*GIM8018_GEAR_RATIO_NOMINAL(=8)
+ *     = deg/45 (旧コードの ax_target[rad]/M_PI*4 と等価)。旧コードと同じく両軸を
+ *     同じ向きに動かし、固定オフセットだけ変える:
+ *       node4 (CAN ID 0x8C = Set_Input_Pos) <- 換算値 + GIM8018_C_INITIAL_NATIVE_TURNS(=+1.3)
+ *       node5 (CAN ID 0xAC = Set_Input_Pos) <- 換算値 + GIM8018_D_INITIAL_NATIVE_TURNS(=-1.3)
+ *     GIM8018(0x04/0x05)も GIM6010 と同じく、起動時にクローズドループへ入れ、
+ *     main.c のラウンドロビン(1周1軸、各軸およそ6秒に1回)で
+ *     「axis_state!=CLOSED_LOOP なら EnterPositionControl 再送」+「Set_Input_Pos 再送」を
+ *     継続する(起動時のフレーム落ちからの自動復帰。GIM8108 側の入力タイムアウト対策)。
+ *     このコマンド受信時は、axis_state を見て必要ならクローズドループへ入れてから
+ *     Set_Input_Pos を送る。バス混雑対策として C→D の送信順は受信のたびに入れ替える
+ *     (常に後発になる D が FDCAN TxFIFO 溢れで弾かれるのを避ける)。
  *
  * 角度の範囲制限(クランプ)はこのモジュール内(STM32側)で行う。Python側は範囲チェック
  * をせずそのまま送ってよい仕様。ただし GIM8018(GIM8108-8, 0x05コマンド)はクランプせず
@@ -91,12 +98,12 @@ void HLControlUDP_Poll(void);
  * 使う診断用。一度1になったら以後0に戻ることはない。 */
 uint8_t HLControlUDP_HasReceived(void);
 
-/* index番目の軸(0=gim6010_a, 1=gim6010_b, 2=gim8018_c, 3=gim8018_d)に、最後に
- * 指令した絶対目標位置(ネイティブturns、GUIからまだ何も来ていなければ初期位置)を
- * Set_Input_Posで再送する。main.cのラウンドロビン(EnterPositionControlと同じ
- * indexの並び)から毎ループその軸の番が来るたびに呼ぶことを想定している。
- * GUIからの新規コマンドが来ない間も目標値を送り続けることで、旧gim_axis(node0)の
- * 実装と同様の継続的な送信を再現する(GIM8108-8側の入力タイムアウト対策)。 */
+/* index番目の軸(0=gim6010_a, 1=gim6010_b, 2=gim8018_c, 3=gim8018_d)に、最後に指令した
+ * 絶対目標位置(ネイティブturns、GUIからまだ何も来ていなければ初期位置)を Set_Input_Pos で
+ * 再送する。main.cのラウンドロビン(EnterPositionControlと同じindexの並び)から毎ループ
+ * その軸の番が来るたびに呼ぶことを想定している(1周1軸なので各軸およそ6秒に1回、
+ * バーストにならない)。GUIからの新規コマンドが来ない間も目標値を送り続けることで、
+ * 起動時のフレーム落ちからの復帰と、GIM8108側の入力タイムアウト対策を兼ねる。 */
 void HLControlUDP_ResendLastTarget(uint8_t index);
 
 /* GIM6010 A(0x06)/B(0x07)は常に同じ絶対目標値を送っているにもかかわらず、実機の

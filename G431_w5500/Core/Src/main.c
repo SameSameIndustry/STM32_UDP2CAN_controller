@@ -94,10 +94,13 @@
 #define GIM8018_C_NODE_ID 0x04U
 #define GIM8018_D_NODE_ID 0x05U
 
-// 0x04/0x05の「初期位置」(ネイティブturns基準)。GIM6010と同様GUIからは設定できず、
-// ここを編集して書き込むことで変更する。
-#define GIM8018_C_INITIAL_NATIVE_TURNS 0.0f
-#define GIM8018_D_INITIAL_NATIVE_TURNS 0.0f
+// 0x04/0x05の固定オフセット(ネイティブturns)。0x05コマンドで
+//   node4 <- 角度換算 + GIM8018_C_INITIAL_NATIVE_TURNS
+//   node5 <- 角度換算 + GIM8018_D_INITIAL_NATIVE_TURNS
+// を Set_Input_Pos で送る(両軸同じ向き、オフセットだけ違う。旧コードの
+// offset_ax4+1.3 / offset_ax5-1.3 の +1.3 / -1.3 に相当。offset_ax は0扱い)。
+#define GIM8018_C_INITIAL_NATIVE_TURNS  1.3f
+#define GIM8018_D_INITIAL_NATIVE_TURNS  1.3f
 
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U
@@ -352,14 +355,18 @@ int main(void)
   WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_1_NODE_ID);
   WaveMotorCAN_Init(&wave_motor2, WAVE_MOTOR_2_NODE_ID);
 
-  // GIM6010-8 2台 (node_id 0x06, 0x07) / GIM8018-8 2台 (node_id 0x04, 0x05)。
-  // ODrive CAN SimpleのPosition Control(POS_FILTER)へ入れる。
-  // ⚠ 4軸分をノーウェイトで連続送信すると、STM32G4のTx FIFO(HW的に3要素しか
-  //   ない、can_bus.cのコメント参照)が溢れ、後方の軸(0x07以降)ほど設定フレームが
-  //   欠落しやすいため、各軸の間にHAL_Delay()を挟む(メインループ開始前で
-  //   CANUDPBridge_Poll等はまだ呼べないため、CANBus_Poll付きのDelay_WithCANPoll()
-  //   ではなく単純なHAL_Delay()を使う。FDCANの送信自体はソフトのポーリングと
-  //   無関係にハードウェアが自動で行うので、ここで待つだけでFIFOは空く)。
+  // GIM6010-8 2台 (0x06, 0x07) / GIM8018-8 2台 (0x04, 0x05) とも、起動時に一度
+  // ODrive CAN Simple の Position Control(POS_FILTER) + クローズドループへ入れる
+  // (Set_Controller_Mode(control_mode=3) + Set_Axis_State(8))。
+  // 起動時フレームがロストした場合(ODrive がまだ起動中で ACK 無し等)の復帰は、
+  // メインループのラウンドロビン(1周1軸、各軸およそ6秒に1回)で
+  // 「axis_state!=CLOSED_LOOP なら EnterPositionControl 再送」+「Set_Input_Pos 再送」
+  // が担当する。GIM8018 もこの対象(以前 0x05 側=D軸だけ原点が毎回ずれたのは、
+  // 復帰の仕組みが無く、クローズドループに入る時刻が毎回ばらついていたため)。
+  // ⚠ 連続送信で STM32G4 の Tx FIFO(HW的に3要素、can_bus.c 参照)が溢れないよう、
+  //   各 EnterPositionControl の間に HAL_Delay() を挟む(メインループ開始前で
+  //   CANUDPBridge_Poll 等はまだ呼べないため単純な HAL_Delay() を使う。FDCAN の
+  //   送信自体は HW が自動で行うので、待つだけで FIFO は空く)。
   GIM6010_Init(&gim6010_a, GIM6010_A_NODE_ID);
   GIM6010_EnterPositionControl(&gim6010_a);
   HAL_Delay(10);
@@ -462,32 +469,24 @@ int main(void)
             ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
         }
 
-        // GIM6010-8 2台 (0x06, 0x07) / GIM8018-8 2台 (0x04, 0x05) を起動時から確実に
+        // GIM6010-8 2台 (0x06,0x07) / GIM8018-8 2台 (0x04,0x05) を起動時から確実に
         // クローズドループ(位置制御)で回し続けるため、Set_Controller_Mode +
-        // Set_Axis_Requested_State(CLOSED_LOOP) を定期的に再送する。起動時に1回だけ
-        // 送る実装だと、AutoRetransmission=DISABLE + ACK無し等でその1フレームが
-        // ロストした場合に永久にIDLEのままになってしまうため、GIM8018-8(gim_axis)の
-        // 位置指令と同様に継続的に送り直して確実性を上げる。
-        // ⚠ 4軸分を同じループ周回で一気に送ると、STM32G4のTx FIFOがHW的に3要素しか
-        //   ないため(can_bus.cのコメント参照)、CPU側がノーウェイトで積もうとして
-        //   溢れ、一部のフレームがHAL_FDCAN_AddMessageToTxFifoQ()の失敗で静かに
-        //   消えることがある(実際に0x07だけクローズドループに入らない不具合として
-        //   発現した)。1周回につき1軸だけラウンドロビンで送ることでburstサイズを
-        //   抑える(各軸は約4周回=6秒に1回の再送になるが、通常運用では十分な頻度)。
-        // 同じ番の軸に、HLControlUDP_ResendLastTarget()でSet_Input_Posも併せて
-        // 再送する。GUIから新規コマンドが来ない間もgim_axis(node0)と同様に目標値を
-        // 送り続けることで、GIM8108-8側の入力タイムアウト等により単発コマンドだけ
-        // では目標を見失ってしまう(と疑われる)問題に対応する。
+        // Set_Axis_Requested_State(CLOSED_LOOP) と Set_Input_Pos(直近の目標値) を定期的に
+        // 再送する。起動時に1回だけ送る実装だと、AutoRetransmission=DISABLE + ACK無し等で
+        // そのフレームがロストした場合に永久にIDLEのままになったり、クローズドループに
+        // 入る時刻が毎回ばらついて原点がずれたりするため(実機で0x05側=D軸に発現)、
+        // 継続的に送り直して確実性を上げる。
+        // ★バス混雑対策:
+        //   - 1周回(約1.5秒)につき「1軸だけ」ラウンドロビンで面倒を見る(%4)。各軸は
+        //     約6秒に1回。複数軸をまとめて送らないので burst にならない。
+        //   - EnterPositionControl(2フレーム)は axis_state != CLOSED_LOOP のとき(=復帰時)
+        //     だけ。定常状態は ResendLastTarget の1フレームのみ。
+        //   - 1周回の合計は gim_axis(1) + 再アサート(定常0/復帰2) + ResendLastTarget(1)
+        //     = 定常2フレーム(TxFIFO3段に収まる)。復帰時のみ4で、その時は can_bus.c の
+        //     リトライ(空き待ち)が吸収する。
         {
             static uint8_t gim_reassert_idx = 0U;
 
-            /* EnterPositionControl()は呼ぶたびに無条件で2フレーム
-             * (Set_Controller_Mode + Set_Axis_Requested_State)を送るため、既に
-             * CLOSED_LOOP_CONTROLに入っている軸に対しても毎回送ってしまうと、
-             * gim_axisの1フレーム+ここの2フレーム+ResendLastTargetの1フレーム=
-             * 4フレームが同一ループでFDCAN TxFIFO(3要素)を溢れさせる。まだ
-             * CLOSED_LOOP_CONTROLでない軸だけ送るようにし、通常運用時は
-             * ResendLastTargetの1フレームのみにする。 */
             switch (gim_reassert_idx) {
                 case 0U:
                     if (gim6010_a.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
@@ -504,7 +503,7 @@ int main(void)
                         GIM8018_EnterPositionControl(&gim8018_c);
                     }
                     break;
-                default:
+                default:  /* 3 */
                     if (gim8018_d.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
                         GIM8018_EnterPositionControl(&gim8018_d);
                     }
