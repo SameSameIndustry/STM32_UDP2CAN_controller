@@ -50,12 +50,42 @@ extern "C" {
 #define GIM8018_DEFAULT_CURRENT_LIMIT_A       6.0f   /* SetLimits を呼ぶまでの控え値 (保守的) */
 #define GIM8018_DEFAULT_VEL_LIMIT_TURNS_S    16.0f   /* モーター軸 [turn/s] */
 
+/* MA732/MA600 系 16bit 単回転アブソリュートエンコーダの cpr
+ * (tools/odrive_setup/gim8108_ref_0p5p14.json: axis0.encoder.config.cpr = 16384)。 */
+#define GIM8018_ENCODER_CPR                 16384
+
+/* CLOSED_LOOP 投入を要求してから axis_state==8 を確認できるまでの上限[ms]。
+ * これを超えたら homing を諦めて現在値を原点にして先へ進む (ODrive が CLOSED_LOOP を
+ * 拒否している = calibration / エラーを疑う)。 */
+#define GIM8018_STARTUP_CL_TIMEOUT_MS      3000U
+/* CLOSED_LOOP 投入後、pos_estimate が整定するのを待つ時間[ms] (この間に ODrive が
+ * 内部で正しいマルチターン値をロードし、CAN 送信も追いつく)。 */
+#define GIM8018_STARTUP_SETTLE_MS           400U
+/* phase 0/1 で CLOSED_LOOP 投入コマンドを再送する間隔[ms] (フレーム落ち対策・バス配慮)。 */
+#define GIM8018_STARTUP_RESEND_MS           200U
+
 typedef struct {
     ODriveCAN_Axis_t odrv;          /* 下位の汎用 ODrive CAN Simple ドライバ (先頭メンバ固定) */
     float current_limit_a;          /* 最後に GIM8018_SetLimits で設定した電流上限 [A] */
     float vel_limit_turns_s;        /* 最後に GIM8018_SetLimits で設定した速度上限 [turn/s] (モーター軸) */
     float torque_constant_nm_a;     /* トルク定数 [Nm/A] (モーター軸)。0 = 未設定 */
     float hard_max_current_a;       /* GIM8018_SetLimits の電流クランプ上限 [A] */
+
+    /* ---- 起動時ホーミング (ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2) ----
+     * CAN では IDLE 中 pos_estimate を読めない個体があるため set_linear_count は使わず、
+     * 先に CLOSED_LOOP へ入れ (§5.1: 遷移時にファームが pos_setpoint=pos_estimate を
+     * 自動初期化するので飛び出さない)、整定後の実測 pos_estimate から最寄りグリッド点
+     * home_target = center + round(pos_estimate - center) を決めて homing する。 */
+    uint8_t startup_normalized;     /* 0 = 進行中, 1 = 確定 (homing 目標 or フォールバック確定) */
+    uint8_t startup_to_grid;        /* 1 = グリッド点へ homing する。0 = フォールバック(現在値保持のみ) */
+    uint8_t startup_phase;          /* 0 = CLOSED_LOOP 投入前, 1 = axis_state==8 待ち,
+                                     * 2 = 投入後 整定待ち → home_target 確定 */
+    uint32_t startup_req_tick;      /* CLOSED_LOOP を最初に要求した HAL_GetTick() (0 = 未要求)。CL_TIMEOUT 判定 */
+    uint32_t startup_entry_tick;    /* axis_state==8 を最初に確認した HAL_GetTick() (0 = 未)。SETTLE 判定 */
+    uint32_t startup_last_send_tick;/* CLOSED_LOOP 投入コマンドを最後に送った tick。RESEND ペーシング */
+    float    startup_origin_native; /* 確定した原点 [モーター軸turns]。以後の絶対位置指令はこれ基準。
+                                     * grid homing 時は center + round(pos_estimate - center)
+                                     * (例: 現在 3.4, 初期角度 0.2 → 3.2)。 */
 } GIM8018_t;
 
 /* 初期化。CANBus_Init() の後に呼ぶこと。実機へは何も送信しない。
@@ -73,8 +103,47 @@ void GIM8018_SetHardMaxCurrent(GIM8018_t *g, float max_current_a); /* SetLimits 
  * current_a は [0, hard_max_current_a] にクランプされる。 */
 HAL_StatusTypeDef GIM8018_SetLimits(GIM8018_t *g, float vel_limit_turns_s, float current_a);
 
+/* ---- 起動時ホーミング (ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2 / §5) ----
+ *
+ * CyberBeast fw 0.5.14 は再起動をまたぐと pos_estimate の種が非決定的にずれ (§3)、
+ * その状態で最初の絶対位置指令を送ると数回転巻き戻す (§5.1)。かつ CAN では IDLE 中の
+ * pos_estimate を読めない個体があるため (Get_Encoder_Estimates が 0 / 古いまま)、
+ * set_linear_count に頼る方式は使えない。
+ *
+ * 代わりに: まず CLOSED_LOOP へ入れる (§5.1: 遷移時にファームが pos_setpoint=pos_estimate
+ * を自動初期化するので飛び出さない ← 実測で 4 秒 ±0.00 回転)。CLOSED_LOOP 後は
+ * pos_estimate が正しくなるので、整定を待って最寄りグリッド点
+ *     home_target = center_native + round(pos_estimate - center_native)
+ * を確定し、そこへ Set_Input_Pos で homing する (移動量は必ず ≤0.5 モーター回転
+ * = 出力軸 ±22.5°)。integer turn 部は保持するので、現在 3.4・初期角度 0.2 なら
+ * home_target = 3.2 (0.2 に強制しない)。
+ *
+ * center_native: 初期角度 [モーター軸turns]。main.c の GIM8018_C/D_INITIAL_NATIVE_TURNS。
+ * GIM8108-8 (node 0x04 / 0x05) 専用。GIM6010 (0x06 / 0x07) には適用しない。
+ *
+ * 3 フェーズ (呼び出し側は HAL_OK になるまでポーリングで呼び直す):
+ *   phase 0 … Set_Controller_Mode(POS,POS_FILTER) + Set_Axis_Requested_State(CLOSED_LOOP)。
+ *             Set_Input_Pos は送らない。
+ *   phase 1 … heartbeat で axis_state==CLOSED_LOOP を確認 (フレーム落ち対策に定期再送)。
+ *   phase 2 … 投入後 GIM8018_STARTUP_SETTLE_MS 経過 & 新鮮なエンコーダフレーム & |vel|小 を
+ *             待ち、home_target を確定。startup_to_grid=1, startup_normalized=1。
+ *
+ * フォールバック (startup_to_grid=0, startup_normalized=1):
+ *   - phase 1 が GIM8018_STARTUP_CL_TIMEOUT_MS で CLOSED_LOOP に入らない
+ *     (ODrive がエラー等で拒否 → calibration を疑う)
+ *   - phase 2 で整定後もエンコーダフレームが来ない
+ *   → 現在の pos_estimate を原点にする (homing しない。0x05 は現在値からの相対移動)。
+ *
+ * 戻り値: HAL_OK=確定 / HAL_BUSY=進行中 / その他=CAN送信失敗(再試行)。 */
+HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_native);
+uint8_t GIM8018_IsStartupNormalized(const GIM8018_t *g);      /* 1 = 確定 (homing 目標 or フォールバック) */
+uint8_t GIM8018_StartupNormalizedToGrid(const GIM8018_t *g);  /* 1 = グリッド点へ homing する */
+uint8_t GIM8018_GetStartupPhase(const GIM8018_t *g);          /* 0=投入前 1=CL待ち 2=整定待ち (診断用) */
+float   GIM8018_GetStartupOriginNative(const GIM8018_t *g);   /* 確定した原点 [モーター軸turns] */
+
 /* ---- 制御モード遷移 (いずれも最後に CLOSED_LOOP_CONTROL に入る) ---- */
 HAL_StatusTypeDef GIM8018_EnterPositionControl(GIM8018_t *g);            /* Position + POS_FILTER (主用途) */
+HAL_StatusTypeDef GIM8018_EnterPositionControlHold(GIM8018_t *g);       /* 上と同じ+移行前に現在位置を目標化(飛び出し防止) */
 HAL_StatusTypeDef GIM8018_EnterPositionControlTrajectory(GIM8018_t *g); /* Position + TRAP_TRAJ */
 HAL_StatusTypeDef GIM8018_EnterVelocityControl(GIM8018_t *g);           /* 副次 */
 HAL_StatusTypeDef GIM8018_EnterTorqueControl(GIM8018_t *g);             /* 副次。要 SetTorqueConstant */

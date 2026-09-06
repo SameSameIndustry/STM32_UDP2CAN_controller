@@ -18,6 +18,7 @@
 #define ODRIVE_CMD_REBOOT                 0x016U
 #define ODRIVE_CMD_GET_BUS_VOLTAGE_CURRENT 0x017U
 #define ODRIVE_CMD_CLEAR_ERRORS          0x018U
+#define ODRIVE_CMD_SET_LINEAR_COUNT      0x019U
 #define ODRIVE_CMD_SET_POS_GAIN          0x01AU
 #define ODRIVE_CMD_SET_VEL_GAINS         0x01BU
 
@@ -177,6 +178,30 @@ HAL_StatusTypeDef ODriveCAN_EnablePositionControl(ODriveCAN_Axis_t *axis)
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
 
+HAL_StatusTypeDef ODriveCAN_EnablePositionControlHold(ODriveCAN_Axis_t *axis)
+{
+    /* Closed Loop に入る瞬間の「飛び出し」(input_pos の既定 0 や前回値へ一気に動く)を
+     * 防ぐため、状態遷移の前に Set_Input_Pos で現在の pos_estimate を目標にしておく
+     * (tools/odrive_setup/odrive_position_test.py と同じ手順)。
+     * pos_estimate をまだ一度も受信していない間は入れない(0 へ飛び出すため)。
+     * その場合は HAL_BUSY を返すので、呼び出し側は次の機会に再試行すること。 */
+    HAL_StatusTypeDef status;
+
+    if (!axis->connected || (axis->last_encoder_tick == 0U)) {
+        return HAL_BUSY;
+    }
+    status = ODriveCAN_SetControllerMode(
+        axis, ODRIVE_CONTROL_MODE_POSITION_CONTROL, ODRIVE_INPUT_MODE_POS_FILTER);
+    if (status != HAL_OK) {
+        return status;
+    }
+    status = ODriveCAN_SetInputPos(axis, axis->pos_estimate, 0.0f, 0.0f);
+    if (status != HAL_OK) {
+        return status;
+    }
+    return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
+}
+
 HAL_StatusTypeDef ODriveCAN_EnableTorqueControl(ODriveCAN_Axis_t *axis)
 {
     HAL_StatusTypeDef status = ODriveCAN_SetControllerMode(
@@ -226,6 +251,13 @@ HAL_StatusTypeDef ODriveCAN_SetTrajAccelLimits(ODriveCAN_Axis_t *axis, float acc
     ODriveCAN_PutF32LE(&data[0], accel_limit);
     ODriveCAN_PutF32LE(&data[4], decel_limit);
     return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_TRAJ_ACCEL_LIMITS), data, 8U);
+}
+
+HAL_StatusTypeDef ODriveCAN_SetLinearCount(ODriveCAN_Axis_t *axis, int32_t count)
+{
+    uint8_t data[4];
+    ODriveCAN_PutU32LE(data, (uint32_t)count);
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_LINEAR_COUNT), data, 4U);
 }
 
 HAL_StatusTypeDef ODriveCAN_SetPosGain(ODriveCAN_Axis_t *axis, float pos_gain)

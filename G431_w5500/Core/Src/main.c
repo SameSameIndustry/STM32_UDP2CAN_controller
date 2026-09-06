@@ -97,10 +97,11 @@
 // 0x04/0x05の固定オフセット(ネイティブturns)。0x05コマンドで
 //   node4 <- 角度換算 + GIM8018_C_INITIAL_NATIVE_TURNS
 //   node5 <- 角度換算 + GIM8018_D_INITIAL_NATIVE_TURNS
-// を Set_Input_Pos で送る(両軸同じ向き、オフセットだけ違う。旧コードの
-// offset_ax4+1.3 / offset_ax5-1.3 の +1.3 / -1.3 に相当。offset_ax は0扱い)。
-#define GIM8018_C_INITIAL_NATIVE_TURNS  1.3f
-#define GIM8018_D_INITIAL_NATIVE_TURNS  1.3f
+// を Set_Input_Pos で送る(両軸同じ向き)。旧コードの offset_ax4+1.3 / offset_ax5-1.3
+// の +1.3 / -1.3 に相当(offset_ax は0扱い)。負値 + circular_setpoints でずれる
+// 疑いの切り分けのため、現状は node5 も +1.3(node4と同じ)にしてある。
+#define GIM8018_C_INITIAL_NATIVE_TURNS  0.2f
+#define GIM8018_D_INITIAL_NATIVE_TURNS  0.8f
 
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U
@@ -220,8 +221,68 @@ static void Delay_WithCANPoll(uint32_t ms)
         CANUDPBridge_Poll();
         CANBus_Poll();
         HLControlUDP_Poll();
+        // GIM8018(0x04/0x05) の目標位置を高頻度(内部で ~250ms 間引き)で再送する。
+        // メインループの周期(Delay_WithCANPoll(1500))は遅すぎて、AutoRetransmission=DISABLE
+        // で落ちたフレームの取り戻しがラウンドロビン(約6秒)頼みになってしまうため。
+        HLControlUDP_PeriodicResend();
         HAL_Delay(5);
     }
+}
+
+// GIM(6010 x2 / 8018 x2) の起動時 bring-up。HLControlUDP_Init() の後に1回だけ呼ぶ。
+//  1) 電源電圧が安定するまで待つ(起動から HLCONTROL_MOTOR_CAN_START_MS)。
+//  2) GIM への連続送信の間に HAL_Delay(5) を挟みながら、Set_Controller_Mode +
+//     Set_Axis_State(=EnterPositionControl) を全4軸へ 5 回ぶん送る。
+//     AutoRetransmission=DISABLE で ODrive 起動直後は ACK が返らずフレームが落ちる
+//     ため、間隔を空けて複数回投げて確実性を上げる。
+//     ★位置指令(Set_Input_Pos)はここでは送らない。最初の Set_Input_Pos はユーザーが
+//       0x04/0x05 を送った瞬間から。それまでモーターは現在位置をその場で保持する。
+// 以後の維持・復帰はメインループのラウンドロビン(1周1軸)が担当する。
+static void GIM_StartupBringUp(void)
+{
+    uint32_t now = HAL_GetTick();
+    if (now < HLCONTROL_MOTOR_CAN_START_MS) {
+        Delay_WithCANPoll(HLCONTROL_MOTOR_CAN_START_MS - now);
+    }
+
+    // GIM6010-8 (0x06/0x07): 従来どおり EnterPositionControlHold(現在位置を目標化してから
+    // クローズドループへ)を数回送る。位置指令(Set_Input_Pos)はユーザーが 0x04 を送るまで無し。
+    for (int i = 0; i < 5; ++i) {
+        GIM6010_EnterPositionControlHold(&gim6010_a);  HAL_Delay(5);
+        GIM6010_EnterPositionControlHold(&gim6010_b);  HAL_Delay(5);
+    }
+
+    // --- GIM8108-8 (node 0x04 / 0x05) 起動時ホーミング ---
+    // ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2 / §5。
+    // CAN では IDLE 中の pos_estimate を読めない個体があり(Get_Encoder_Estimates が 0/古い)、
+    // その値で homing 目標を決めると誤り(実測: ID5 原点=0、ID4 が投入後に ~1回転して戻る)。
+    // → set_linear_count は使わず、先に CLOSED_LOOP へ入れ(§5.1: 遷移時にファームが
+    //   pos_setpoint=pos_estimate を自動初期化するので飛び出さない)、整定後の実測値から
+    //   最寄りグリッド点 home_target = 初期角度 + round(pos_estimate - 初期角度) を決めて
+    //   そこへ homing する(移動量は必ず出力軸 ±22.5° 以内。integer turn 部は保持:
+    //   現在 3.4・初期角度 0.2 → home_target=3.2)。GIM6010(0x06/0x07)には適用しない。
+    // phase 0(投入)→1(CLOSED_LOOP確認)→2(整定・目標確定) を最大 ~5 秒ポーリング。
+    for (int i = 0; i < 400; ++i) {
+        HAL_StatusTypeDef nc = GIM8018_NormalizeMultiturnStartup(&gim8018_c, GIM8018_C_INITIAL_NATIVE_TURNS);
+        HAL_StatusTypeDef nd = GIM8018_NormalizeMultiturnStartup(&gim8018_d, GIM8018_D_INITIAL_NATIVE_TURNS);
+        if ((nc == HAL_OK) && (nd == HAL_OK)) {
+            break;  // 両軸とも確定 (homing 目標 or フォールバック)。
+        }
+        Delay_WithCANPoll(10);
+    }
+    if (GIM8018_IsStartupNormalized(&gim8018_c)) {
+        HLControlUDP_SetGim8018Origin(0U, GIM8018_GetStartupOriginNative(&gim8018_c),
+                                      GIM8018_StartupNormalizedToGrid(&gim8018_c));
+    }
+    if (GIM8018_IsStartupNormalized(&gim8018_d)) {
+        HLControlUDP_SetGim8018Origin(1U, GIM8018_GetStartupOriginNative(&gim8018_d),
+                                      GIM8018_StartupNormalizedToGrid(&gim8018_d));
+    }
+
+    // grid homing: SetGim8018Origin(home=1) が pending を立てたので、この待ち時間の間に
+    // Delay_WithCANPoll → HLControlUDP_PeriodicResend() が home_target を ~200ms 間隔で
+    // 撒いて到達させる(到達 or 4s で自動停止)。POS_FILTER で緩やかに動く。
+    Delay_WithCANPoll(1500);
 }
 /* USER CODE END 0 */
 
@@ -355,33 +416,13 @@ int main(void)
   WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_1_NODE_ID);
   WaveMotorCAN_Init(&wave_motor2, WAVE_MOTOR_2_NODE_ID);
 
-  // GIM6010-8 2台 (0x06, 0x07) / GIM8018-8 2台 (0x04, 0x05) とも、起動時に一度
-  // ODrive CAN Simple の Position Control(POS_FILTER) + クローズドループへ入れる
-  // (Set_Controller_Mode(control_mode=3) + Set_Axis_State(8))。
-  // 起動時フレームがロストした場合(ODrive がまだ起動中で ACK 無し等)の復帰は、
-  // メインループのラウンドロビン(1周1軸、各軸およそ6秒に1回)で
-  // 「axis_state!=CLOSED_LOOP なら EnterPositionControl 再送」+「Set_Input_Pos 再送」
-  // が担当する。GIM8018 もこの対象(以前 0x05 側=D軸だけ原点が毎回ずれたのは、
-  // 復帰の仕組みが無く、クローズドループに入る時刻が毎回ばらついていたため)。
-  // ⚠ 連続送信で STM32G4 の Tx FIFO(HW的に3要素、can_bus.c 参照)が溢れないよう、
-  //   各 EnterPositionControl の間に HAL_Delay() を挟む(メインループ開始前で
-  //   CANUDPBridge_Poll 等はまだ呼べないため単純な HAL_Delay() を使う。FDCAN の
-  //   送信自体は HW が自動で行うので、待つだけで FIFO は空く)。
+  // GIM6010-8 2台 (0x06, 0x07) / GIM8018-8 2台 (0x04, 0x05)。
+  // ここでは構造体の初期化(GIM*_Init、CAN送信なし)だけ。
+  // 実際の CAN 送信は下の GIM_StartupBringUp() で、電圧安定待ち(1秒)の後に行う。
   GIM6010_Init(&gim6010_a, GIM6010_A_NODE_ID);
-  GIM6010_EnterPositionControl(&gim6010_a);
-  HAL_Delay(10);
-
   GIM6010_Init(&gim6010_b, GIM6010_B_NODE_ID);
-  GIM6010_EnterPositionControl(&gim6010_b);
-  HAL_Delay(10);
-
   GIM8018_Init(&gim8018_c, GIM8018_C_NODE_ID);
-  GIM8018_EnterPositionControl(&gim8018_c);
-  HAL_Delay(10);
-
   GIM8018_Init(&gim8018_d, GIM8018_D_NODE_ID);
-  GIM8018_EnterPositionControl(&gim8018_d);
-  HAL_Delay(10);
 
   // 高レベル制御UDP (Python GUIのOPEN/CLOSEボタン・ピッチ角目標値・GIM6010/GIM8018
   // ピッチ角目標値を受け取る)。GIM6010/GIM8018の初期位置はGUIから設定するのでは
@@ -392,6 +433,11 @@ int main(void)
                      GIM6010_A_INITIAL_NATIVE_TURNS, GIM6010_B_INITIAL_NATIVE_TURNS,
                      &gim8018_c, &gim8018_d,
                      GIM8018_C_INITIAL_NATIVE_TURNS, GIM8018_D_INITIAL_NATIVE_TURNS);
+
+  // 電源電圧安定待ち(起動から HLCONTROL_MOTOR_CAN_START_MS=1秒)後、昔のコードと
+  // 同じく GIM への連続送信の間に HAL_Delay(5) を挟みながら、クローズドループ投入を
+  // 5回ぶん・基準位置の Set_Input_Pos を2回ぶん送る。フレームロスト対策。
+  GIM_StartupBringUp();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -418,6 +464,35 @@ int main(void)
                                    (unsigned long)CANBus_GetTxQueueFailures());
             if (hb_len > 0) {
                 sendto(HEARTBEAT_SN, (uint8_t*)hb_msg, (uint16_t)hb_len, hb_broadcast_ip, HEARTBEAT_PORT);
+            }
+        }
+
+        // GIM8108-8 (0x04/0x05) の起動時ホーミング診断 (udp.port==5002)。
+        //   st   = ODrive axis_state (1=IDLE, 8=CLOSED_LOOP)
+        //   nrm  = startup_normalized (1=homing 目標確定 or フォールバック確定)
+        //   grid = startup_to_grid   (1=グリッド点へ homing する / 0=フォールバック)
+        //   ph  = startup ホーミング phase (0=CL投入前 1=CL待ち 2=整定待ち)
+        //   err = ODrive heartbeat の axis_error (0=正常)
+        //   encAge = 直近 Get_Encoder_Estimates 受信からの経過[ms] (-1 = 未受信)。
+        //     ★ID5 が st=1 のまま → CLOSED_LOOP に入れない。err!=0 なら calibration/エラー、
+        //       err=0 かつ ph=1 のままなら投入コマンドが node5 に届いていない (配線/終端/node_id)。
+        //     ★st=8,nrm=1,grid=0 → フォールバック (整定後もエンコーダフレーム無し等)。
+        {
+            char gm[160];
+            uint32_t now = HAL_GetTick();
+            long c_age = gim8018_c.odrv.last_encoder_tick ? (long)(now - gim8018_c.odrv.last_encoder_tick) : -1;
+            long d_age = gim8018_d.odrv.last_encoder_tick ? (long)(now - gim8018_d.odrv.last_encoder_tick) : -1;
+            int gl = snprintf(gm, sizeof(gm),
+                              "GIM c:st=%u,nrm=%u,grid=%u,ph=%u,err=%lu,encAge=%ld "
+                              "d:st=%u,nrm=%u,grid=%u,ph=%u,err=%lu,encAge=%ld\r\n",
+                              gim8018_c.odrv.axis_state, GIM8018_IsStartupNormalized(&gim8018_c),
+                              GIM8018_StartupNormalizedToGrid(&gim8018_c), GIM8018_GetStartupPhase(&gim8018_c),
+                              (unsigned long)gim8018_c.odrv.axis_error, c_age,
+                              gim8018_d.odrv.axis_state, GIM8018_IsStartupNormalized(&gim8018_d),
+                              GIM8018_StartupNormalizedToGrid(&gim8018_d), GIM8018_GetStartupPhase(&gim8018_d),
+                              (unsigned long)gim8018_d.odrv.axis_error, d_age);
+            if (gl > 0) {
+                sendto(HEARTBEAT_SN, (uint8_t*)gm, (uint16_t)gl, hb_broadcast_ip, HEARTBEAT_PORT);
             }
         }
 
@@ -457,7 +532,9 @@ int main(void)
         //    負荷を外した状態・電流制限をかけた電源でまず試すこと。
         //    axis_errorが非0だったり反応がなければ、モーター/エンコーダのキャリブレーションが
         //    済んでいない可能性がある(ODrive/GIM設定ツール側での作業が必要)。
-        {
+        // ⚠ 電源投入直後は電圧が不安定なので、GIM への CAN 送信は起動から
+        //   HLCONTROL_MOTOR_CAN_START_MS(=1秒) 経過するまで一切行わない。
+        if (HAL_GetTick() >= HLCONTROL_MOTOR_CAN_START_MS) {
             static uint8_t pos_toggle_count = 0U;
             static float pos_target_turns = 0.0f;
 
@@ -469,13 +546,16 @@ int main(void)
             ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
         }
 
-        // GIM6010-8 2台 (0x06,0x07) / GIM8018-8 2台 (0x04,0x05) を起動時から確実に
-        // クローズドループ(位置制御)で回し続けるため、Set_Controller_Mode +
-        // Set_Axis_Requested_State(CLOSED_LOOP) と Set_Input_Pos(直近の目標値) を定期的に
-        // 再送する。起動時に1回だけ送る実装だと、AutoRetransmission=DISABLE + ACK無し等で
-        // そのフレームがロストした場合に永久にIDLEのままになったり、クローズドループに
-        // 入る時刻が毎回ばらついて原点がずれたりするため(実機で0x05側=D軸に発現)、
-        // 継続的に送り直して確実性を上げる。
+        // GIM6010-8 2台 (0x06,0x07) / GIM8018-8 2台 (0x04,0x05) を確実にクローズドループ
+        // (位置制御)で回し続けるため、Set_Controller_Mode + Set_Axis_Requested_State
+        // (CLOSED_LOOP) を定期的に再送する。1回だけ送る実装だと、AutoRetransmission=DISABLE
+        // + ACK無し等でそのフレームがロストした場合に永久にIDLEのままになるため、継続的に
+        // 送り直して確実性を上げる。
+        // Set_Input_Pos(直近の目標値)の再送は「ユーザーが一度でも 0x04/0x05 を送った軸」
+        // だけ(HLControlUDP_ResendLastTarget 内で判定)。電源投入後まだコマンドが無い軸へは
+        // 位置を送らず、モーターがその場で現在位置を保持する。
+        // ★電源投入直後(電圧不安定期間)は送らない。起動から HLCONTROL_MOTOR_CAN_START_MS
+        //   (=1秒) 経過後にこのラウンドロビンが各軸を順にクローズドループへ入れる。
         // ★バス混雑対策:
         //   - 1周回(約1.5秒)につき「1軸だけ」ラウンドロビンで面倒を見る(%4)。各軸は
         //     約6秒に1回。複数軸をまとめて送らないので burst にならない。
@@ -484,28 +564,48 @@ int main(void)
         //   - 1周回の合計は gim_axis(1) + 再アサート(定常0/復帰2) + ResendLastTarget(1)
         //     = 定常2フレーム(TxFIFO3段に収まる)。復帰時のみ4で、その時は can_bus.c の
         //     リトライ(空き待ち)が吸収する。
-        {
+        if (HAL_GetTick() >= HLCONTROL_MOTOR_CAN_START_MS) {
             static uint8_t gim_reassert_idx = 0U;
+
+            // node 0x04/0x05: §4.2/§5 起動時ホーミングの状態機械を毎ループ進める
+            // (起動時 bring-up のポーリング窓に間に合わなかった分の受け皿。完了済みなら
+            //  IsStartupNormalized で即 return なので実質ゼロコスト)。
+            // ホーミング確定後は下の switch が「CLOSED_LOOP から外れたら入れ直す」だけ担当する
+            // (このとき odrv.pos_estimate は既に有効なので EnterPositionControlHold で可)。
+            if (!GIM8018_IsStartupNormalized(&gim8018_c)) {
+                if (GIM8018_NormalizeMultiturnStartup(&gim8018_c, GIM8018_C_INITIAL_NATIVE_TURNS) == HAL_OK) {
+                    HLControlUDP_SetGim8018Origin(0U, GIM8018_GetStartupOriginNative(&gim8018_c),
+                                                  GIM8018_StartupNormalizedToGrid(&gim8018_c));
+                }
+            }
+            if (!GIM8018_IsStartupNormalized(&gim8018_d)) {
+                if (GIM8018_NormalizeMultiturnStartup(&gim8018_d, GIM8018_D_INITIAL_NATIVE_TURNS) == HAL_OK) {
+                    HLControlUDP_SetGim8018Origin(1U, GIM8018_GetStartupOriginNative(&gim8018_d),
+                                                  GIM8018_StartupNormalizedToGrid(&gim8018_d));
+                }
+            }
 
             switch (gim_reassert_idx) {
                 case 0U:
                     if (gim6010_a.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-                        GIM6010_EnterPositionControl(&gim6010_a);
+                        GIM6010_EnterPositionControlHold(&gim6010_a);
                     }
                     break;
                 case 1U:
                     if (gim6010_b.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-                        GIM6010_EnterPositionControl(&gim6010_b);
+                        GIM6010_EnterPositionControlHold(&gim6010_b);
                     }
                     break;
                 case 2U:
-                    if (gim8018_c.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-                        GIM8018_EnterPositionControl(&gim8018_c);
+                    if (GIM8018_IsStartupNormalized(&gim8018_c) &&
+                        (gim8018_c.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL)) {
+                        GIM8018_EnterPositionControlHold(&gim8018_c);
                     }
                     break;
                 default:  /* 3 */
-                    if (gim8018_d.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-                        GIM8018_EnterPositionControl(&gim8018_d);
+                    if (GIM8018_IsStartupNormalized(&gim8018_d) &&
+                        (gim8018_d.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL)) {
+                        GIM8018_EnterPositionControlHold(&gim8018_d);
                     }
                     break;
             }
@@ -525,6 +625,7 @@ int main(void)
         // (数ms粒度の応答性確保)ので、ここでの呼び出しは無くても実用上問題ないが、
         // Delay_WithCANPoll()を挟まない一瞬の間も取りこぼさないよう念のため呼ぶ。
         HLControlUDP_Poll();
+        HLControlUDP_PeriodicResend();
 
   }
   /* USER CODE END 3 */

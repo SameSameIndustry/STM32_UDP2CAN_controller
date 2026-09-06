@@ -39,15 +39,21 @@ extern "C" {
  *     HLControlUDP_Init()に渡す(プログラム側の定数)。
  *   HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG (0x05): payload = float32 LE、角度[deg]。
  *     クランプなし。ネイティブ(モーター軸)turns へ換算: deg/360*GIM8018_GEAR_RATIO_NOMINAL(=8)
- *     = deg/45 (旧コードの ax_target[rad]/M_PI*4 と等価)。旧コードと同じく両軸を
- *     同じ向きに動かし、固定オフセットだけ変える:
- *       node4 (CAN ID 0x8C = Set_Input_Pos) <- 換算値 + GIM8018_C_INITIAL_NATIVE_TURNS(=+1.3)
- *       node5 (CAN ID 0xAC = Set_Input_Pos) <- 換算値 + GIM8018_D_INITIAL_NATIVE_TURNS(=-1.3)
+ *     = deg/45 (旧コードの ax_target[rad]/M_PI*4 と等価)。これを「偏差」とし、両軸とも
+ *       Set_Input_Pos <- GIM8018_C/D_INITIAL_NATIVE_TURNS + 偏差
+ *     を送る(C/D 同じ偏差。0x04 と違い符号反転しない)。初期位置は GUI からは設定
+ *     できず、main.c の GIM8018_C/D_INITIAL_NATIVE_TURNS を編集して HLControlUDP_Init()
+ *     に渡す(プログラム側の定数)。
+ *     ★電源投入後は Set_Input_Pos を一切送らない: 起動時の bring-up・ラウンドロビン
+ *       とも「Set_Controller_Mode + Set_Axis_State(CLOSED_LOOP)」だけ行い、位置は
+ *       モーターがその場で保持する。最初の Set_Input_Pos はユーザーが 0x04/0x05 を
+ *       送った瞬間から(それ以降はラウンドロビンが last_target を再送し続ける)。
  *     GIM8018(0x04/0x05)も GIM6010 と同じく、起動時にクローズドループへ入れ、
  *     main.c のラウンドロビン(1周1軸、各軸およそ6秒に1回)で
- *     「axis_state!=CLOSED_LOOP なら EnterPositionControl 再送」+「Set_Input_Pos 再送」を
- *     継続する(起動時のフレーム落ちからの自動復帰。GIM8108 側の入力タイムアウト対策)。
- *     このコマンド受信時は、axis_state を見て必要ならクローズドループへ入れてから
+ *     「axis_state!=CLOSED_LOOP なら EnterPositionControl 再送」を継続し、
+ *     ユーザーが一度でもコマンドを送った軸だけ「Set_Input_Pos 再送」も行う
+ *     (起動時のフレーム落ちからの自動復帰。GIM8108 側の入力タイムアウト対策)。
+ *     コマンド受信時は、axis_state を見て必要ならクローズドループへ入れてから
  *     Set_Input_Pos を送る。バス混雑対策として C→D の送信順は受信のたびに入れ替える
  *     (常に後発になる D が FDCAN TxFIFO 溢れで弾かれるのを避ける)。
  *
@@ -68,6 +74,22 @@ extern "C" {
 /* open/closeボタンで送るTTLサーボのオフセット値 (仕様通り: open=-25deg, close=+50deg) */
 #define HLCONTROL_TTL_OPEN_DEG   (-25.0f)
 #define HLCONTROL_TTL_CLOSE_DEG   (50.0f)
+
+/* 電源投入直後は電源電圧が安定しないため、GIM(6010/8018)への CAN 送信
+ * (Set_Controller_Mode / Set_Axis_State / Set_Input_Pos = モード設定・クローズドループ
+ *  移行・目標値)は、STM32 起動(HAL_GetTick()=0)からこの時間[ms]が経過するまで
+ * 一切行わない。起動時 bring-up も周期再送も 0x04/0x05 ハンドラの送信もすべて対象。 */
+#define HLCONTROL_MOTOR_CAN_START_MS 1000U
+
+/* GIM8018 (0x04/0x05) の「配達確認つき」再送 (HLControlUDP_PeriodicResend)。
+ * 目標が変わった時だけ、到達 or タイムアウトするまで RESEND_MS 間隔で Set_Input_Pos を
+ * 撒く。到達後は撒かない (定常状態のバス負荷ゼロ)。
+ *   RESEND_MS         : 未到達中の再送間隔
+ *   ARRIVE_TOL_NATIVE : 到達判定のしきい値 [モーター軸turn] (0.05turn = 出力軸 ~2.25°)
+ *   PENDING_TIMEOUT_MS: これを超えたら高頻度再送をやめる (以後はラウンドロビンの保険のみ) */
+#define HLCONTROL_GIM8018_RESEND_MS          200U
+#define HLCONTROL_GIM8018_ARRIVE_TOL_NATIVE  0.05f
+#define HLCONTROL_GIM8018_PENDING_TIMEOUT_MS 4000U
 
 /* GIM6010/GIM8018ピッチ角目標値のクランプ範囲。wave motorのピッチ角目標値とは別の値
  * (減速比8なので角度指定の実質可動範囲がwave motorと異なるため)。
@@ -93,6 +115,30 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
 
 /* メインループから毎回呼ぶ (非ブロッキング)。受信したコマンドをその場で処理する。 */
 void HLControlUDP_Poll(void);
+
+/* GIM8018 (0x04/0x05) の「配達確認つき」再送。Delay_WithCANPoll から呼ぶ。
+ * FDCAN は AutoRetransmission=DISABLE なので ACK が返らないフレームは黙って捨てられ、
+ * とくに node5(0x05) は落ちやすい。ラウンドロビン(約6秒)頼みだと「角度指令が 6 秒
+ * 遅れて効く/効かない」症状になる。
+ * この関数は「目標が変わってからまだ到達していない軸」だけ、HLCONTROL_GIM8018_RESEND_MS
+ * 間隔で Set_Input_Pos を撒き、pos_estimate が目標に十分近づいたら止める
+ * (= 定常状態ではバスに何も足さない)。PENDING_TIMEOUT_MS を超えても止める。 */
+void HLControlUDP_PeriodicResend(void);
+
+/* GIM8018 (GIM8108-8, node 0x04 / 0x05) の「初期位置」を、起動時マルチターン正規化
+ * (ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2 対策B) で得た原点で置き換える。
+ * which: 0 = gim8018_c (0x04), 1 = gim8018_d (0x05)。origin_native はモーター軸turns。
+ * 以後の 0x05 コマンドはこの原点を基準に「原点 + ユーザー入力角度の偏差」を
+ * 絶対位置指令として送る (§5.3 手順7 の相対増分運用)。
+ *
+ * home:
+ *   1 = grid collapse 成功 (GIM8018_StartupNormalizedToGrid)。origin_native は厳密に初期角度。
+ *       commanded=1 にして last_target=origin をセットし、モーターを能動的にその初期角度
+ *       (最寄りグリッド点、出力軸で±22.5°以内) へ回して保持する。
+ *   0 = フォールバック。origin_native は「電源投入時の現在位置」。commanded=0 のまま
+ *       (能動的に動かさない。ユーザーが 0x05 を送るまでその場保持)。
+ * GIM_StartupBringUp() および main.c のラウンドロビンから、正規化確定時に呼ばれる。 */
+void HLControlUDP_SetGim8018Origin(uint8_t which, float origin_native, uint8_t home);
 
 /* PCから1度でも高レベル制御コマンドを受信済みなら1を返す。通信状態表示LED等に
  * 使う診断用。一度1になったら以後0に戻ることはない。 */
