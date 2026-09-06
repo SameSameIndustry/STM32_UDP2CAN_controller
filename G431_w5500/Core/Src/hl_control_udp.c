@@ -81,17 +81,6 @@ static float HLControl_ClampGim6010PitchDeg(float deg)
     return deg;
 }
 
-static float HLControl_ClampGim8018PitchDeg(float deg)
-{
-    if (deg < HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG) {
-        return HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG;
-    }
-    if (deg > HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG) {
-        return HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG;
-    }
-    return deg;
-}
-
 /* メインループ側のラウンドロビン再送(main.c)は約6秒に1回しか各軸を見に行かない
  * ため、その間にクローズドループから外れていると、目標値だけ送っても反映
  * されない(実機でクローズドループが0x07だけ外れる不具合として発現した)。
@@ -246,7 +235,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&pitch_deg, &buf[1], sizeof(float));
-        pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);
+        /* GIM8018(GIM8108-8)は角度クランプなし。入力値をそのまま偏差計算に使う。 */
         native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
         /* GIM6010(0x06/0x07)とは逆に、0x04には「初期位置C + 偏差」、0x05には

@@ -40,6 +40,12 @@ USB経由でodrivetoolのPythonライブラリ(`odrive`パッケージ)を使っ
     python odrive_configure.py --can-id 4 --pole-pairs 21 --torque-constant 1.00 \\
         --current-lim-hard-max 25 --current-lim 15
 
+    # デュアルエンコーダ(出力軸絶対角フィードバック)を、動いているGIM6010-8から
+    # clone して有効化してから較正する場合:
+    python odrive_clone_encoder_config.py --dump gim6010_ref.json --can-id 6   # 先に参照を採取
+    python odrive_configure.py --can-id 4 --pole-pairs 21 --torque-constant 1.00 \\
+        --current-lim-hard-max 25 --current-lim 15 --encoder-config-from gim6010_ref.json
+
     全オプションは python odrive_configure.py --help を参照。
 
 Windowsでのセットアップ (マニュアル3.1.2節準拠):
@@ -125,6 +131,13 @@ def parse_args():
                     help="較正(MOTOR_CALIBRATION/ENCODER_OFFSET_CALIBRATION)を"
                          "スキップし、CAN ID・電流/速度制限などの設定のみ行う"
                          "(既に較正済みの個体のパラメータだけ変えたい場合に使う)")
+    p.add_argument("--encoder-config-from", "--encoder_config_from", dest="encoder_config_from",
+                    metavar="JSON", default=None,
+                    help="動いているGIM6010-8等から odrive_clone_encoder_config.py --dump で"
+                         "書き出したJSONを渡すと、その中のエンコーダ関連設定(デュアル/出力軸"
+                         "エンコーダの有効化を含む)を較正の前にこの個体へ書き込む。SteadyWinの"
+                         "デュアルエンコーダ有効化パラメータは機種/ファーム個別で公開マニュアルに"
+                         "記載が無いため、値は推測せず『既に正しく設定された個体』から clone する")
     return p.parse_args()
 
 
@@ -181,6 +194,13 @@ def main():
     print(f"CAN設定を書き込みます (node_id={args.can_id}, baud_rate={args.can_baud_rate})...")
     odrv0.can.config.baud_rate = args.can_baud_rate
     odrv0.axis0.config.can.node_id = args.can_id
+
+    if args.encoder_config_from:
+        from odrive_clone_encoder_config import apply_config_file
+        print(f"\nエンコーダ関連設定を {args.encoder_config_from} から clone します"
+              f"(デュアル/出力軸エンコーダの有効化を含む)...")
+        apply_config_file(odrv0, args.encoder_config_from, write=True, prompt=True)
+        print("※ この後の較正で個体固有の較正結果(位相オフセット等)を作り直します。")
 
     if args.skip_calibration:
         print("\n--skip-calibration が指定されたため、較正は行いません。")

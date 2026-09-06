@@ -38,14 +38,15 @@ extern "C" {
  *     GIM6010_A_INITIAL_NATIVE_TURNS / GIM6010_B_INITIAL_NATIVE_TURNS を編集して
  *     HLControlUDP_Init()に渡す(プログラム側の定数)。
  *   HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG (0x05): payload = float32 LE、
- *     角度[deg]。ネイティブ換算の偏差 = deg/360*GIM8018_GEAR_RATIO_NOMINAL(=8) を計算し、
+ *     角度[deg]。クランプせず、ネイティブ換算の偏差 = deg/360*GIM8018_GEAR_RATIO_NOMINAL(=8) を計算し、
  *     0x04へ「初期位置C + 偏差」、0x05へ「初期位置D - 偏差」(符号反転、同じ大きさ、
  *     GIM6010とは逆で目標値を互い違いにする)をSet_Input_Pos(絶対位置、ネイティブturns)
  *     として送る。初期位置はGIM6010と同様main.cのプログラム側定数
  *     (GIM8018_C_INITIAL_NATIVE_TURNS / GIM8018_D_INITIAL_NATIVE_TURNS)で決まる。
  *
  * 角度の範囲制限(クランプ)はこのモジュール内(STM32側)で行う。Python側は範囲チェック
- * をせずそのまま送ってよい仕様。
+ * をせずそのまま送ってよい仕様。ただし GIM8018(GIM8108-8, 0x05コマンド)はクランプせず
+ * 入力値をそのまま使う。
  */
 
 #define HLCONTROL_CMD_SET_PITCH_TARGET             0x01U
@@ -67,8 +68,7 @@ extern "C" {
  * としては0〜60degを有効範囲としてクランプする(反転後に-60〜0degになる)。 */
 #define HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG (0.0f)
 #define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (60.0f)
-#define HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG (-100.0f)
-#define HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG  (100.0f)
+/* GIM8018(GIM8108-8)は角度クランプを行わない(入力値をそのまま使う)。 */
 
 /* 初期化。ttl/wave1/wave2/gim6010_a/gim6010_b/gim8018_c/gim8018_dはいずれもNULL可
  * (その場合、対応コマンドは無視される)。

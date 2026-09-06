@@ -37,12 +37,102 @@ def safe_get(obj, path, default="<N/A>"):
         return default
 
 
+def _children(obj):
+    """odrivetoolのリモートオブジェクトでも通常オブジェクトでも子要素名を列挙する。"""
+    names = set()
+    try:
+        names.update(n for n in dir(obj) if not n.startswith("_"))
+    except Exception:
+        pass
+    for attr in ("_remote_attributes", "_properties"):
+        try:
+            names.update(getattr(obj, attr).keys())
+        except Exception:
+            pass
+    return sorted(names)
+
+
+def _is_leaf(v):
+    return isinstance(v, (bool, int, float, str)) or v is None
+
+
+def dump_subtree(obj, prefix, max_depth=3, _depth=0):
+    """objの葉ノード(数値/bool/文字列)を prefix.名前 = 値 形式で再帰的に出力する。"""
+    if _depth >= max_depth:
+        return
+    for name in _children(obj):
+        try:
+            v = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(v):
+            continue
+        path = f"{prefix}.{name}"
+        if _is_leaf(v):
+            print(f"    {path} = {v}")
+        else:
+            dump_subtree(v, path, max_depth, _depth + 1)
+
+
+def dump_dual_encoder(odrv0):
+    """デュアルエンコーダ(出力軸側エンコーダ)が有効かどうかを判断する材料を出す。
+    ファーム世代でツリーが違うので、既知のパスを片っ端から当てて存在するものだけ出す。"""
+    print("\n=== デュアル/セカンドエンコーダ関連 (存在するものだけ表示) ===")
+
+    # 0.6.x系: mapper と load/commutation encoder の割り当て
+    for path in (
+        "axis0.config.load_encoder",
+        "axis0.config.commutation_encoder",
+        "axis0.config.encoder_bandwidth",
+        "axis0.commutation_mapper.config",
+        "axis0.pos_vel_mapper.config",
+        "axis0.pos_vel_mapper.status",
+        "axis0.load_mapper.config",
+    ):
+        val = safe_get(odrv0, path, default="<なし>")
+        if val != "<なし>" and _is_leaf(val):
+            print(f"  {path} = {val}")
+        elif val != "<なし>":
+            print(f"  {path}:")
+            dump_subtree(val, "  " + path, max_depth=2)
+
+    # トップレベルにぶら下がるエンコーダオブジェクト(0.6.x系 / SteadyWinカスタム)
+    top_names = _children(odrv0)
+    enc_like = [n for n in top_names
+                if any(k in n.lower() for k in ("encoder", "mapper"))]
+    for name in enc_like:
+        print(f"  odrv0.{name}:")
+        dump_subtree(getattr(odrv0, name, None), f"  odrv0.{name}", max_depth=3)
+
+    # axis0直下 / axis0.config直下にエンコーダ/ロード/マッパー系があれば
+    for base, label in (("axis0", "axis0"), ("axis0.config", "axis0.config")):
+        base_obj = safe_get(odrv0, base, default=None)
+        if base_obj is None or _is_leaf(base_obj):
+            continue
+        for name in _children(base_obj):
+            if any(k in name.lower() for k in ("encoder", "mapper", "load", "commutation")):
+                sub = getattr(base_obj, name, None)
+                if _is_leaf(sub):
+                    print(f"  {label}.{name} = {sub}")
+                elif sub is not None and f"{label}.{name}" != "axis0.encoder":
+                    print(f"  {label}.{name}:")
+                    dump_subtree(sub, f"  {label}.{name}", max_depth=3)
+
+    print("  ※ 出力軸エンコーダらしきオブジェクト(pos_estimateが別にある / load_encoderが"
+          "motor以外を指す)が見当たらなければ、デュアルエンコーダは無効=モーター軸単回転"
+          "エンコーダのみ、と判断してよい。")
+
+
 def main():
     print("ODriveを検索中... (USB接続を確認してください)")
     odrv0 = odrive.find_any()
     print("接続しました。\n")
 
     print("=== ファームウェア/ハードウェア情報 ===")
+    print(f"  fw_version: {safe_get(odrv0, 'fw_version_major')}."
+          f"{safe_get(odrv0, 'fw_version_minor')}."
+          f"{safe_get(odrv0, 'fw_version_revision')}"
+          f"  (0.5.x系ならlegacy属性ツリー / 0.6.x系ならpos_vel_mapper等の新ツリー)")
     print(f"  hw_version: {safe_get(odrv0, 'hw_version_major')}."
           f"{safe_get(odrv0, 'hw_version_minor')}."
           f"{safe_get(odrv0, 'hw_version_variant')}"
@@ -74,15 +164,20 @@ def main():
           f"  (マニュアル記載値: 368uH±10%)")
 
     print("\n=== エンコーダ設定 (axis0.encoder.config.*) ===")
+    print(f"  mode: {safe_get(odrv0, 'axis0.encoder.config.mode')}"
+          f"  (0=INCREMENTAL,1=HALL,256/257=SPI_ABS系。ABS系なら単回転アブソリュート)")
     print(f"  cpr: {safe_get(odrv0, 'axis0.encoder.config.cpr')}"
           f"  (16bit絶対値エンコーダなので通常16384)")
     print(f"  pre_calibrated: {safe_get(odrv0, 'axis0.encoder.config.pre_calibrated')}")
     print(f"  index_offset (ユーザーゼロ点): {safe_get(odrv0, 'axis0.encoder.config.index_offset')}")
+    print(f"  use_index: {safe_get(odrv0, 'axis0.encoder.config.use_index')}")
     print(f"  pos_estimate (現在位置, モーター軸換算[rev]): "
           f"{safe_get(odrv0, 'axis0.encoder.pos_estimate')}")
-    print("  ※ マニュアルにはload_encoder/commutation_encoderのような出力軸専用エンコーダ"
-          "の概念は見当たらない。pos_estimateはモーター軸(エンコーダ)基準のturnsであり、"
-          "出力軸換算するにはgear_ratio(GIM6010-8は8)で割る必要がある。")
+    print(f"  shadow_count / count_in_cpr: "
+          f"{safe_get(odrv0, 'axis0.encoder.shadow_count')} / "
+          f"{safe_get(odrv0, 'axis0.encoder.count_in_cpr')}")
+
+    dump_dual_encoder(odrv0)
 
     print("\n=== コントローラ設定 (axis0.controller.config.*) ===")
     print(f"  control_mode: {safe_get(odrv0, 'axis0.controller.config.control_mode')}"
