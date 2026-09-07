@@ -12,6 +12,8 @@ static GIM6010_t       *s_gim6010_a = NULL;   /* node_id 0x06 */
 static GIM6010_t       *s_gim6010_b = NULL;   /* node_id 0x07 */
 static GIM8018_t       *s_gim8018_c = NULL;   /* node_id 0x04 */
 static GIM8018_t       *s_gim8018_d = NULL;   /* node_id 0x05 */
+static C610Current_t   *s_c610      = NULL;   /* DJI C610 電流制御ブロック (CAN ID 0x01) */
+static C610Position_t  *s_c610_pos  = NULL;   /* DJI C610 位置制御コントローラ (AS5600 FB) */
 
 /* GIM6010/GIM8018の「初期位置」(ネイティブ=モーター軸turns)。HLControlUDP_Init()の
  * 引数でプログラム側(main.c)の固定値として渡され、以後変更されない(GUIからは設定不可)。
@@ -252,6 +254,12 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
     ctlsocket(s_sn, CS_SET_IOMODE, &nonblock);
 }
 
+void HLControlUDP_SetC610(C610Current_t *c610, C610Position_t *c610_pos)
+{
+    s_c610     = c610;
+    s_c610_pos = c610_pos;
+}
+
 void HLControlUDP_SetGim8018Origin(uint8_t which, float origin_native, uint8_t home)
 {
     /* 起動時ホーミング状態機械が確定した「原点(= 絶対0度)」を受け取る。
@@ -369,6 +377,34 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             uint32_t t = HAL_GetTick();
             s_gim8018_c_pending = 1U;  s_gim8018_c_pending_tick = t;
             s_gim8018_d_pending = 1U;  s_gim8018_d_pending_tick = t;
+        }
+    } else if (cmd == HLCONTROL_CMD_SET_C610_CURRENT_A) {
+        float amps;
+
+        if (len < (int32_t)(1U + sizeof(float))) {
+            return;
+        }
+        memcpy(&amps, &buf[1], sizeof(float));
+        /* 手動電流モード: 位置制御を止めてから直接電流を指令する。
+         * 実際の CAN 送信は C610Current_Tick() が行う (電源投入から2秒間は送らない)。
+         * 負値も可 (C610 は符号付き int16 電流指令)。 */
+        if (s_c610_pos != NULL) {
+            C610Position_SetEnabled(s_c610_pos, 0U);
+        }
+        if (s_c610 != NULL) {
+            C610Current_SetCurrentA(s_c610, amps);
+        }
+    } else if (cmd == HLCONTROL_CMD_SET_C610_TARGET_DEG) {
+        float offset_deg;
+
+        if (len < (int32_t)(1U + sizeof(float))) {
+            return;
+        }
+        memcpy(&offset_deg, &buf[1], sizeof(float));
+        /* AS5600 カスケード位置制御の目標を「原点(C610_POS_ORIGIN_DEG)からの差分」で
+         * 設定し、コントローラを有効化する。ゲイン・原点・ゼロ点はコンパイル時定数。 */
+        if (s_c610_pos != NULL) {
+            C610Position_SetTargetOffsetDeg(s_c610_pos, offset_deg);
         }
     }
     /* 未知のコマンドは無視する */

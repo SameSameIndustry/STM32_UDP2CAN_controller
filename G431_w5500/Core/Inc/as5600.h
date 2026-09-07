@@ -73,6 +73,15 @@ typedef struct {
 void AS5600_Init(void);
 
 /**
+ * @brief  I2C バスの回復を試みる。電源投入時のモーター突入電流による 3V3 瞬低や
+ *         ノイズで転送が中断し、AS5600 が SDA を Low に保持したまま (以降ずっと
+ *         ok=0) になった場合の復帰用。SCL クロックパルス + STOP、ダメなら GPIO 再設定。
+ *         AS5600_ReadAll() は失敗時に内部で1回リトライするが、それでも読めない状態が
+ *         続く場合に呼び出し側 (AS5600_StreamTick) から定期的に呼ぶ。
+ */
+void AS5600_Recover(void);
+
+/**
  * @brief  1レジスタ(8bit)読み出し。
  * @retval HAL_OK / HAL_ERROR(NACK 等)
  */

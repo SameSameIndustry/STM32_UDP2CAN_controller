@@ -6,6 +6,8 @@
 #include "wave_motor_can.h"
 #include "gim6010.h"
 #include "gim8018.h"
+#include "c610_current.h"
+#include "c610_position.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,6 +60,21 @@ extern "C" {
  *     コマンド受信時は、axis_state を見て必要ならクローズドループへ入れてから
  *     Set_Input_Pos を送る。バス混雑対策として C→D の送信順は受信のたびに入れ替える
  *     (常に後発になる D が FDCAN TxFIFO 溢れで弾かれるのを避ける)。
+ *   HLCONTROL_CMD_SET_C610_CURRENT_A (0x06): payload = float32 LE、電流指令[A]。
+ *     DJI C610 (CAN ID 0x01 / ESC ID 1) を「手動電流モード」で直接駆動する。
+ *     ★位置制御コントローラ(c610_position)を無効化してから電流を指令する
+ *       (テスト・オープンループ用)。位置制御に戻すには 0x07 を送ること。
+ *     ±10A にクランプ。負値も可 (C610 は int16 ビッグエンディアンの符号付き電流指令
+ *     なので、負値は単なる2の補数。例: -1A → raw -1000 = 0xFC18)。
+ *     実際の CAN 送信は c610_current.c の Tick が行う: 電源投入から
+ *     C610_CURRENT_STARTUP_DELAY_MS(=2秒) の間は C610 へ一切送信しない。
+ *   HLCONTROL_CMD_SET_C610_TARGET_DEG (0x07): payload = float32 LE、原点からの差分[deg]。
+ *     AS5600 フィードバックのカスケード位置制御 (位置ループP → 速度ループPI → 電流) の
+ *     目標を「原点 C610_POS_ORIGIN_DEG からの差分」で設定し、コントローラを有効化する。
+ *     実目標角 = norm360(origin + 差分)。位置誤差は最短回り(±180deg)、出力電流は ±0.5A
+ *     クランプ。全ゲイン・原点・ゼロ点(センサ取付オフセット)は c610_position.h / main.c の
+ *     コンパイル時定数で、GUI からは変更しない。
+ *   ※ 0x06 / 0x07 は HLControlUDP_SetC610() でブロックを登録していないと無視される。
  *
  * 角度の範囲制限(クランプ)はこのモジュール内(STM32側)で行う。Python側は範囲チェック
  * をせずそのまま送ってよい仕様。ただし GIM8018(GIM8108-8, 0x05コマンド)はクランプせず
@@ -69,6 +86,8 @@ extern "C" {
 #define HLCONTROL_CMD_TTL_CLOSE                      0x03U
 #define HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG   0x04U
 #define HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG   0x05U
+#define HLCONTROL_CMD_SET_C610_CURRENT_A             0x06U
+#define HLCONTROL_CMD_SET_C610_TARGET_DEG           0x07U
 
 #define HLCONTROL_PITCH_TARGET_MIN_DEG (-100.0f)
 #define HLCONTROL_PITCH_TARGET_MAX_DEG  (100.0f)
@@ -114,6 +133,12 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
                         float gim6010_a_initial_native, float gim6010_b_initial_native,
                         GIM8018_t *gim8018_c, GIM8018_t *gim8018_d,
                         float gim8018_c_initial_native, float gim8018_d_initial_native);
+
+/* DJI C610 の電流制御ブロック(c610_current.h)と位置制御コントローラ(c610_position.h)
+ * を登録する。HLControlUDP_Init() の後に1回呼ぶ。どちらも NULL 可 (その場合、対応する
+ * 0x06 / 0x07 コマンドは無視される)。いずれの経路も CAN 送信はここでは行わない
+ * (送信は C610Current_Tick() の担当)。 */
+void HLControlUDP_SetC610(C610Current_t *c610, C610Position_t *c610_pos);
 
 /* メインループから毎回呼ぶ (非ブロッキング)。受信したコマンドをその場で処理する。 */
 void HLControlUDP_Poll(void);

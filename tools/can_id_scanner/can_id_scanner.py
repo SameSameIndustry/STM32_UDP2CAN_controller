@@ -1,21 +1,20 @@
 """
-CAN <-> UDP ブリッジ用の簡易GUIツール (v4: GIM6010-8 / GIM8018-8 2台の位置制御 + VESC)。
-STM32(G431_w5500)ファームウェア側の CANUDPBridge (Core/Src/can_udp_bridge.c) と
-UDPで通信し、以下を行う:
+CAN <-> UDP ブリッジ用の簡易GUIツール (v5: ログ + GIM同期位置制御 + AS5600角度モニタ)。
+
+STM32(G431_w5500)ファームウェアと UDP で通信し、以下を行う:
   - 受信した生CANフレームの一覧表示 (標準/拡張ID・DLC・Data・STM32側tick_ms)
   - ODrive CAN Simple(標準ID)フレームの自動デコードと、Heartbeat放送からのnode ID自動収集
   - VESCプロトコル(拡張ID)フレームの自動デコードと、STATUS放送からのController ID自動収集
-  - 位置制御パネル: GIM6010-8 と GIM8018-8 をそれぞれ別のnode_id/gear_ratioで設定し、
-    出力軸(減速後)の絶対角度で位置制御する (Enable / Set角度 / Idle / Clear Errors)。
-    ファーム側ラッパー gim6010.c / gim8018.c と同じ考え方 (odrive_can 共用 + 出力軸換算)。
-  - VESC Quick Control: 直接コマンド送信
-  - 任意のCANフレームの手動送信 (標準/拡張どちらも可)
+  - 高レベル同期位置制御 (hl_control_udp.c): OPEN/CLOSE・ピッチ角目標値・
+    GIM6010(0x06/0x07 同期)・GIM8018(0x04/0x05 符号反転)のピッチ角目標値・
+    C610(0x01) の AS5600フィードバック カスケード位置制御 (原点からの差分角 0x07 / 手動電流 0x06。
+    位置ループP→速度ループPI→電流。ゲイン・原点・センサオフセットはSTM32側のコンパイル時定数)
+  - AS5600 磁気エンコーダの絶対角モニタ (main.c AS5600_StreamTick、UDPポート5004)、
+    C610位置制御テレメトリ (同じ行の末尾 c610_*)
+  - 任意のCANフレームの手動送信 (標準/拡張どちらも可、CAN ID調査用)
 
-GIM8018-8はODrive互換と認識されているとのことなので、まずODrive CAN Simple
-プロトコル(標準ID, ODrive公式ドキュメント準拠)を本命として扱う。ただし
-SameSameIndustry/M5_Lower-Controller にはVESCプロトコル(拡張ID)を話す別モーターも
-混在しており、コードだけからはどちらがGIM8018-8か確定できなかったため、両方の
-デコード・監視・簡易送信に対応させてある。実機の応答で確認すること。
+※ 以前あった「GIM単独の速度/位置制御パネル」と「VESC Quick Control」は削除した。
+  モーターを動かすのは高レベル同期位置制御パネルのみ。
 
 ODriveはHeartbeat(cmd 0x001)を、VESCはCAN_PACKET_STATUS(cmd 9)を、それぞれ
 既定で周期的に自動ブロードキャストするので、電源さえ入っていれば何もしなくても
@@ -25,24 +24,27 @@ ODriveはHeartbeat(cmd 0x001)を、VESCはCAN_PACKET_STATUS(cmd 9)を、それ�
 実行方法:
     python can_id_scanner.py
 
-通信プロトコル (STM32側 can_udp_bridge.h と対応):
-  PC -> STM32 (command, 14byte固定):
-    [0-3] uint32 CAN ID (little endian)
-    [4]   uint8  flags (bit0: 1=拡張ID(29bit) / 0=標準ID(11bit))
-    [5]   uint8  DLC (0-8)
-    [6-13] uint8 data[8]
-  STM32 -> PC (report, 18byte固定):
-    [0-3] uint32 CAN ID (little endian)
-    [4]   uint8  flags
-    [5]   uint8  DLC
-    [6-13] uint8 data[8]
-    [14-17] uint32 tick_ms (STM32側のHAL_GetTick())
+通信プロトコル:
+  CAN<->UDPブリッジ (can_udp_bridge.h、ポート5001):
+    PC -> STM32 (command, 14byte固定):
+      [0-3] uint32 CAN ID (LE) / [4] flags(bit0:拡張ID) / [5] DLC / [6-13] data[8]
+    STM32 -> PC (report, 18byte固定):
+      [0-3] uint32 CAN ID (LE) / [4] flags / [5] DLC / [6-13] data[8] / [14-17] uint32 tick_ms
+  高レベル同期制御 (hl_control_udp.c、ポート5003): PC -> STM32 のみ (下記 HLCONTROL_CMD_*)
+  AS5600 (main.c、ポート5004): STM32 -> PC のみ、ASCII 1行ブロードキャスト
+      AS5600 seq=.. tick=.. ok=<0|1> raw=<0..4095> mdeg=<milli deg>
+             angle=<0..4095> status=0x<hh> agc=<0..255> mag=<0..4095>
+             c610_en=<0|1> c610_act=<0|1> c610_org_mdeg=<±int> c610_off_mdeg=<±int>
+             c610_tgt_mdeg=<±int> c610_meas_mdeg=<int> c610_err_mdeg=<±int>
+             c610_vsp_mdps=<±int> c610_vel_mdps=<±int> c610_i_ma=<±int>
 """
 
 import queue
+import re
 import socket
 import struct
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -50,11 +52,10 @@ COMMAND_LEN = 14
 REPORT_LEN = 18
 FLAG_EXTENDED = 0x01
 
-# ---- VESC CANプロトコル (VESC bldc firmware comm/comm_can.c 準拠) ----
-VESC_SET_DUTY = 0
-VESC_SET_CURRENT = 1
-VESC_SET_CURRENT_BRAKE = 2
-VESC_SET_RPM = 3
+# GIM6010-8 / GIM8018-8 はどちらも減速比 1/8 (ログ表示の出力軸換算に使うだけ)。
+GIM_GEAR_RATIO = 8.0
+
+# ---- VESC CANプロトコル (VESC bldc firmware comm/comm_can.c 準拠、監視のみ) ----
 VESC_STATUS = 9
 
 VESC_PACKET_NAMES = {
@@ -63,23 +64,9 @@ VESC_PACKET_NAMES = {
     17: "PING", 18: "PONG", 27: "STATUS_5",
 }
 
-VESC_COMMANDS = {
-    "Duty (-1..1)": (VESC_SET_DUTY, 100000.0),
-    "Current [A]": (VESC_SET_CURRENT, 1000.0),
-    "Current Brake [A]": (VESC_SET_CURRENT_BRAKE, 1000.0),
-    "RPM (ERPM)": (VESC_SET_RPM, 1.0),
-}
-
-# ---- ODrive CAN Simpleプロトコル (ODrive公式ドキュメント準拠) ----
+# ---- ODrive CAN Simpleプロトコル (ODrive公式ドキュメント準拠、監視のみ) ----
 ODRIVE_CMD_HEARTBEAT = 0x001
-ODRIVE_CMD_ESTOP = 0x002
-ODRIVE_CMD_SET_AXIS_STATE = 0x007
 ODRIVE_CMD_GET_ENCODER_ESTIMATES = 0x009
-ODRIVE_CMD_SET_CONTROLLER_MODE = 0x00B
-ODRIVE_CMD_SET_INPUT_POS = 0x00C
-ODRIVE_CMD_SET_INPUT_VEL = 0x00D
-ODRIVE_CMD_SET_INPUT_TORQUE = 0x00E
-ODRIVE_CMD_CLEAR_ERRORS = 0x018
 
 ODRIVE_CMD_NAMES = {
     0x001: "Heartbeat", 0x002: "Estop", 0x007: "Set_Axis_State", 0x009: "Get_Encoder_Estimates",
@@ -93,22 +80,43 @@ ODRIVE_AXIS_STATE_NAMES = {
     8: "CLOSED_LOOP_CONTROL", 9: "LOCKIN_SPIN", 10: "ENCODER_DIR_FIND", 11: "HOMING",
 }
 
-ODRIVE_AXIS_STATE_IDLE = 1
-ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL = 8
-ODRIVE_CONTROL_MODE_VELOCITY_CONTROL = 2
-ODRIVE_CONTROL_MODE_POSITION_CONTROL = 3
-ODRIVE_INPUT_MODE_PASSTHROUGH = 1
-ODRIVE_INPUT_MODE_POS_FILTER = 3
-
-# ---- 高レベル制御UDP (STM32側 Core/Src/hl_control_udp.c と対応) ----
-# CAN-UDPブリッジ(pack_command/unpack_report, ポート5001)とは別の専用ポート。
+# ---- 高レベル同期制御UDP (STM32側 Core/Src/hl_control_udp.c と対応) ----
 # 仕様: tools/hl_control/PROTOCOL_HL_CONTROL_UDP.md
-HLCONTROL_CMD_SET_PITCH_TARGET = 0x01             # payload: float32 LE, deg (-100〜100, STM32側でクランプ)
+HLCONTROL_CMD_SET_PITCH_TARGET = 0x01             # payload: float32 LE, deg
 HLCONTROL_CMD_TTL_OPEN = 0x02                      # payloadなし。0x21へ-25deg
 HLCONTROL_CMD_TTL_CLOSE = 0x03                     # payloadなし。0x21へ+50deg
-HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG = 0x04  # payload: float32 LE, deg。0x06/0x07へ全く同じ目標値
-HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG = 0x05  # payload: float32 LE, deg。0x04は+偏差、0x05は-偏差(互い違い)
+HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG = 0x04  # payload: float32 LE, deg。0x06/0x07へ同じ目標値
+HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG = 0x05  # payload: float32 LE, deg。0x04は+偏差、0x05は-偏差
+HLCONTROL_CMD_SET_C610_CURRENT_A = 0x06            # payload: float32 LE, 電流[A]。手動モード(位置制御OFF)
+HLCONTROL_CMD_SET_C610_TARGET_DEG = 0x07           # payload: float32 LE, 原点からの差分角[deg]。位置制御ON
 HLCONTROL_DEFAULT_PORT = 5003
+
+# DJI C610 電流指令レンジ (STM32側 c610_current.h と対応): raw ±10000 = ±10A。
+# C610 の電流指令は int16 ビッグエンディアンの符号付き値なので、負電流は 2の補数
+# (例: -1A → raw -1000 = 0xFC18)。STM32側で [A] → raw 変換 + クランプする。
+# 位置制御時の電流は STM32 側で ±0.5A にクランプされる (c610_position.h)。
+C610_CURRENT_AMP_MAX = 10.0
+
+# ---- AS5600 磁気エンコーダ (STM32側 Core/Src/main.c AS5600_StreamTick と対応) ----
+AS5600_DEFAULT_PORT = 5004
+AS5600_COUNTS = 4096.0
+AS5600_LINE_RE = re.compile(
+    r"AS5600\s+"
+    r"seq=(?P<seq>\d+)\s+tick=(?P<tick>\d+)\s+ok=(?P<ok>\d+)\s+"
+    r"raw=(?P<raw>\d+)\s+mdeg=(?P<mdeg>\d+)\s+angle=(?P<angle>\d+)\s+"
+    r"status=0x(?P<status>[0-9A-Fa-f]+)\s+agc=(?P<agc>\d+)\s+mag=(?P<mag>\d+)"
+)
+
+# C610 カスケード位置制御テレメトリ (同じ AS5600 行の末尾に付く。
+# 整数: mdeg=1/1000度, mdps=1/1000度/秒, ma=1/1000A)
+C610_POS_LINE_RE = re.compile(
+    r"c610_en=(?P<en>\d+)\s+c610_act=(?P<act>\d+)\s+"
+    r"c610_org_mdeg=(?P<org>-?\d+)\s+c610_off_mdeg=(?P<off>-?\d+)\s+"
+    r"c610_tgt_mdeg=(?P<tgt>-?\d+)\s+c610_meas_mdeg=(?P<meas>-?\d+)\s+"
+    r"c610_err_mdeg=(?P<err>-?\d+)\s+"
+    r"c610_vsp_mdps=(?P<vsp>-?\d+)\s+c610_vel_mdps=(?P<vel>-?\d+)\s+"
+    r"c610_i_ma=(?P<ima>-?\d+)"
+)
 
 
 def pack_command(can_id: int, is_extended: bool, data: bytes) -> bytes:
@@ -129,15 +137,6 @@ def unpack_report(pkt: bytes):
     return can_id, bool(flags & FLAG_EXTENDED), dlc, data, tick_ms
 
 
-def vesc_ext_id(packet_id: int, controller_id: int) -> int:
-    return ((packet_id & 0xFF) << 8) | (controller_id & 0xFF)
-
-
-def vesc_pack_int32(value: float) -> bytes:
-    v = int(round(value)) & 0xFFFFFFFF
-    return bytes([(v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF])
-
-
 def decode_vesc(can_id: int, is_extended: bool, data: bytes):
     """拡張IDフレームをVESCプロトコルとして解釈できれば(controller_id, 説明文, erpm, current, duty)を返す"""
     if not is_extended:
@@ -152,22 +151,6 @@ def decode_vesc(can_id: int, is_extended: bool, data: bytes):
         desc = f"{name} ctrl={controller_id} ERPM={erpm} I={current:.1f}A duty={duty:.3f}"
         return controller_id, desc, erpm, current, duty
     return controller_id, f"{name} ctrl={controller_id}", None, None, None
-
-
-def odrive_id(node_id: int, cmd_id: int) -> int:
-    return ((node_id & 0x3F) << 5) | (cmd_id & 0x1F)
-
-
-def odrive_pack_u32(value: int) -> bytes:
-    return struct.pack("<I", int(value) & 0xFFFFFFFF)
-
-
-def odrive_pack_i32(value: int) -> bytes:
-    return struct.pack("<i", int(value))
-
-
-def odrive_pack_f32(value: float) -> bytes:
-    return struct.pack("<f", value)
 
 
 def decode_odrive(can_id: int, is_extended: bool, data: bytes):
@@ -191,8 +174,67 @@ def decode_odrive(can_id: int, is_extended: bool, data: bytes):
     return node_id, f"{name} node={node_id}", {}
 
 
+# --------------------------------------------------------------------- AS5600 --
+def as5600_parse_line(text: str):
+    """AS5600 の ASCII 1行をパースして dict を返す。合致しなければ None。"""
+    m = AS5600_LINE_RE.search(text)
+    if not m:
+        return None
+    g = m.groupdict()
+    rec = {
+        "seq": int(g["seq"]), "tick": int(g["tick"]), "ok": int(g["ok"]),
+        "raw": int(g["raw"]), "mdeg": int(g["mdeg"]), "angle": int(g["angle"]),
+        "status": int(g["status"], 16), "agc": int(g["agc"]), "mag": int(g["mag"]),
+    }
+    mc = C610_POS_LINE_RE.search(text)
+    if mc:
+        c = mc.groupdict()
+        rec["c610"] = {
+            "en": int(c["en"]), "act": int(c["act"]),
+            "origin_deg": int(c["org"]) / 1000.0, "offset_deg": int(c["off"]) / 1000.0,
+            "tgt_deg": int(c["tgt"]) / 1000.0, "meas_deg": int(c["meas"]) / 1000.0,
+            "err_deg": int(c["err"]) / 1000.0,
+            "vsp_dps": int(c["vsp"]) / 1000.0, "vel_dps": int(c["vel"]) / 1000.0,
+            "current_a": int(c["ima"]) / 1000.0,
+        }
+    return rec
+
+
+def as5600_status_flags(status: int) -> str:
+    f = []
+    if status & 0x20:
+        f.append("MD:磁石検出")
+    if status & 0x10:
+        f.append("ML:磁石弱い")
+    if status & 0x08:
+        f.append("MH:磁石強い")
+    return " / ".join(f) if f else "-"
+
+
+class Unwrapper:
+    """0..360 で折り返す角度を連続値(多回転)に展開する。"""
+
+    def __init__(self):
+        self.prev = None
+        self.turns = 0
+
+    def reset(self):
+        self.prev = None
+        self.turns = 0
+
+    def feed(self, deg: float) -> float:
+        if self.prev is not None:
+            d = deg - self.prev
+            if d > 180.0:
+                self.turns -= 1
+            elif d < -180.0:
+                self.turns += 1
+        self.prev = deg
+        return self.turns * 360.0 + deg
+
+
 class Bridge:
-    """UDPソケットの送受信を管理する。受信は別スレッドで回し、report_cbへ渡す。"""
+    """CAN<->UDPブリッジ(ポート5001)のUDP送受信を管理する。受信は別スレッドで回す。"""
 
     def __init__(self, report_cb):
         self.sock = None
@@ -240,21 +282,72 @@ class Bridge:
                 self.report_cb(r)
 
 
+class AS5600Listener:
+    """AS5600 角度ブロードキャスト(ポート5004)を listen する。受信は別スレッド。
+    CAN<->UDPブリッジとは独立で、Connect 不要 (STM32 が一方的に送ってくる)。"""
+
+    def __init__(self, reading_cb):
+        self.sock = None
+        self.thread = None
+        self.running = False
+        self.reading_cb = reading_cb
+        self.status = "未開始"
+
+    def start(self, port: int, bind_addr: str = "0.0.0.0"):
+        self.stop()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((bind_addr, port))
+            s.settimeout(0.3)
+        except OSError as e:
+            self.status = f"bind失敗 ({bind_addr}:{port}): {e}"
+            return False
+        self.sock = s
+        self.running = True
+        self.status = f"待受中 udp {bind_addr}:{port}"
+        self.thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self.thread.start()
+        return True
+
+    def stop(self):
+        self.running = False
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    def _recv_loop(self):
+        while self.running:
+            try:
+                pkt, addr = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            text = pkt.decode("ascii", errors="replace")
+            rec = as5600_parse_line(text)
+            if rec is not None:
+                rec["src"] = addr[0]
+                self.reading_cb(rec)
+
+
 class HLControlPanel(ttk.LabelFrame):
-    """高レベル制御UDP (hl_control_udp.c) 送信パネル。
-    OPEN/CLOSEボタン(TTLサーボ 0x21向け、絶対原点からのオフセット -25deg/+50deg)、
-    ピッチ角目標値(wave motor 0x11/0x12向け、-100〜100deg)、GIM6010-8(0x06/0x07、
-    全く同じ目標値)・GIM8018-8(0x04/0x05、符号反転で互い違いの目標値)のピッチ角
-    目標値を送る。GIM6010/GIM8018の初期位置はGUIからは設定できず、STM32側(main.c)の
-    プログラム定数で決まる。CAN-UDPブリッジ(Bridgeクラス、ポート5001)とは別の専用
-    UDPソケット・ポート(既定5003)を使う単方向(PC→STM32のみ)送信。角度の範囲チェック
-    (クランプ)はSTM32側で行うため、ここでは行わない。
+    """高レベル同期制御UDP (hl_control_udp.c) 送信パネル。
+    OPEN/CLOSEボタン(TTLサーボ 0x21向け、-25deg/+50deg)、ピッチ角目標値
+    (wave motor 0x11/0x12向け)、GIM6010-8(0x06/0x07、同じ目標値)・
+    GIM8018-8(0x04/0x05、符号反転で互い違いの目標値)のピッチ角目標値を送る。
+    GIM6010/GIM8018 の初期位置はGUIからは設定できず、STM32側(main.c)の定数で決まる。
+    CAN-UDPブリッジ(ポート5001)とは別の専用ポート(既定5003)を使う単方向送信。
+    角度のクランプはSTM32側で行う。
     """
 
     def __init__(self, parent, app):
         super().__init__(
             parent,
-            text="高レベル制御 (UDP, TTLサーボ0x21 / wave motor 0x11,0x12 / GIM6010 0x06,0x07 / GIM8018 0x04,0x05)",
+            text="高レベル同期制御 (UDP, TTLサーボ0x21 / wave motor 0x11,0x12 / GIM6010 0x06,0x07 / GIM8018 0x04,0x05 / C610 0x01)",
             padding=8)
         self.app = app
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -283,8 +376,8 @@ class HLControlPanel(ttk.LabelFrame):
         self.gim_pitch_var = tk.StringVar(value="0")
         ttk.Entry(row4, textvariable=self.gim_pitch_var, width=8).pack(side="left", padx=4)
         ttk.Button(row4, text="送信", command=self.on_send_gim_pitch).pack(side="left", padx=4)
-        ttk.Label(row4, text="(0x06・0x07とも全く同じ目標値=各軸の初期位置+偏差。偏差=角度/360×8。"
-                              "初期位置はSTM32側のプログラム定数)").pack(side="left", padx=4)
+        ttk.Label(row4, text="(0x06・0x07とも同じ目標値=各軸の初期位置+偏差。偏差=角度/360×8。"
+                              "初期位置はSTM32側の定数)").pack(side="left", padx=4)
 
         row5 = ttk.Frame(self)
         row5.pack(fill="x", pady=(4, 0))
@@ -294,6 +387,32 @@ class HLControlPanel(ttk.LabelFrame):
         ttk.Button(row5, text="送信", command=self.on_send_gim8018_pitch).pack(side="left", padx=4)
         ttk.Label(row5, text="(0x04は初期位置+偏差、0x05は初期位置-偏差 と互い違いの目標値になる)").pack(
             side="left", padx=4)
+
+        ttk.Separator(self, orient="horizontal").pack(fill="x", pady=6)
+
+        # --- C610 (0x01) AS5600フィードバック カスケード位置制御 (位置P→速度PI→電流) ---
+        # ゲイン・原点(C610_POS_ORIGIN_DEG)・センサオフセット(C610_ZERO_OFFSET_DEG)は
+        # STM32側のコンパイル時定数 (c610_position.h / main.c)。GUIからは原点からの差分角のみ。
+        row6 = ttk.Frame(self)
+        row6.pack(fill="x")
+        ttk.Label(row6, text="C610 目標 = 原点からの差分 [deg] (カスケード位置制御。電流±0.5AにSTM32側でクランプ):").pack(side="left")
+        self.c610_target_var = tk.StringVar(value="0")
+        ent = ttk.Entry(row6, textvariable=self.c610_target_var, width=8)
+        ent.pack(side="left", padx=4)
+        ent.bind("<Return>", lambda *_: self.on_send_c610_target())
+        ttk.Button(row6, text="送信 (0x07)", command=self.on_send_c610_target).pack(side="left", padx=4)
+        ttk.Label(row6, text="(実目標 = 原点 + この値。原点/ゲインはSTM32側の定数)").pack(side="left", padx=4)
+
+        row8 = ttk.Frame(self)
+        row8.pack(fill="x", pady=(4, 0))
+        ttk.Label(row8, text="C610 手動電流 [A] (±10、位置制御OFF。テスト用):").pack(side="left")
+        self.c610_current_var = tk.StringVar(value="0")
+        ent2 = ttk.Entry(row8, textvariable=self.c610_current_var, width=8)
+        ent2.pack(side="left", padx=4)
+        ent2.bind("<Return>", lambda *_: self.on_send_c610_current())
+        ttk.Button(row8, text="送信 (0x06)", command=self.on_send_c610_current).pack(side="left", padx=4)
+        ttk.Button(row8, text="STOP (0A)", command=self.on_c610_stop).pack(side="left", padx=4)
+        ttk.Label(row8, text="(電源投入後2秒間はSTM32が送信を保留)").pack(side="left", padx=4)
 
     def _target(self):
         try:
@@ -346,175 +465,144 @@ class HLControlPanel(ttk.LabelFrame):
             return
         self._send(struct.pack("<Bf", HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG, deg))
 
+    def on_send_c610_target(self):
+        try:
+            deg = float(self.c610_target_var.get())   # 原点からの差分角
+        except ValueError:
+            messagebox.showerror("エラー", "C610目標(原点からの差分角)の入力が不正です")
+            return
+        self._send(struct.pack("<Bf", HLCONTROL_CMD_SET_C610_TARGET_DEG, deg))
 
-class ODriveMotorPanel(ttk.LabelFrame):
-    """1台分の ODrive/GIM モーターの位置制御パネル。node_id と gear_ratio を個別に持ち、
-    出力軸(減速後)の絶対角度で位置制御する。GIM6010-8 と GIM8018-8 で1個ずつ生成する。"""
+    def on_send_c610_current(self):
+        try:
+            amps = float(self.c610_current_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "C610電流目標値の入力が不正です")
+            return
+        # クランプ自体はSTM32側で行うが、GUIの表示も直しておく
+        if amps > C610_CURRENT_AMP_MAX:
+            amps = C610_CURRENT_AMP_MAX
+        elif amps < -C610_CURRENT_AMP_MAX:
+            amps = -C610_CURRENT_AMP_MAX
+        self.c610_current_var.set(f"{amps:g}")
+        self._send(struct.pack("<Bf", HLCONTROL_CMD_SET_C610_CURRENT_A, amps))
 
-    def __init__(self, parent, app, title, default_node, default_gear, note=""):
-        super().__init__(parent, text=title, padding=6)
+    def on_c610_stop(self):
+        self.c610_current_var.set("0")
+        self._send(struct.pack("<Bf", HLCONTROL_CMD_SET_C610_CURRENT_A, 0.0))
+
+
+class AS5600Panel(ttk.LabelFrame):
+    """AS5600 磁気エンコーダの絶対角モニタ。STM32 が UDP 5004 へブロードキャストする
+    ASCII 行を AS5600Listener 経由で受け取り、角度を表示する。受信専用 (送信は無い)。"""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, text="AS5600 磁気エンコーダ (UDP 5004, SCL=PA15 / SDA=PB7)", padding=8)
         self.app = app
-        self.node_var = tk.StringVar(value=str(default_node))
-        self.gear_var = tk.StringVar(value=str(default_gear))
-        self.pos_deg_var = tk.StringVar(value="0")
-        self.vel_var = tk.StringVar(value="0.5")
-        self.fb_var = tk.StringVar(value="(heartbeat未受信)")
-        self._fb_state = ""
-        self._fb_pos = ""
-        # ゼロ点校正 (旧コードの offset_ax4 等を模倣): 「現在位置を出力軸0度とする」を
-        # 押した瞬間の生pos_estimate(ネイティブturns)を記憶し、以後はこれを基準にした
-        # 相対角度で位置指令・位置表示を行う。素の絶対エンコーダ値は個体差・据付角度で
-        # バラバラなので、これが無いと「0度を指令」しても意味のある物理角度にならない。
-        self.zero_offset_native = 0.0
-        self.zero_offset_var = tk.StringVar(value="0.0")
-        self._last_pos_native = None  # 直近受信したネイティブ(モーター軸)pos_estimate
-        self._build(note)
+        self.unwrap = Unwrapper()
+        self.zero_deg = None
+        self.last_seq = None
+        self.lost = 0
+        self.last_rx = None
 
-    # -- helpers --
-    def node_id_or_none(self):
-        try:
-            return int(self.node_var.get(), 0)
-        except (ValueError, TypeError):
-            return None
+        row0 = ttk.Frame(self)
+        row0.pack(fill="x")
+        self.status_var = tk.StringVar(value="待受開始待ち")
+        ttk.Label(row0, textvariable=self.status_var, foreground="#777777").pack(side="left")
 
-    def gear_or_default(self):
-        try:
-            g = float(self.gear_var.get())
-            return g if g != 0.0 else 1.0
-        except (ValueError, TypeError):
-            return 1.0
+        row1 = ttk.Frame(self)
+        row1.pack(fill="x", pady=(6, 0))
+        ttk.Label(row1, text="絶対角:").pack(side="left")
+        self.angle_var = tk.StringVar(value="---.-- deg")
+        ttk.Label(row1, textvariable=self.angle_var, font=("Consolas", 22, "bold"),
+                  foreground="#0055aa").pack(side="left", padx=8)
+        ttk.Label(row1, text="連続角(多回転):").pack(side="left", padx=(16, 0))
+        self.cont_var = tk.StringVar(value="---.-- deg")
+        ttk.Label(row1, textvariable=self.cont_var, font=("Consolas", 16)).pack(side="left", padx=8)
 
-    # -- UI --
-    def _build(self, note):
-        pad = dict(padx=4, pady=2)
-        ttk.Label(self, text="Node ID:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(self, textvariable=self.node_var, width=5).grid(row=0, column=1, **pad)
-        ttk.Label(self, text="Gear Ratio:").grid(row=0, column=2, sticky="w")
-        ttk.Entry(self, textvariable=self.gear_var, width=6).grid(row=0, column=3, **pad)
-        ttk.Button(self, text="Enable (Position)", command=self.enable_position).grid(row=0, column=4, **pad)
-        ttk.Button(self, text="Idle (停止)", command=self.idle).grid(row=0, column=5, **pad)
-        ttk.Button(self, text="Clear Errors", command=self.clear_errors).grid(row=0, column=6, **pad)
+        row2 = ttk.Frame(self)
+        row2.pack(fill="x", pady=(4, 0))
+        ttk.Button(row2, text="現在を0度に", command=self.set_zero).pack(side="left")
+        ttk.Button(row2, text="0度解除", command=self.clear_zero).pack(side="left", padx=4)
+        self.zero_var = tk.StringVar(value="ゼロ基準: なし (生の絶対角)")
+        ttk.Label(row2, textvariable=self.zero_var).pack(side="left", padx=8)
 
-        ttk.Label(self, text="出力軸 絶対角 [deg]:").grid(row=1, column=0, columnspan=2, sticky="w")
-        ttk.Entry(self, textvariable=self.pos_deg_var, width=10).grid(row=1, column=2, **pad)
-        ttk.Button(self, text="Set 角度", command=self.set_position_deg).grid(row=1, column=3, **pad)
-        ttk.Label(self, text="(参考)速度[turn/s]:").grid(row=1, column=4, sticky="w")
-        ttk.Entry(self, textvariable=self.vel_var, width=7).grid(row=1, column=5, **pad)
-        ttk.Button(self, text="Enable+Vel", command=self.enable_and_set_velocity).grid(row=1, column=6, **pad)
+        row3 = ttk.Frame(self)
+        row3.pack(fill="x", pady=(4, 0))
+        self.detail_var = tk.StringVar(value="raw=--- angle=--- AGC=--- MAG=--- [--]  --.-Hz  lost=0")
+        ttk.Label(row3, textvariable=self.detail_var, foreground="#0055aa").pack(side="left")
 
-        # ゼロ点校正: 現在位置を出力軸0度として覚えさせる (旧コードの手動オフセット定数に相当)
-        ttk.Button(self, text="現在位置をゼロ設定", command=self.set_zero_here).grid(row=2, column=0, columnspan=2, **pad)
-        ttk.Label(self, text="オフセット[turn,native]:").grid(row=2, column=2, sticky="w")
-        ttk.Entry(self, textvariable=self.zero_offset_var, width=10).grid(row=2, column=3, **pad)
-        ttk.Button(self, text="適用", command=self.apply_zero_offset_entry).grid(row=2, column=4, **pad)
-        ttk.Button(self, text="ゼロ解除(0に戻す)", command=self.clear_zero_offset).grid(row=2, column=5, columnspan=2, **pad)
+        row4 = ttk.Frame(self)
+        row4.pack(fill="x", pady=(4, 0))
+        self.c610_var = tk.StringVar(value="C610位置制御: (テレメトリ未受信)")
+        ttk.Label(row4, textvariable=self.c610_var, font=("Consolas", 11),
+                  foreground="#aa5500").pack(side="left")
 
-        ttk.Label(self, textvariable=self.fb_var, foreground="#0055aa").grid(
-            row=3, column=0, columnspan=7, sticky="w", pady=(4, 0))
-        if note:
-            ttk.Label(self, text=note, foreground="#777777", wraplength=940, justify="left").grid(
-                row=4, column=0, columnspan=7, sticky="w")
-
-    # -- actions --
-    def _send(self, cmd_id, data):
-        node = self.node_id_or_none()
-        if node is None:
-            messagebox.showerror("エラー", "Node ID の入力が不正です")
-            return False
-        self.app.bridge.send_frame(odrive_id(node, cmd_id), False, data)
-        return True
-
-    def enable_position(self):
-        data = odrive_pack_i32(ODRIVE_CONTROL_MODE_POSITION_CONTROL) + odrive_pack_i32(ODRIVE_INPUT_MODE_POS_FILTER)
-        if self._send(ODRIVE_CMD_SET_CONTROLLER_MODE, data):
-            self._send(ODRIVE_CMD_SET_AXIS_STATE, odrive_pack_u32(ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL))
-
-    def idle(self):
-        self._send(ODRIVE_CMD_SET_AXIS_STATE, odrive_pack_u32(ODRIVE_AXIS_STATE_IDLE))
-
-    def clear_errors(self):
-        self._send(ODRIVE_CMD_CLEAR_ERRORS, b"")
-
-    def set_position_deg(self):
-        try:
-            deg = float(self.pos_deg_var.get())
-        except ValueError:
-            messagebox.showerror("エラー", "角度の入力が不正です")
+    def set_zero(self):
+        if self.unwrap.prev is None:
+            messagebox.showinfo("AS5600", "まだ角度を受信していません。")
             return
-        # 入力欄は「ゼロ設定した基準からの」出力軸絶対角[deg]。
-        # turns に直しgear_ratioでネイティブ単位へ変換したうえで、zero_offset_native
-        # (「現在位置をゼロ設定」した時点の生pos_estimate)を足してSet_Input_Posへ送る。
-        # これが無いと、送る値は常にエンコーダの生ゼロ点基準になり、据付角度・個体差の
-        # ぶんだけ実際の物理角とずれる(旧コードのoffset_ax4/offset_ax5と同じ役割)。
-        turns_native = self.zero_offset_native + (deg / 360.0) * self.gear_or_default()
-        self._send(ODRIVE_CMD_SET_INPUT_POS, odrive_pack_f32(turns_native) + bytes(4))  # Vel_FF=0, Torque_FF=0
+        self.zero_deg = self.unwrap.prev
+        self.zero_var.set(f"ゼロ基準: {self.zero_deg:.2f} deg")
 
-    def set_zero_here(self):
-        if self._last_pos_native is None:
-            messagebox.showerror("エラー", "まだこのnode_idからのGet_Encoder_Estimatesを受信していません。"
-                                            "接続・node_idを確認してください。")
-            return
-        self.zero_offset_native = self._last_pos_native
-        self.zero_offset_var.set(f"{self.zero_offset_native:.4f}")
+    def clear_zero(self):
+        self.zero_deg = None
+        self.zero_var.set("ゼロ基準: なし (生の絶対角)")
 
-    def apply_zero_offset_entry(self):
-        try:
-            self.zero_offset_native = float(self.zero_offset_var.get())
-        except ValueError:
-            messagebox.showerror("エラー", "オフセットの入力が不正です")
+    def on_reading(self, rec: dict):
+        now = time.time()
+        rate = (1.0 / (now - self.last_rx)) if (self.last_rx and now > self.last_rx) else 0.0
+        self.last_rx = now
 
-    def clear_zero_offset(self):
-        self.zero_offset_native = 0.0
-        self.zero_offset_var.set("0.0")
+        if self.last_seq is not None:
+            gap = rec["seq"] - self.last_seq - 1
+            if 0 < gap < 100000:
+                self.lost += gap
+        self.last_seq = rec["seq"]
 
-    def enable_and_set_velocity(self):
-        try:
-            vel = float(self.vel_var.get())
-        except ValueError:
-            messagebox.showerror("エラー", "速度の入力が不正です")
-            return
-        data = odrive_pack_i32(ODRIVE_CONTROL_MODE_VELOCITY_CONTROL) + odrive_pack_i32(ODRIVE_INPUT_MODE_PASSTHROUGH)
-        if not self._send(ODRIVE_CMD_SET_CONTROLLER_MODE, data):
-            return
-        self._send(ODRIVE_CMD_SET_AXIS_STATE, odrive_pack_u32(ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL))
-        gear = self.gear_or_default()
-        self._send(ODRIVE_CMD_SET_INPUT_VEL, odrive_pack_f32(vel * gear) + odrive_pack_f32(0.0))
+        deg = rec["raw"] * 360.0 / AS5600_COUNTS
+        cont = self.unwrap.feed(deg)
+        shown = deg if self.zero_deg is None else (deg - self.zero_deg) % 360.0
 
-    # -- フィードバック更新 (App._pump_queue から node ごとに呼ばれる) --
-    def on_frame(self, node_id, extra, tick_ms):
-        if self.node_id_or_none() != node_id:
-            return
-        gear = self.gear_or_default()
-        if "axis_state" in extra:
-            st = ODRIVE_AXIS_STATE_NAMES.get(extra["axis_state"], str(extra["axis_state"]))
-            err = extra["axis_error"]
-            self._fb_state = f"state={st}  err=0x{err:X}" + ("" if err == 0 else "  ⚠エラー")
-        if "pos" in extra:
-            self._last_pos_native = extra["pos"]
-            # ゼロ設定した基準からの相対角度で表示 (Set 角度 に入れる値と同じ基準)
-            rel_turn = (extra["pos"] - self.zero_offset_native) / gear
-            abs_turn = extra["pos"] / gear
-            self._fb_pos = (f"出力軸 pos(ゼロ基準)={rel_turn:+.4f} turn ({rel_turn * 360.0:+.2f} deg)  "
-                            f"[絶対:{abs_turn:+.4f} turn]  vel={extra['vel'] / gear:+.3f} turn/s")
-        self.fb_var.set("   |   ".join(x for x in (self._fb_state, self._fb_pos) if x)
-                        or f"node {node_id} 受信中...")
+        if rec["ok"]:
+            self.angle_var.set(f"{shown:7.2f} deg")
+            self.cont_var.set(f"{cont:+.2f} deg")
+        else:
+            self.angle_var.set("  NG!  ")
+            self.cont_var.set("磁石/配線を確認")
+
+        self.detail_var.set(
+            f"src={rec['src']}  raw={rec['raw']:4d}  angleReg={rec['angle']:4d}  "
+            f"AGC={rec['agc']:3d}  MAG={rec['mag']:4d}  "
+            f"[{as5600_status_flags(rec['status'])}]  {rate:4.1f}Hz  lost={self.lost}")
+        self.status_var.set(self.app.as5600.status)
+
+        c = rec.get("c610")
+        if c is not None:
+            mode = "停止/待機" if not c["en"] else ("カスケード位置制御" if c["act"] else "位置制御(送信保留中2s)")
+            self.c610_var.set(
+                f"C610 {mode}  原点={c['origin_deg']:.1f}deg 差分={c['offset_deg']:+.2f}deg "
+                f"→ 目標={c['tgt_deg']:7.2f}deg 実測={c['meas_deg']:7.2f}deg 誤差={c['err_deg']:+6.2f}deg | "
+                f"速度指令={c['vsp_dps']:+6.2f} 実速度={c['vel_dps']:+6.2f}deg/s | 電流={c['current_a']:+.3f}A")
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("GIM6010-8 / GIM8018-8 CAN Tool (ODrive/VESC, CAN <-> UDP)")
+        self.title("CAN <-> UDP ツール (ログ + GIM同期位置制御 + AS5600角度)")
         self.geometry("1060x900")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.report_queue: "queue.Queue" = queue.Queue()
+        self.as5600_queue: "queue.Queue" = queue.Queue()
         self.bridge = Bridge(report_cb=lambda r: self.report_queue.put(r))
+        self.as5600 = AS5600Listener(reading_cb=lambda r: self.as5600_queue.put(r))
         self.rx_count = 0
         self.odrive_rows = {}  # node_id -> treeview item id
         self.vesc_rows = {}    # controller_id -> treeview item id
-        self.motor_panels = []  # [ODriveMotorPanel, ...]
 
         self._build_ui()
+        self.as5600.start(AS5600_DEFAULT_PORT)
         self.after(50, self._pump_queue)
 
     # ---------------------------------------------------------------- UI --
@@ -531,56 +619,32 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(value="未接続")
         ttk.Label(top, textvariable=self.status_var).pack(side="left", padx=8)
 
-        # --- ODrive status ---
+        # --- AS5600 角度モニタ (受信専用、Connect不要) ---
+        self.as5600_panel = AS5600Panel(self, self)
+        self.as5600_panel.pack(fill="x", padx=8, pady=4)
+
+        # --- ODrive status (ログ: node ID / axis state / エンコーダ) ---
         ostat = ttk.LabelFrame(
-            self, text="ODrive heartbeat / encoder (自動収集 = node IDの発見場所。本命はこちら)", padding=8
+            self, text="ODrive heartbeat / encoder (自動収集 = node IDの発見場所)", padding=8
         )
         ostat.pack(fill="x", padx=8, pady=4)
         ocolumns = ("node", "state", "err", "pos", "vel", "outpos", "t")
         oheaders = {"node": "Node ID", "state": "Axis State", "err": "Axis Error",
                     "pos": "Pos [turn] (native)", "vel": "Vel [turn/s] (native)",
-                    "outpos": "Pos [turn] (÷Gear Ratio)", "t": "tick_ms"}
+                    "outpos": f"出力軸 [deg] (÷{GIM_GEAR_RATIO:g})", "t": "tick_ms"}
         owidths = {"node": 70, "state": 160, "err": 90, "pos": 120, "vel": 120, "outpos": 150, "t": 90}
-        self.odrive_tree = ttk.Treeview(ostat, columns=ocolumns, show="headings", height=4)
+        self.odrive_tree = ttk.Treeview(ostat, columns=ocolumns, show="headings", height=5)
         for col in ocolumns:
             self.odrive_tree.heading(col, text=oheaders[col])
             self.odrive_tree.column(col, width=owidths[col], anchor="w")
         self.odrive_tree.pack(fill="x")
 
-        # --- 位置制御 (GIM6010-8 / GIM8018-8 の2台対応) ---
-        octrl = ttk.LabelFrame(
-            self, text="位置制御 — 出力軸(減速後)の絶対角度で指令。GIM6010-8 / GIM8018-8 を個別設定",
-            padding=6)
-        octrl.pack(fill="x", padx=8, pady=4)
-
-        self.gim6010_panel = ODriveMotorPanel(
-            octrl, self, "GIM6010-8", default_node=1, default_gear=8.0,
-            note="減速比: 公称8.0。デュアルエンコーダで ODrive が出力軸エンコーダを位置FBに使う設定なら"
-                 "1.0 にする(IDLEで出力軸を手でちょうど1回転させ、上の表 Pos[turn] の変化量が8.0か1.0かで判定)。")
-        self.gim6010_panel.pack(fill="x", pady=2)
-        self.motor_panels.append(self.gim6010_panel)
-
-        self.gim8018_panel = ODriveMotorPanel(
-            octrl, self, "GIM8018-8", default_node=0, default_gear=8.0,
-            note="node_id の既定はファーム main.c の GIM_NODE_ID(=0) 準拠。実機の node_id は上の表で確認。"
-                 "減速比の考え方は GIM6010-8 と同じ。")
-        self.gim8018_panel.pack(fill="x", pady=2)
-        self.motor_panels.append(self.gim8018_panel)
-
-        ttk.Label(
-            octrl,
-            text="⚠ 負荷を外し電流制限をかけた電源で、Enable後にまず小さい角度から試すこと。"
-                 "Gear Ratio が実機と違うと指令値と実移動量がずれる(odrive_can.h / gim8018.h のコメント参照)。"
-                 "絶対角なので Set した角度へそのまま動く(相対移動ではない)。",
-            foreground="red", wraplength=1000, justify="left",
-        ).pack(anchor="w", pady=(4, 0))
-
-        # --- 高レベル制御 (TTLサーボ0x21 / wave motor 0x11,0x12、専用UDPポート) ---
+        # --- 高レベル同期制御 (TTLサーボ0x21 / wave motor 0x11,0x12 / GIM6010,GIM8018) ---
         self.hl_control_panel = HLControlPanel(self, self)
         self.hl_control_panel.pack(fill="x", padx=8, pady=4)
 
-        # --- VESC status ---
-        vstat = ttk.LabelFrame(self, text="VESC status (自動収集。比較用の保険)", padding=8)
+        # --- VESC status (ログ: 比較用の保険) ---
+        vstat = ttk.LabelFrame(self, text="VESC status (自動収集。比較用の保険、監視のみ)", padding=8)
         vstat.pack(fill="x", padx=8, pady=4)
         vcolumns = ("ctrl", "erpm", "current", "duty", "t")
         vheaders = {"ctrl": "Controller ID", "erpm": "ERPM", "current": "Current [A]", "duty": "Duty", "t": "tick_ms"}
@@ -591,24 +655,8 @@ class App(tk.Tk):
             self.vesc_tree.column(col, width=vwidths[col], anchor="w")
         self.vesc_tree.pack(fill="x")
 
-        # --- VESC Quick Control ---
-        vctrl = ttk.LabelFrame(self, text="VESC Quick Control (保険用)", padding=8)
-        vctrl.pack(fill="x", padx=8, pady=4)
-        ttk.Label(vctrl, text="Controller ID:").grid(row=0, column=0, sticky="w")
-        self.vesc_id_var = tk.StringVar(value="10")
-        ttk.Entry(vctrl, textvariable=self.vesc_id_var, width=8).grid(row=0, column=1, padx=4)
-        ttk.Label(vctrl, text="Command:").grid(row=0, column=2, sticky="w")
-        self.vesc_cmd_var = tk.StringVar(value="RPM (ERPM)")
-        ttk.Combobox(
-            vctrl, textvariable=self.vesc_cmd_var, values=list(VESC_COMMANDS.keys()), width=18, state="readonly"
-        ).grid(row=0, column=3, padx=4)
-        ttk.Label(vctrl, text="Value:").grid(row=0, column=4, sticky="w")
-        self.vesc_val_var = tk.StringVar(value="1000")
-        ttk.Entry(vctrl, textvariable=self.vesc_val_var, width=10).grid(row=0, column=5, padx=4)
-        ttk.Button(vctrl, text="Send", command=self.on_vesc_send).grid(row=0, column=6, padx=8)
-
-        # --- 手動送信 (生フレーム) ---
-        send = ttk.LabelFrame(self, text="手動送信 (生フレーム)", padding=8)
+        # --- 手動送信 (生フレーム、CAN ID調査用) ---
+        send = ttk.LabelFrame(self, text="手動送信 (生フレーム、CAN ID調査用。Connect が必要)", padding=8)
         send.pack(fill="x", padx=8, pady=4)
         ttk.Label(send, text="CAN ID (hex):").grid(row=0, column=0, sticky="w")
         self.tx_id_var = tk.StringVar(value="1")
@@ -644,8 +692,7 @@ class App(tk.Tk):
     # ----------------------------------------------------------- helpers --
     @staticmethod
     def _parse_hex_id(s: str) -> int:
-        s = s.strip()
-        return int(s, 16)
+        return int(s.strip(), 16)
 
     @staticmethod
     def _parse_hex_data(s: str) -> bytes:
@@ -664,24 +711,6 @@ class App(tk.Tk):
         self.bridge.connect(self.ip_var.get(), port)
         self.status_var.set(f"接続先: {self.ip_var.get()}:{port} (登録パケット送信済み)")
 
-    def _gear_for_node(self, node_id):
-        for panel in self.motor_panels:
-            if panel.node_id_or_none() == node_id:
-                return panel.gear_or_default()
-        return 1.0
-
-    def on_vesc_send(self):
-        try:
-            controller_id = int(self.vesc_id_var.get())
-            packet_id, scale = VESC_COMMANDS[self.vesc_cmd_var.get()]
-            value = float(self.vesc_val_var.get())
-        except (ValueError, KeyError):
-            messagebox.showerror("エラー", "Controller ID / Command / Value の入力が不正です")
-            return
-        ext_id = vesc_ext_id(packet_id, controller_id)
-        data = vesc_pack_int32(value * scale)
-        self.bridge.send_frame(ext_id, True, data)
-
     def on_send_manual(self):
         try:
             can_id = self._parse_hex_id(self.tx_id_var.get())
@@ -699,10 +728,18 @@ class App(tk.Tk):
 
     def on_close(self):
         self.bridge.close()
+        self.as5600.stop()
         self.destroy()
 
     # -------------------------------------------------------------- loop --
     def _pump_queue(self):
+        try:
+            while True:
+                rec = self.as5600_queue.get_nowait()
+                self.as5600_panel.on_reading(rec)
+        except queue.Empty:
+            pass
+
         try:
             while True:
                 can_id, is_extended, dlc, data, tick_ms = self.report_queue.get_nowait()
@@ -720,8 +757,6 @@ class App(tk.Tk):
                         self._update_odrive_row(node_id, extra, None, None, tick_ms)
                     elif "pos" in extra:
                         self._update_odrive_row(node_id, None, extra["pos"], extra["vel"], tick_ms)
-                    for panel in self.motor_panels:
-                        panel.on_frame(node_id, extra, tick_ms)
 
                 vesc = decode_vesc(can_id, is_extended, data)
                 if vesc:
@@ -755,7 +790,7 @@ class App(tk.Tk):
         if pos is not None:
             cur[3] = f"{pos:.3f}"
             cur[4] = f"{vel:.3f}"
-            cur[5] = f"{pos / self._gear_for_node(node_id):.3f}"
+            cur[5] = f"{pos / GIM_GEAR_RATIO * 360.0:+.1f}"
         cur[6] = tick_ms
         self.odrive_tree.item(item, values=cur)
 

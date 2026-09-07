@@ -50,6 +50,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/can_bus.c
     Core/Src/can_udp_bridge.c
     Core/Src/dji_c610.c
+    Core/Src/c610_current.c
+    Core/Src/c610_position.c
     Core/Src/vesc_can.c
     Core/Src/odrive_can.c
     Core/Src/gim6010.c
