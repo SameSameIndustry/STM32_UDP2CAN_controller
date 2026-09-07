@@ -49,10 +49,9 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
     }
     now = HAL_GetTick();
 
-    /* ================= phase 2: CLOSED_LOOP 後、整定を待って home_target を確定 ============= */
+    /* ================= phase 2: CLOSED_LOOP 後、実測 pos_estimate を原点に確定 =============== */
     if (g->startup_phase == 2U) {
         float pe;
-        int32_t k;
 
         /* CLOSED_LOOP から外れた (フォールト等) → phase 1 へ戻して入れ直す。 */
         if (g->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
@@ -76,17 +75,23 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
             return HAL_BUSY;
         }
 
-        /* 最寄りグリッド点。integer turn 部は保持する
-         * (例: pos_estimate=3.4, center=0.2 → k=round(3.2)=3 → home_target=3.2)。
-         * 移動量 |pos_estimate - home_target| は必ず ≤0.5 モーター回転 (出力軸 ±22.5°)。 */
+        /* CLOSED_LOOP 投入後の実測 pos_estimate から「原点(= 絶対0度)」を確定する。
+         *   origin = center_native + round(pos_estimate - center_native)
+         * integer turn 部を最寄りに丸めるので、原点は必ず center_native (=初期角度) と
+         * 同じ小数部を持つ (0.2 / 1.2 / -0.8 ...)。以後の 0x05 は Set_Input_Pos = origin ± 偏差
+         * = 「原点(0度)からの絶対角度」。★モーターを能動的に origin へは動かさない
+         * (最初の 0x05 で origin+偏差 へ動く。0x05 前は電源投入位置を保持)。
+         *
+         * ※ どの integer turn (どの 45° 出力セクタ) になるかは起動時の種依存で非決定的
+         * (§3.2 の ±22.5° 曖昧性)。真のセクタ確定にはホスト側の不揮発保存が要る。 */
         pe = g->odrv.pos_estimate;
         {
             float dd = pe - center_native;
-            k = (int32_t)((dd >= 0.0f) ? (dd + 0.5f) : (dd - 0.5f));
+            int32_t k = (int32_t)((dd >= 0.0f) ? (dd + 0.5f) : (dd - 0.5f));
+            g->startup_origin_native = center_native + (float)k;
         }
-        g->startup_origin_native = center_native + (float)k;
-        g->startup_to_grid       = 1U;
-        g->startup_normalized     = 1U;
+        g->startup_to_grid   = 1U;
+        g->startup_normalized = 1U;
         return HAL_OK;
     }
 
@@ -115,19 +120,24 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
             g->startup_normalized     = 1U;
             return HAL_OK;
         }
-        /* フレーム落ち対策に投入コマンドを定期再送。 */
-        if ((now - g->startup_last_send_tick) >= GIM8018_STARTUP_RESEND_MS) {
-            /* ★axis_error が latch されていると ODrive は CLOSED_LOOP を拒否する
-             * (= その軸は永遠に IDLE)。先に Clear_Errors(cmd 0x018) を送る。
-             * CyberBeast が CAN 受信負荷で CONTROL_DEADLINE_MISSED → MOTOR_FAILED(0x40)
-             * を出すケースがあり、その復帰にはこれが必須。 */
-            if (g->odrv.axis_error != 0U) {
-                (void)ODriveCAN_ClearErrors(&g->odrv);
-                HAL_Delay(5);
-            }
-            HAL_StatusTypeDef st = ODriveCAN_EnablePositionControl(&g->odrv);
-            if (st == HAL_OK) {
-                g->startup_last_send_tick = now;
+        /* 投入コマンドを定期再送。★間隔にジッタを入れる: node4/node5 の CyberBeast が
+         * 同一 heartbeat_rate(100ms) で位相ロックしてバス調停を毎周期 node5 が負ける
+         * (= node5 の CAN が詰まって MOTOR_FAILED(0x40)) 問題があり、STM32 の再送まで
+         * きっかり周期的だと node5 の送信機会をさらに潰す。少しばらつかせて位相をずらす
+         * (ODrive 公式 / STM community どちらも「周期送信をスキューさせろ」と言っている)。 */
+        {
+            uint32_t interval = GIM8018_STARTUP_RESEND_MS + (uint32_t)((now >> 5) & 0x7FU); /* +0..127ms */
+            if ((now - g->startup_last_send_tick) >= interval) {
+                /* ★axis_error が latch されていると ODrive は CLOSED_LOOP を拒否する
+                 * (= その軸は永遠に IDLE)。先に Clear_Errors(cmd 0x018) を送る。 */
+                if (g->odrv.axis_error != 0U) {
+                    (void)ODriveCAN_ClearErrors(&g->odrv);
+                    HAL_Delay(5);
+                }
+                HAL_StatusTypeDef st = ODriveCAN_EnablePositionControl(&g->odrv);
+                if (st == HAL_OK) {
+                    g->startup_last_send_tick = now;
+                }
             }
         }
         return HAL_BUSY;

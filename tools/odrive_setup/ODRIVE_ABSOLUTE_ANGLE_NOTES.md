@@ -298,3 +298,56 @@ def normalize_around(ax, ref_turn):
 - **突入 3 秒間の変動は最大 0.02°** = クローズドループ突入で暴走しない（正規化/復元 + `input_pos=pos_estimate` の効果）。
 - 誤差が -0.01°→-0.35° と**微増**（約 0.035°/サイクル）。これは位置ループの整定オフセットが、毎回「現在値からの相対増分」で指令するため累積するもの。**原点からの絶対値で指令すれば累積しない**（対策A で絶対座標が保たれているので絶対指令が可能）。
 
+---
+
+## 8. GIM8108 を 2 台同一バスに載せると node5 だけ動かない問題（2026-09 解決）
+
+### 8.1 症状
+
+- **node4(0x04) 単体 / node5(0x05) 単体 → どちらもバスにつなげば即座に CLOSED_LOOP に入り正常に位置制御できる。**
+- **node4 と node5 を同じバスに載せた瞬間、node5 だけおかしくなる**:
+  - 電源投入後 **~10 秒**しないと CLOSED_LOOP に入らない（CAN scanner の heartbeat で確認できる）。node4 は即時。
+  - その間 node5 は何を送っても位置制御されない。
+  - `axis_error = 0x40`（`AXIS_ERROR_MOTOR_FAILED`。実体は `motor.error` の `CONTROL_DEADLINE_MISSED`）。
+- `canBusOff = 0`（STM32 は Bus-Off していない）。CAN 終端 60Ω 正常。ボーレートを 250k に落としても変化なし。
+- **GIM6010(0x06/0x07, ODrive 0.6.x) は同じバスに載っていても全く問題ない。**
+
+### 8.2 原因: CAN 低優先度ノードの飢餓 + 周期送信の位相ロック
+
+CAN のアービトレーションは **ID が小さいほど高優先度**。frame ID = `node_id << 5 | cmd_id` なので **node4 の全フレームが node5 より高優先度**。
+
+両 GIM8108 は `axis0.config.can.heartbeat_rate_ms = 100` / `encoder_rate_ms = 100` が**完全に同一**で、同じ電源で同時に起動する → 周期送信が**位相ロック**する。100ms ごとに node4 と node5 がほぼ同時刻に送信を試み、**毎周期 node4 が勝ち、node5 が負ける**。
+
+node5 の CyberBeast fw 0.5.14 は auto-retransmission が効いて送信キューが埋まり、CAN 割り込み処理がリアルタイム制御ループの時間を食う → `CONTROL_DEADLINE_MISSED` → `MOTOR_FAILED (0x40)` → CLOSED_LOOP を保持できない。
+
+**~10 秒 = 2 台の CAN クロック（内蔵 RC?）がドリフトして位相ロックが自然に外れるまでの時間。**
+
+GIM6010 が平気なのは ODrive 0.6.x の CAN スタックがアービトレーション負けを制御ループを止めずに捌けるため（+ `encoder_rate_ms=10` で位相が噛み合わない）。
+
+### 8.3 Web 上の同種事例
+
+- **[ODrive S1: node_id が一定以上のノードだけ通信できない](https://discourse.odriverobotics.com/t/communication-issue-with-odrive-s1-nodes-via-can-interface-beyond-certain-node-ids/11307)** — 「高い node ID のノードがリクエストでハングする。低い ID の3台だけ応答」。原因＝バス輻輳、CAN アービトレーションで低優先度が遅延・ドロップ。対策＝メッセージ頻度を下げる + ボーレートを上げる。
+- **[STM32 CANFD 複数送信ノードの Tx 問題](https://community.st.com/t5/stm32-mcus-products/canfd-multiple-senders-tx-issues/td-p/132944)** — 4 ノードが同期送信 → 1 ノードの Tx FIFO が飽和してデッドロック。**1 つを 1000ms→1001ms にずらしただけで解消**。「周期送信をスキューさせろ」。
+- **[ODrive `CONTROL_DEADLINE_MISSED`](https://discourse.odriverobotics.com/t/unexplainable-control-deadline-missed/6667)** — CPU 過負荷で制御ループ反復をスキップ。
+
+### 8.4 対策
+
+**ODrive 側（本命）: node4 と node5 の周期送信レートをずらして位相ロックを壊す。**
+```python
+# node5 だけ変更（node4 は 100/100 のまま）:
+odrv0.axis0.config.can.heartbeat_rate_ms = 113   # 100 と互いに素な値
+odrv0.axis0.config.can.encoder_rate_ms   = 97
+odrv0.save_configuration()
+```
+併せてバス全体の負荷を下げる: GIM6010(0x06/0x07) の `encoder_rate_ms` を 10 → 30〜50。
+
+**STM32 ファーム側（副次、実装済み）:**
+- `GIM8018_NormalizeMultiturnStartup` phase 1 の CLOSED_LOOP 投入コマンド再送に **+0〜127ms のジッタ**を付与（きっかり周期だと node5 の送信機会をさらに潰すため）。`GIM8018_STARTUP_RESEND_MS` 200→300ms。
+- `axis_error != 0` を見たら `Clear_Errors (0x018)` を送ってから CLOSED_LOOP 再投入（`MOTOR_FAILED` latch からの復帰）。
+- `ODriveCAN_Enable*Control*` のサブフレーム間に `HAL_Delay(5)`（`ODRIVE_CAN_SEQ_GAP_MS`）。
+- heartbeat が一度も来ないノード（`!connected`）には送信しない。
+
+### 8.5 結論
+
+「同一機種の ODrive/CyberBeast を複数台 1 本の CAN バスに載せるときは、周期送信レート（`heartbeat_rate_ms` / `encoder_rate_ms`）を台ごとに互いに素な値にずらすこと。」 揃えると低い node_id が高い node_id を恒常的に飢餓させる。
+

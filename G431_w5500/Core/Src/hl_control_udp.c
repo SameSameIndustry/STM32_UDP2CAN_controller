@@ -193,7 +193,7 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
     s_gim6010_b_last_target = gim6010_b_initial_native;
     s_gim8018_c_last_target = gim8018_c_initial_native;
     s_gim8018_d_last_target = gim8018_d_initial_native;
-    s_gim8018_c_commanded = 0U;   /* §4.2 正規化確定まで Set_Input_Pos を送らない */
+    s_gim8018_c_commanded = 0U;   /* 起動時ホーミング確定 & 初回 0x05 まで Set_Input_Pos を送らない */
     s_gim8018_d_commanded = 0U;
 
     socket(s_sn, Sn_MR_UDP, listen_port, 0);
@@ -204,24 +204,23 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
 
 void HLControlUDP_SetGim8018Origin(uint8_t which, float origin_native, uint8_t home)
 {
-    /* 正規化後の原点を「初期位置」として採用する。0x05 ハンドラは
-     * s_gim8018_*_initial_native + 偏差 を絶対位置指令にするので、ここを書き換えるだけで
-     * 以後の指令が新原点基準になる。
-     *   home=1: grid 正規化成功。origin は厳密に初期角度。commanded を立て、last_target=origin
-     *           を継続再送してモーターを最寄りグリッド点へ回して保持する。
-     *   home=0: フォールバック。origin は現在位置。commanded は 0 のまま (能動的に動かさない)。 */
+    /* 起動時ホーミング状態機械が確定した「原点(= 絶対0度)」を受け取る。
+     * origin_native = center_native + round(pos_estimate - center_native)
+     *              (= 初期角度と同じ小数部を持つ最寄りグリッド点)。
+     * 以後の 0x05 は Set_Input_Pos = origin ± ユーザー角度。
+     * ここではモーターを能動的に動かさない (commanded=0)。0x05 前は電源投入位置を保持し、
+     * 最初の 0x05 で origin±偏差 へ動く。home 引数は未使用。 */
+    (void)home;
     if (which == 0U) {
         s_gim8018_c_initial_native = origin_native;
         s_gim8018_c_last_target    = origin_native;
-        s_gim8018_c_commanded      = home ? 1U : 0U;
-        s_gim8018_c_pending        = home ? 1U : 0U;   /* home 中は到達まで再送 */
-        s_gim8018_c_pending_tick   = HAL_GetTick();
+        s_gim8018_c_commanded      = 0U;
+        s_gim8018_c_pending        = 0U;
     } else {
         s_gim8018_d_initial_native = origin_native;
         s_gim8018_d_last_target    = origin_native;
-        s_gim8018_d_commanded      = home ? 1U : 0U;
-        s_gim8018_d_pending        = home ? 1U : 0U;
-        s_gim8018_d_pending_tick   = HAL_GetTick();
+        s_gim8018_d_commanded      = 0U;
+        s_gim8018_d_pending        = 0U;
     }
 }
 
@@ -297,8 +296,10 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
          * deg/360*8 = deg/45 (= 旧コードの ax_target[rad]/M_PI*4 と等価)。 */
         native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
-        /* 目標 = 「各軸の原点 (起動時ホーミングで確定した init)」+「ユーザー入力角度の偏差」。
-         * ★C(0x04) と D(0x05) は逆向きに回す: C = init_c + delta, D = init_d - delta。 */
+        /* 目標 = 「原点(絶対0度) init」+「ユーザー入力角度」。init は起動時ホーミングが
+         * 確定した center_native と同じ小数部の値 (0.2 / 1.2 / -0.8 ...)。
+         * 例: 現在 0.4, init 0.2, ユーザー +1 → Set_Input_Pos = 1.2 (差分 0.8 動く)。
+         * ★C(0x04) と D(0x05) は逆向き: C = init_c + delta, D = init_d - delta。 */
         s_gim8018_c_last_target = s_gim8018_c_initial_native + native_delta;
         s_gim8018_d_last_target = s_gim8018_d_initial_native - native_delta;
         s_gim8018_c_commanded = 1U;

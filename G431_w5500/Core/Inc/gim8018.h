@@ -62,8 +62,9 @@ extern "C" {
 /* CLOSED_LOOP 投入後、pos_estimate が整定するのを待つ時間[ms] (この間に ODrive が
  * 内部で正しいマルチターン値をロードし、CAN 送信も追いつく)。短いほど早く homing 開始。 */
 #define GIM8018_STARTUP_SETTLE_MS           100U
-/* phase 0/1 で CLOSED_LOOP 投入コマンドを再送する間隔[ms] (フレーム落ち対策・バス配慮)。 */
-#define GIM8018_STARTUP_RESEND_MS           200U
+/* phase 0/1 で CLOSED_LOOP 投入コマンドを再送する最小間隔[ms]。実際はこれ +0..127ms の
+ * ジッタを足す (node4/node5 の周期送信位相ロック対策。gim8018.c phase 1 のコメント参照)。 */
+#define GIM8018_STARTUP_RESEND_MS           300U
 
 typedef struct {
     ODriveCAN_Axis_t odrv;          /* 下位の汎用 ODrive CAN Simple ドライバ (先頭メンバ固定) */
