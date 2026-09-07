@@ -127,6 +127,14 @@ void HLControlUDP_Poll(void);
  * (= 定常状態ではバスに何も足さない)。PENDING_TIMEOUT_MS を超えても止める。 */
 void HLControlUDP_PeriodicResend(void);
 
+/* GIM6010 (0x06/0x07) の起動時「0度」ホーミング。A/B とも CLOSED_LOOP + 角度読み取り可
+ * (新鮮なエンコーダフレーム + 低速) になったら、現在位置から
+ *   origin = GIM6010_A/B_INITIAL_NATIVE_TURNS + round(pos_estimate - INITIAL)
+ * (= INITIAL と同じ小数部の最寄りグリッド点、A/B は同じ integer turn) を確定し、
+ * そこへ Set_Input_Pos で homing する。以後の 0x04 はこの原点基準。1 回で確定。
+ * Delay_WithCANPoll から毎回呼ぶ (確定後は即 return)。 */
+void HLControlUDP_Gim6010StartupHomeTick(void);
+
 /* GIM8018 (GIM8108-8, node 0x04 / 0x05) の「初期位置」を、起動時マルチターン正規化
  * (ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2 対策B) で得た原点で置き換える。
  * which: 0 = gim8018_c (0x04), 1 = gim8018_d (0x05)。origin_native はモーター軸turns。

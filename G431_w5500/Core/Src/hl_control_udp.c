@@ -47,6 +47,10 @@ static uint8_t s_gim6010_commanded = 0U;
 static uint8_t s_gim8018_c_commanded = 0U;
 static uint8_t s_gim8018_d_commanded = 0U;
 
+/* GIM6010 (0x06/0x07) を起動時に「0度」(= initial_native と同じ小数部の最寄りグリッド点)
+ * へ homing 済みか。1 になると HLControlUDP_Gim6010StartupHomeTick() は何もしない。 */
+static uint8_t s_gim6010_startup_homed = 0U;
+
 /* 「目標が変わってからまだ到達していない」= 高頻度再送の対象。到達 or タイムアウトで 0。
  * 目標を更新する箇所 (0x05 ハンドラ / HLControlUDP_SetGim8018Origin) で 1 にする。 */
 static uint8_t  s_gim8018_c_pending = 0U;
@@ -162,6 +166,51 @@ static void HLControl_ApplyGim6010Targets(void)
     }
 }
 
+void HLControlUDP_Gim6010StartupHomeTick(void)
+{
+    float pea, peb, da, db, davg;
+    int32_t k;
+    uint32_t now;
+
+    if (s_gim6010_startup_homed) {
+        return;
+    }
+    if ((s_gim6010_a == NULL) || (s_gim6010_b == NULL) || !HLControl_MotorCanReady()) {
+        return;
+    }
+    /* A/B とも CLOSED_LOOP + 新鮮なエンコーダ + 低速 になってから (pos_estimate が有効な状態)。 */
+    if (!GIM6010_IsClosedLoop(s_gim6010_a) || !GIM6010_IsClosedLoop(s_gim6010_b)) {
+        return;
+    }
+    now = HAL_GetTick();
+    if ((s_gim6010_a->odrv.last_encoder_tick == 0U) || ((now - s_gim6010_a->odrv.last_encoder_tick) > 300U) ||
+        (s_gim6010_b->odrv.last_encoder_tick == 0U) || ((now - s_gim6010_b->odrv.last_encoder_tick) > 300U)) {
+        return;
+    }
+    if ((s_gim6010_a->odrv.vel_estimate > 0.5f) || (s_gim6010_a->odrv.vel_estimate < -0.5f) ||
+        (s_gim6010_b->odrv.vel_estimate > 0.5f) || (s_gim6010_b->odrv.vel_estimate < -0.5f)) {
+        return;
+    }
+
+    /* 「0度」= initial_native と同じ小数部を持つ最寄りグリッド点。A/B は機械的に結合して
+     * いるので同じ integer turn(k) を使う (davg で決める)。移動量は ≤ ~0.5 モーター回転。 */
+    pea  = s_gim6010_a->odrv.pos_estimate;
+    peb  = s_gim6010_b->odrv.pos_estimate;
+    da   = pea - s_gim6010_a_initial_native;
+    db   = peb - s_gim6010_b_initial_native;
+    davg = (da + db) * 0.5f;
+    k    = (int32_t)((davg >= 0.0f) ? (davg + 0.5f) : (davg - 0.5f));
+
+    s_gim6010_a_initial_native += (float)k;   /* 以後の 0x04 はこの原点(0度)基準 */
+    s_gim6010_b_initial_native += (float)k;
+    s_gim6010_a_base_native     = s_gim6010_a_initial_native;
+    s_gim6010_b_base_native     = s_gim6010_b_initial_native;
+    s_gim6010_sync_trim_native  = 0.0f;
+    s_gim6010_commanded         = 1U;
+    s_gim6010_startup_homed     = 1U;
+    HLControl_ApplyGim6010Targets();          /* 即時 1 発。以後はラウンドロビン + Sync が維持 */
+}
+
 void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
                         TTLServoCAN_t *ttl, WaveMotorCAN_t *wave1, WaveMotorCAN_t *wave2,
                         GIM6010_t *gim6010_a, GIM6010_t *gim6010_b,
@@ -193,8 +242,9 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
     s_gim6010_b_last_target = gim6010_b_initial_native;
     s_gim8018_c_last_target = gim8018_c_initial_native;
     s_gim8018_d_last_target = gim8018_d_initial_native;
-    s_gim8018_c_commanded = 0U;   /* 起動時ホーミング確定 & 初回 0x05 まで Set_Input_Pos を送らない */
+    s_gim8018_c_commanded = 0U;   /* 起動時ホーミング確定まで Set_Input_Pos を送らない */
     s_gim8018_d_commanded = 0U;
+    s_gim6010_startup_homed = 0U;
 
     socket(s_sn, Sn_MR_UDP, listen_port, 0);
     /* recvfrom()をノンブロッキングにする。can_udp_bridge.cと同じ理由
@@ -207,20 +257,23 @@ void HLControlUDP_SetGim8018Origin(uint8_t which, float origin_native, uint8_t h
     /* 起動時ホーミング状態機械が確定した「原点(= 絶対0度)」を受け取る。
      * origin_native = center_native + round(pos_estimate - center_native)
      *              (= 初期角度と同じ小数部を持つ最寄りグリッド点)。
-     * 以後の 0x05 は Set_Input_Pos = origin ± ユーザー角度。
-     * ここではモーターを能動的に動かさない (commanded=0)。0x05 前は電源投入位置を保持し、
-     * 最初の 0x05 で origin±偏差 へ動く。home 引数は未使用。 */
+     * ★CLOSED_LOOP + 角度読み取り可 になったので、モーターを能動的に origin(0度) へ
+     *   ホーミングする (commanded=1, pending=1 → PeriodicResend/DeliverTick が
+     *   Set_Input_Pos(origin) を到達まで撒く)。移動量は必ず ≤0.5 モーター回転(出力軸±22.5°)。
+     * 以後の 0x05 は Set_Input_Pos = origin ± ユーザー角度。home 引数は未使用。 */
     (void)home;
     if (which == 0U) {
         s_gim8018_c_initial_native = origin_native;
         s_gim8018_c_last_target    = origin_native;
-        s_gim8018_c_commanded      = 0U;
-        s_gim8018_c_pending        = 0U;
+        s_gim8018_c_commanded      = 1U;
+        s_gim8018_c_pending        = 1U;
+        s_gim8018_c_pending_tick   = HAL_GetTick();
     } else {
         s_gim8018_d_initial_native = origin_native;
         s_gim8018_d_last_target    = origin_native;
-        s_gim8018_d_commanded      = 0U;
-        s_gim8018_d_pending        = 0U;
+        s_gim8018_d_commanded      = 1U;
+        s_gim8018_d_pending        = 1U;
+        s_gim8018_d_pending_tick   = HAL_GetTick();
     }
 }
 

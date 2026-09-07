@@ -100,40 +100,37 @@ def normalize_multiturn(ax):
 - **実証: 起動種が -6.49 / -7.48 / -5.51 回転でも、正規化後 `input_pos=0` 指令での移動量は最大 0.49 回転（出力軸 22.1°）に制限。** 正規化なしなら 5〜7 回転暴走。
 - 限界: 正規化後のゼロ点は「最寄りの出力軸 45° グリッド点」であって真の原点とは限らない。
 
-#### STM32 ファーム実装（GIM8108-8 = CAN node 0x04 / 0x05 のみ）
+#### STM32 ファーム実装（GIM 4 台すべて: 0x04 / 0x05 / 0x06 / 0x07）
 
-`G431_w5500` のファームに実装済み。対象は GIM8108-8（`gim8018_c`=0x04 / `gim8018_d`=0x05）だけで、GIM6010-8（0x06/0x07）には入れていない。
+`G431_w5500` のファーム。**GIM8108-8（0x04/0x05）と GIM6010-8（0x06/0x07）の全 4 台**が対象。
 
-**重要: CAN では IDLE 中の `pos_estimate` を読めない**（`Get_Encoder_Estimates` が 0 / 古いまま。既存の `hl_control_udp.c` のコメントもそう書いている。CLOSED_LOOP に入ると正しくなる）。よって `set_linear_count`（IDLE で使うもの）を STM32 から使う方式は**破綻する**（実測: ID5 原点=0、ID4 が CLOSED_LOOP 投入後に ~1 回転して戻る ← 投入後に本当の `pos_estimate` が現れた瞬間、古い 0 基準で組んだ目標へ走るため）。
+**大前提: CAN では IDLE 中の `pos_estimate` を読めない**（`Get_Encoder_Estimates` が 0 / 古いまま。CLOSED_LOOP に入ると正しくなる）。よって「IDLE で位置を読んでから CLOSED_LOOP」は不可能。`set_linear_count`（IDLE で使うもの）も STM32 からは使えない。
 
-**採用した方式（`GIM8018_NormalizeMultiturnStartup(g, center_native)` = 起動時ホーミング状態機械）:**
+**起動時ホーミング（全 4 台）:**
 
-1. **phase 0**: `Set_Controller_Mode(POSITION, POS_FILTER)` + `Set_Axis_Requested_State(CLOSED_LOOP)`。`Set_Input_Pos` は送らない（§5.1: 遷移時にファームが `pos_setpoint = pos_estimate` を自動初期化 → 飛び出さない。実測 4 秒 ±0.00 回転）。
-2. **phase 1**: heartbeat で `axis_state == CLOSED_LOOP` を確認（`GIM8018_STARTUP_RESEND_MS=200ms` ごとに投入コマンド再送）。
-3. **phase 2**: 投入後 `GIM8018_STARTUP_SETTLE_MS=400ms` 経過 & 新鮮なエンコーダフレーム & `|vel| < 0.5` を待ち、**整定後の実測 `pos_estimate`** から最寄りグリッド点を確定:
+1. **CLOSED_LOOP へ入れる**: `Set_Controller_Mode(POSITION, POS_FILTER)` + `Set_Axis_Requested_State(CLOSED_LOOP)`。`Set_Input_Pos` は送らない（§5.1: 遷移時にファームが `pos_setpoint = pos_estimate` を自動初期化 → 飛び出さない）。`axis_error != 0` なら先に `Clear_Errors(0x018)`。
+2. **CLOSED_LOOP 確認**: heartbeat で `axis_state == 8` を確認（投入コマンドを定期再送、`GIM8018_STARTUP_RESEND_MS=300ms` +0〜127ms ジッタ）。
+3. **整定待ち → 原点確定**: 投入後 `GIM8018_STARTUP_SETTLE_MS=100ms` 経過 & 新鮮なエンコーダフレームを受信 したら、実測 `pos_estimate` から「絶対 0 度」の原点を確定:
    ```
-   home_target = center_native + round(pos_estimate - center_native)
+   origin = INITIAL + round(pos_estimate - INITIAL)
    ```
-   integer turn 部を保持する（`0.2` に強制しない）。**例: `pos_estimate = 3.4`, `center = 0.2` → `home_target = 3.2`**。移動量 `|pos_estimate - home_target|` は必ず ≤0.5 モーター回転（出力軸 ±22.5°）。
-4. `HLControlUDP_SetGim8018Origin(which, home_target, home=1)` → `commanded` を立て `last_target = home_target`。`GIM_StartupBringUp()` と メインループのラウンドロビンが `Set_Input_Pos(home_target)` を送り、モーターを最寄りグリッド点へ回して保持。以後の 0x05 は `home_target + ユーザー入力角度の偏差` を絶対指令。
+   （`INITIAL` = `GIM8018_C/D_INITIAL_NATIVE_TURNS` or `GIM6010_A/B_INITIAL_NATIVE_TURNS`）。
+   integer turn 部を最寄りに丸めるので、**origin は必ず `INITIAL` と同じ小数部**（0.2 / 1.2 / -0.8 …）。どのセクタ（integer turn）になるかは起動時の種依存で非決定的（§3.2 の ±22.5° 曖昧性）。
+   - **例: `pos_estimate = 3.9`, `INITIAL = 0.2` → `origin = 4.2`**。
+   - GIM6010 A/B は機械結合しているので `davg = (da+db)/2` で **同じ k** を使う。
+4. **0 度へ能動的にホーミング**: `Set_Input_Pos(origin)` を到達まで撒く（移動量は必ず ≤0.5 モーター回転 = 出力軸 ±22.5°、POS_FILTER で緩やか）。
+5. 以後のユーザー角度指令 = `origin ± ユーザー角度`。**0x05 は C(0x04) と D(0x05) を逆向き**（C: `origin_c + delta`, D: `origin_d - delta`）。GIM6010 は 0x04 で A/B に同じ値。
 
-**フォールバック**（`startup_to_grid = 0`, `startup_normalized = 1`）:
-- phase 1 が `GIM8018_STARTUP_CL_TIMEOUT_MS=3000ms` 以内に CLOSED_LOOP に入らない（ODrive がエラーで拒否 → calibration を疑う）
-- phase 2 で整定後もエンコーダフレームが来ない
-→ 現在の `pos_estimate` を原点にする（`commanded` は立てない＝能動的に動かさない）。0x05 は現在値からの相対移動で暴走はしないが、初期角度はグリッド点に揃わない。
+**フォールバック**: CLOSED_LOOP に `GIM8018_STARTUP_CL_TIMEOUT_MS=4000ms` 以内に入らない / 整定後もエンコーダフレームが来ない → 現在の `pos_estimate` を原点にして確定（グリッドには揃わないが 0x05 は現在値基準で暴走しない）。ただしその後もラウンドロビン / DeliverTick が `clear_errors` + CLOSED_LOOP 再投入を続けるので、フォールト個体が後から CL を保持できれば復活する。
 
-**診断**: heartbeat ブロードキャスト（`udp.port==5002`）に `GIM c:st=..,nrm=..,grid=..,encAge=.. d:..` を追加。
-`st`=`axis_state`（1=IDLE, 8=CLOSED_LOOP）, `nrm`=`startup_normalized`, `grid`=`startup_to_grid`, `encAge`=直近 `Get_Encoder_Estimates` からの ms（`-1`=未受信）。
-- `st=1` がずっと → CLOSED_LOOP に入れない（ODrive の calibration / エラー / node_id / 電源）
-- `st=8, nrm=0` → CLOSED_LOOP 済み、整定待ち（数百 ms で `nrm=1` になるはず）
-- `st=8, nrm=1, grid=1` → グリッド点へ homing 完了
-- `nrm=1, grid=0` → フォールバック（上記いずれかの理由）
-
-- `GIM_StartupBringUp()`: 電圧安定待ち（1s）→ GIM6010 bring-up → GIM8018 状態機械を最大 ~4s ポーリング → grid 軸へ `Set_Input_Pos(home_target)` を ~1s 送って homing。間に合わなければメインループが毎周（約1.5s）状態機械を進め、確定後は `switch` の `case 2/3` が「CLOSED_LOOP から外れたら入れ直す」だけ担当。
-- `commanded` フラグは C(0x04)/D(0x05) 別々（`s_gim8018_c_commanded` / `_d_commanded`）。
-- **フレーム間ギャップ**（`ODRIVE_CAN_SEQ_GAP_MS = 5ms`, `odrive_can.c`）: `AutoRetransmission = DISABLE` のため、mode 遷移シーケンス（`Set_Controller_Mode` → `Set_Input_Pos` → `Set_Axis_Requested_State`）を**立て続けに投げると 2〜3 発目が落ちる**。ODrive の CAN RX FIFO は小さく、連続受信で溢れる。とくに配線が弱い node で顕著（**ID4 は CLOSED_LOOP に入るが ID5 は入らない → その軸だけ homing されない**）。`ODriveCAN_EnablePositionControl` / `EnablePositionControlHold` / `EnableVelocity/TorqueControl` の各サブフレーム間に `HAL_Delay(5)` を入れた（これらは hot-loop ではない）。`GIM8018_STARTUP_CL_TIMEOUT_MS` も 3s→6s に延長（arm が遅い個体でも homing まで到達させる）。
-- **配達確認つき再送**（`HLControlUDP_PeriodicResend`）: 落ちたフレームの取り戻しがラウンドロビン（約6秒）頼みだと「角度指令が 6 秒遅れて効く/効かない」症状になる。対策として、**目標が変わった軸だけ** `pos_estimate` が目標に近づく（`|err| < 0.05 turn`）まで `HLCONTROL_GIM8018_RESEND_MS=200ms` 間隔で `Set_Input_Pos` を撒く（C→D の順を毎回入れ替え＋間に 3ms gap）。到達 or `PENDING_TIMEOUT_MS=6000ms` で自動停止 → **定常状態のバス負荷ゼロ**。0x05 ハンドラは CAN を送らず pending を立てるだけにして、送信を PeriodicResend に一本化。`Delay_WithCANPoll` から呼ぶ。
-- `ODriveCAN_SetLinearCount()`（cmd `0x019`）は残してあるが未使用（IDLE で読めないため使えない）。
+**堅牢化:**
+- **フレーム間ギャップ** `ODRIVE_CAN_SEQ_GAP_MS = 5ms`（`odrive_can.c`）: `AutoRetransmission = DISABLE` のため mode 遷移の複数フレームを立て続けに投げると 2〜3 発目が落ちる。`ODriveCAN_Enable*Control*` のサブフレーム間に `HAL_Delay(5)`。
+- **配達確認つき再送** `HLControlUDP_PeriodicResend`: 目標が変わった GIM8108 軸だけ `|pos_estimate - target| < 0.05turn` まで `HLCONTROL_GIM8018_RESEND_MS=200ms` 間隔で `Set_Input_Pos` を撒く（C→D 順入替 + 3ms gap）。到達 or `PENDING_TIMEOUT_MS=6000ms` で停止 → **定常状態はバス負荷ゼロ**。
+- **非ブロッキング起動**: `GIM_StartupBringUp()` は ~1.5s で抜け、状態機械の続きは `Delay_WithCANPoll` 内の `GIM_StartupTick()` / `HLControlUDP_Gim6010StartupHomeTick()` が ~100ms ごとに進める（旧: 両軸確定まで最大 10s ブロック → node5 フォールト時に「電源投入後 10 秒無反応」の原因だった）。
+- 一度も heartbeat が来ないノード（`!odrv.connected`）には送信しない。
+- **周期送信レートの位相ロック問題 → §8**（同一機種 2 台を同一バスに載せるときは `heartbeat_rate_ms` / `encoder_rate_ms` を台ごとにずらすこと）。
+- **診断**: heartbeat ブロードキャスト（`udp.port==5002`）に `GIM c:st=..,nrm=..,grid=..,ph=..,err=..,hbAge=..,encAge=.. d:..` と `HB ... TEC=.. REC=.. LEC=..` を追加。
+- `ODriveCAN_SetLinearCount()`（cmd `0x019`）は残してあるが未使用。
 - 未対応: ODrive 単独の途中リブート検出（STM32 と ODrive が同時に電源断・復帰する前提）。
 
 #### 送信コマンド順序（正規化 → クローズドループ投入）

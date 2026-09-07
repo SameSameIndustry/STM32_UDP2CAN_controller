@@ -252,7 +252,8 @@ static void Delay_WithCANPoll(uint32_t ms)
         CANUDPBridge_Poll();
         CANBus_Poll();
         HLControlUDP_Poll();
-        GIM_StartupTick();               // 起動時ホーミングを ~100ms ごとに進める
+        GIM_StartupTick();               // GIM8108(0x04/0x05) 起動時ホーミングを ~100ms ごとに進める
+        HLControlUDP_Gim6010StartupHomeTick();  // GIM6010(0x06/0x07) を 0度へ homing (確定後は即 return)
         // GIM8018(0x04/0x05) の目標位置を「配達確認つき」で再送する (到達したら止める)。
         HLControlUDP_PeriodicResend();
         HAL_Delay(5);
@@ -651,6 +652,7 @@ int main(void)
         HLControlUDP_Poll();
         HLControlUDP_PeriodicResend();
         GIM_StartupTick();
+        HLControlUDP_Gim6010StartupHomeTick();
 
   }
   /* USER CODE END 3 */
