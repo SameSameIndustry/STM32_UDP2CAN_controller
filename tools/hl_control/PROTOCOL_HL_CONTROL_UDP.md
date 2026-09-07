@@ -9,7 +9,18 @@ DJI C610 (CAN ID 0x01) を直接操作するための、生CANフレーム中継
 - STM32側: [`Core/Inc/hl_control_udp.h`](../../G431_w5500/Core/Inc/hl_control_udp.h) /
   [`Core/Src/hl_control_udp.c`](../../G431_w5500/Core/Src/hl_control_udp.c)
 - Python側: [`tools/can_id_scanner/can_id_scanner.py`](../can_id_scanner/can_id_scanner.py)
-  の `HLControlPanel` クラス
+  の `GimSection` / `EndEffectorSection` クラス
+
+## 2基板構成
+
+PC に 2 枚の基板を同一 LAN で繋ぐ。**このブランチ (`enndeffector_UDP`) のファームはエンドエフェクタ基板 (192.168.1.101) 用**。
+
+| 基板 | IP | ファーム | 役割 (この 5003 プロトコルで操作するもの) |
+|------|----|----------|-------------------------------------------|
+| GIM基板 | `192.168.1.100` | 別ブランチ | `0x01` (wave motor pitch)、`0x04` (GIM6010)、`0x05` (GIM8018) |
+| エンドエフェクタ基板 | `192.168.1.101` | このブランチ | `0x02`/`0x03` (エンドエフェクタ サーボ開閉 = TTLサーボ 0x21)、`0x06`/`0x07` (C610 0x01 位置制御) |
+
+同じ 5003 プロトコルだが、コマンドの宛先は**基板の IP で分ける** (Python アプリが GIM系は .100 へ、サーボ/C610 系は .101 へ送信する)。MAC は基板ごとに別 (`main.c` の `gWIZNETINFO.mac`、末尾 `0x65` = 101)。
 
 ## 通信設定
 
@@ -19,9 +30,6 @@ DJI C610 (CAN ID 0x01) を直接操作するための、生CANフレーム中継
 | 通信方向 | PC → STM32 のみ (STM32からの応答・ACKは無い) |
 | STM32側ポート | `5003` (`main.c` の `HLCONTROL_PORT` で変更可能) |
 | STM32側ソケット番号 | `3` (`HLCONTROL_SN`。ソケット0=Helloデモ, 1=CAN-UDPブリッジ, 2=ハートビートと重複しないもの) |
-
-STM32のIPアドレスは他の通信 (CAN-UDPブリッジ等) と共通 (`main.c` の `gWIZNETINFO.ip`、
-既定 `192.168.1.100`)。
 
 ## パケット形式
 
@@ -66,8 +74,9 @@ GUIからは変更不可)。
 
 0x11・0x12・0x21はいずれも受信専用の実機。本プロトコル自体はいずれの場合もSTM32から
 PCへの応答は一切無い (fire-and-forget)。実際に反映されたかどうかは、`can_udp_bridge.c`
-経由の生CANログ (`tools/can_id_scanner/can_id_scanner.py` のログ欄・GIM6010/GIM8018は
-「ODrive heartbeat / encoder」欄) で別途確認すること。
+経由の生CANログ (`can_id_scanner.py` の GIM基板セクションのログ欄・「ODrive heartbeat /
+encoder」欄) や、C610 は AS5600/C610 テレメトリ (UDP 5004、エンドエフェクタ基板セクション)
+で別途確認すること。
 
 ## Python側サンプル
 
@@ -75,7 +84,8 @@ PCへの応答は一切無い (fire-and-forget)。実際に反映されたかど
 import socket
 import struct
 
-STM32_IP = "192.168.1.100"
+GIM_IP = "192.168.1.100"   # GIM基板: 0x01 / 0x04 / 0x05
+EE_IP  = "192.168.1.101"   # エンドエフェクタ基板: 0x02 / 0x03 / 0x06 / 0x07
 HLCONTROL_PORT = 5003
 
 CMD_SET_PITCH_TARGET = 0x01
@@ -88,36 +98,27 @@ CMD_SET_C610_TARGET_DEG = 0x07
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+# --- GIM基板 (192.168.1.100) ---
 # ピッチ角目標値を+42.5degに設定 (0x11には-42.5、0x12には+42.5が送られる)
-sock.sendto(struct.pack("<Bf", CMD_SET_PITCH_TARGET, 42.5), (STM32_IP, HLCONTROL_PORT))
+sock.sendto(struct.pack("<Bf", CMD_SET_PITCH_TARGET, 42.5), (GIM_IP, HLCONTROL_PORT))
+# GIM6010のピッチ角目標値を90degに設定 (0x06・0x07とも同じ値 = 初期位置+2.0)
+sock.sendto(struct.pack("<Bf", CMD_SET_GIM6010_PITCH_TARGET_DEG, 90.0), (GIM_IP, HLCONTROL_PORT))
+# GIM8018のピッチ角目標値を90degに設定 (0x04は初期位置+2.0、0x05は初期位置-2.0)
+sock.sendto(struct.pack("<Bf", CMD_SET_GIM8018_PITCH_TARGET_DEG, 90.0), (GIM_IP, HLCONTROL_PORT))
 
-# TTLサーボ (0x21) をopen (-25deg)
-sock.sendto(struct.pack("<B", CMD_TTL_OPEN), (STM32_IP, HLCONTROL_PORT))
+# --- エンドエフェクタ基板 (192.168.1.101) ---
+# エンドエフェクタ サーボ open (-25deg) / close (+50deg)
+sock.sendto(struct.pack("<B", CMD_TTL_OPEN),  (EE_IP, HLCONTROL_PORT))
+sock.sendto(struct.pack("<B", CMD_TTL_CLOSE), (EE_IP, HLCONTROL_PORT))
 
-# TTLサーボ (0x21) をclose (+50deg)
-sock.sendto(struct.pack("<B", CMD_TTL_CLOSE), (STM32_IP, HLCONTROL_PORT))
-
-# GIM6010のピッチ角目標値を90degに設定 (0x06・0x07とも同じ値 = 初期位置+2.0が送られる)
-sock.sendto(struct.pack("<Bf", CMD_SET_GIM6010_PITCH_TARGET_DEG, 90.0), (STM32_IP, HLCONTROL_PORT))
-
-# GIM8018のピッチ角目標値を90degに設定 (0x04は初期位置+2.0、0x05は初期位置-2.0が送られる)
-sock.sendto(struct.pack("<Bf", CMD_SET_GIM8018_PITCH_TARGET_DEG, 90.0), (STM32_IP, HLCONTROL_PORT))
-
-# C610 (0x01) の目標電流を +2.5A に設定 (電源投入から2秒経過後、STM32が送信を開始する)
-sock.sendto(struct.pack("<Bf", CMD_SET_C610_CURRENT_A, 2.5), (STM32_IP, HLCONTROL_PORT))
-
-# C610 を逆回転方向に -1.0A (負値もそのまま指定できる)
-sock.sendto(struct.pack("<Bf", CMD_SET_C610_CURRENT_A, -1.0), (STM32_IP, HLCONTROL_PORT))
-
-# C610 停止 (0A、位置制御OFF)
-sock.sendto(struct.pack("<Bf", CMD_SET_C610_CURRENT_A, 0.0), (STM32_IP, HLCONTROL_PORT))
+# C610 手動電流 +2.5A (電源投入から2秒経過後、STM32が送信を開始。負値も可、位置制御OFF)
+sock.sendto(struct.pack("<Bf", CMD_SET_C610_CURRENT_A, 2.5), (EE_IP, HLCONTROL_PORT))
 
 # C610 カスケード位置制御: 原点から +30deg へ (実目標 = C610_POS_ORIGIN_DEG + 30)
 # ゲイン・原点・センサオフセットはSTM32側のコンパイル時定数
-sock.sendto(struct.pack("<Bf", CMD_SET_C610_TARGET_DEG, 30.0), (STM32_IP, HLCONTROL_PORT))
-
+sock.sendto(struct.pack("<Bf", CMD_SET_C610_TARGET_DEG, 30.0), (EE_IP, HLCONTROL_PORT))
 # 原点そのものに戻す
-sock.sendto(struct.pack("<Bf", CMD_SET_C610_TARGET_DEG, 0.0), (STM32_IP, HLCONTROL_PORT))
+sock.sendto(struct.pack("<Bf", CMD_SET_C610_TARGET_DEG, 0.0), (EE_IP, HLCONTROL_PORT))
 ```
 
 STM32 → PC の位置制御テレメトリは AS5600 ブロードキャスト行 (UDP `5004`) の末尾に付く:
