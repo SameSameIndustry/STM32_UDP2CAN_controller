@@ -35,6 +35,7 @@
 #include "gim6010.h"
 #include "gim8018.h"
 #include "hl_control_udp.h"
+#include "as5600.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -112,6 +113,14 @@
 // やハートビート(ソケット2, ポート5002)とは別の専用ソケット・ポートを使う。
 #define HLCONTROL_SN    3U
 #define HLCONTROL_PORT  5003U
+
+// AS5600 磁気エンコーダの角度をUDPで垂れ流す専用ソケット・ポート。
+// ハートビート(SN2)と同じくブロードキャスト(255.255.255.255)で送るので、
+// PC側はポート5004をbindするだけでよい (STM32のIPを知らなくても受かる)。
+// Pythonツール: tools/as5600_monitor/as5600_monitor.py
+#define AS5600_SN       4U
+#define AS5600_PORT     5004U
+#define AS5600_PERIOD_MS 50U   // 送信周期 (約20Hz)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -242,6 +251,54 @@ static void GIM_StartupTick(void)
     }
 }
 
+// AS5600 磁気エンコーダを AS5600_PERIOD_MS ごとに読み、角度をUDP(ポート5004)へ
+// ブロードキャストする。ハートビート等と同じく ASCII 1行テキスト。
+//   AS5600 seq=.. tick=.. ok=1 raw=2048 mdeg=180000 angle=2047 status=0x20 agc=128 mag=1234
+//     seq    : 連番
+//     tick   : STM32側 HAL_GetTick() [ms]
+//     ok     : 1 = I2C応答あり かつ 磁石検出(STATUS.MD=1)
+//     raw    : RAW_ANGLE レジスタ 0..4095 (未加工の機械角)
+//     mdeg   : raw を 0.001度単位に換算した整数 (= raw*360000/4096)。
+//              ★nano.specs + 浮動小数printf無効のため firmware では %f を使わず整数で送る。
+//     angle  : ANGLE レジスタ 0..4095 (ZPOS/MPOS/ヒステリシス適用後)
+//     status : STATUS レジスタ (bit5 MH=磁石強すぎ / bit4 ML=磁石弱すぎ / bit3 MD=検出)
+//     agc    : AGC レジスタ (3.3V動作で 0..255、中央付近が理想)
+//     mag    : MAGNITUDE レジスタ 0..4095
+// 角度[deg] への換算は受信側(Python)で raw*360/4096 で行う。
+static void AS5600_StreamTick(void)
+{
+    static uint32_t s_last = 0U;
+    static uint32_t s_seq  = 0U;
+    static uint8_t  s_sock_opened = 0U;
+
+    uint32_t now = HAL_GetTick();
+    if ((now - s_last) < AS5600_PERIOD_MS) {
+        return;
+    }
+    s_last = now;
+
+    if (!s_sock_opened || (getSn_SR(AS5600_SN) == SOCK_CLOSED)) {
+        socket(AS5600_SN, Sn_MR_UDP, AS5600_PORT, 0);
+        s_sock_opened = 1U;
+    }
+
+    AS5600_Reading_t r;
+    HAL_StatusTypeDef st = AS5600_ReadAll(&r);
+    uint32_t mdeg = ((uint32_t)r.raw_angle * 360000U) / 4096U;
+
+    char msg[128];
+    int len = snprintf(msg, sizeof(msg),
+                       "AS5600 seq=%lu tick=%lu ok=%d raw=%u mdeg=%lu angle=%u status=0x%02X agc=%u mag=%u\r\n",
+                       (unsigned long)s_seq++, (unsigned long)now,
+                       (int)((st == HAL_OK) && r.ok),
+                       (unsigned)r.raw_angle, (unsigned long)mdeg, (unsigned)r.angle,
+                       (unsigned)r.status, (unsigned)r.agc, (unsigned)r.magnitude);
+    if (len > 0) {
+        uint8_t bcast[4] = {255, 255, 255, 255};
+        sendto(AS5600_SN, (uint8_t*)msg, (uint16_t)len, bcast, AS5600_PORT);
+    }
+}
+
 // HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングと
 // CANBus_Poll()(Bus-Off検出・自動復帰)を挟むことで、PCからのCAN送信コマンドへの
 // 応答性と、CAN通信が止まったままにならないことを確保する (数msの粒度)
@@ -256,6 +313,7 @@ static void Delay_WithCANPoll(uint32_t ms)
         HLControlUDP_Gim6010StartupHomeTick();  // GIM6010(0x06/0x07) を 0度へ homing (確定後は即 return)
         // GIM8018(0x04/0x05) の目標位置を「配達確認つき」で再送する (到達したら止める)。
         HLControlUDP_PeriodicResend();
+        AS5600_StreamTick();             // AS5600 磁気エンコーダの角度をUDP(5004)へ ~20Hz で送る
         HAL_Delay(5);
     }
 }
@@ -442,6 +500,10 @@ int main(void)
   // 同じく GIM への連続送信の間に HAL_Delay(5) を挟みながら、クローズドループ投入を
   // 5回ぶん・基準位置の Set_Input_Pos を2回ぶん送る。フレームロスト対策。
   GIM_StartupBringUp();
+
+  // AS5600 磁気エンコーダ (ソフトウェアI2C: SCL=PA15, SDA=PB7)。
+  // 角度は AS5600_StreamTick() が UDPポート5004へ周期送信する。
+  AS5600_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -653,6 +715,7 @@ int main(void)
         HLControlUDP_PeriodicResend();
         GIM_StartupTick();
         HLControlUDP_Gim6010StartupHomeTick();
+        AS5600_StreamTick();
 
   }
   /* USER CODE END 3 */
