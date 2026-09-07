@@ -125,20 +125,9 @@ static void HLControl_EnsureGim6010ClosedLoop(GIM6010_t *g)
     }
 }
 
-static void HLControl_EnsureGim8018ClosedLoop(GIM8018_t *g)
-{
-    /* ★§4.2: 起動時マルチターン正規化が済むまでクローズドループへ入れない。
-     * 古い誤マルチターン種(pos_estimate = -6.9 等)のまま EnterPositionControlHold が
-     * Set_Input_Pos(古い pos_estimate) を送ると数回転巻き戻す(§5.1)。
-     * 正規化は GIM_StartupBringUp / main.c のラウンドロビンが進める。それまで
-     * GUI から 0x05 が来てもこの軸は据え置き(モーターがその場保持)。 */
-    if (!GIM8018_IsStartupNormalized(g)) {
-        return;
-    }
-    if (g->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-        GIM8018_EnterPositionControlHold(g);
-    }
-}
+/* GIM8018 (0x04/0x05) の CLOSED_LOOP 維持・Set_Input_Pos 送信は
+ * HLControlUDP_PeriodicResend() / HLControl_Gim8018DeliverTick() に一本化した
+ * (startup ホーミング未確定の軸を弾く判定もそちら側)。 */
 
 /* s_gim6010_a/b_base_native と s_gim6010_sync_trim_native から実際に送る絶対位置を
  * 計算し直すだけで、CAN送信はしない。呼ぶだけならFDCAN TxFIFOを消費しないので、
@@ -308,49 +297,24 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
          * deg/360*8 = deg/45 (= 旧コードの ax_target[rad]/M_PI*4 と等価)。 */
         native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
-        /* 目標 = 「固定の初期位置(GIM8018_C/D_INITIAL_NATIVE_TURNS)」+「ユーザー入力
-         * 角度の偏差」。0x05 は 0x04 と違い符号反転しない。C/D とも同じ偏差。 */
+        /* 目標 = 「各軸の原点 (起動時ホーミングで確定した init)」+「ユーザー入力角度の偏差」。
+         * ★C(0x04) と D(0x05) は逆向きに回す: C = init_c + delta, D = init_d - delta。 */
         s_gim8018_c_last_target = s_gim8018_c_initial_native + native_delta;
-        s_gim8018_d_last_target = s_gim8018_d_initial_native + native_delta;
-        s_gim8018_c_commanded = 1U;   /* 以後ラウンドロビンが last_target を再送してよい */
+        s_gim8018_d_last_target = s_gim8018_d_initial_native - native_delta;
+        s_gim8018_c_commanded = 1U;
         s_gim8018_d_commanded = 1U;
-        /* 新しい目標。到達するまで HLControlUDP_PeriodicResend() が ~200ms 間隔で撒く
-         * (AutoRetransmission=DISABLE で初回フレームが落ちても数百 ms で追いつく)。 */
+        /* ここでは CAN を一切送らない。目標を記憶して pending を立てるだけ。
+         * 実際の送信は HLControlUDP_PeriodicResend() が担当する:
+         *   - C→D を毎回入れ替え + 間に gap を入れて撒く (立て続け送信で D が落ちるのを防ぐ)
+         *   - pos_estimate が目標に十分近づいたら止める (定常状態はバス負荷ゼロ)
+         *   - CLOSED_LOOP から外れていたら入れ直してから撒く
+         * 起動時の電圧不安定期間 / startup ホーミング未確定の軸は PeriodicResend 側で弾く。
+         * ★早すぎる 0x05 (ホーミング確定前) は、確定時に SetGim8018Origin が
+         *   commanded/last_target/pending を上書きするので破棄される (ユーザーは再送が必要)。 */
         {
             uint32_t t = HAL_GetTick();
             s_gim8018_c_pending = 1U;  s_gim8018_c_pending_tick = t;
             s_gim8018_d_pending = 1U;  s_gim8018_d_pending_tick = t;
-        }
-
-        /* GIM6010 と同じく、目標を送る直前に axis_state を見てクローズドループで
-         * なければモードを再設定する(既にクローズドループなら 0 フレーム)。
-         * ★バス混雑対策: 毎回 C→D の順で立て続けに送ると、後発の D のフレームが
-         *   FDCAN TxFIFO(3段)溢れで弾かれやすい(can_bus.c のコメント参照)。
-         *   受信のたびに送信順を入れ替えて、D が常に後ろにならないようにする。
-         *   周期再送は main.c のラウンドロビン(1周1軸)が担当するので、ここは
-         *   GUI コマンド受信時の単発イベントのみ。 */
-        /* 起動直後(電圧不安定期間)は目標値を記憶するだけで送信しない。
-         * 経過後は main.c のラウンドロビンが last_target を送る。
-         * ★§4.2: 正規化(startup_normalized)が済んでいない軸へは Set_Input_Pos を送らない。
-         *   正規化確定時に HLControlUDP_SetGim8018Origin() が commanded / last_target を
-         *   上書きするので、ここで記憶した早すぎる目標は破棄される(ユーザーは再送が必要)。 */
-        if (HLControl_MotorCanReady()) {
-            static uint8_t d_first = 0U;
-            uint8_t c_ready = (s_gim8018_c != NULL) && GIM8018_IsStartupNormalized(s_gim8018_c);
-            uint8_t d_ready = (s_gim8018_d != NULL) && GIM8018_IsStartupNormalized(s_gim8018_d);
-            if (d_first && d_ready) {
-                HLControl_EnsureGim8018ClosedLoop(s_gim8018_d);
-                ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_last_target, 0.0f, 0.0f);
-            }
-            if (c_ready) {
-                HLControl_EnsureGim8018ClosedLoop(s_gim8018_c);
-                ODriveCAN_SetInputPos(&s_gim8018_c->odrv, s_gim8018_c_last_target, 0.0f, 0.0f);
-            }
-            if (!d_first && d_ready) {
-                HLControl_EnsureGim8018ClosedLoop(s_gim8018_d);
-                ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_last_target, 0.0f, 0.0f);
-            }
-            d_first = (uint8_t)(!d_first);
         }
     }
     /* 未知のコマンドは無視する */
@@ -387,13 +351,21 @@ static void HLControl_Gim8018DeliverTick(GIM8018_t *g, float target_native,
     if (!GIM8018_IsStartupNormalized(g)) {
         return;   /* startup ホーミング未確定。状態機械側に任せる */
     }
+    /* 一度も応答の無いノードには送らない (応答が間欠的なだけなら送り続ける)。 */
+    if (!g->odrv.connected) {
+        return;
+    }
     /* タイムアウト: これ以上は撒かない (ラウンドロビンの保険に委ねる)。 */
     if ((now - pending_tick) > HLCONTROL_GIM8018_PENDING_TIMEOUT_MS) {
         *pending = 0U;
         return;
     }
-    /* CLOSED_LOOP から外れていたら入れ直してから位置を撒く。 */
+    /* CLOSED_LOOP から外れていたら入れ直してから位置を撒く。
+     * axis_error が latch されていると CLOSED_LOOP を拒否されるので先にクリア。 */
     if (g->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
+        if (g->odrv.axis_error != 0U) {
+            (void)ODriveCAN_ClearErrors(&g->odrv);
+        }
         GIM8018_EnterPositionControlHold(g);
         return;
     }
@@ -426,10 +398,25 @@ void HLControlUDP_PeriodicResend(void)
     }
     last = now;
 
-    HLControl_Gim8018DeliverTick(s_gim8018_c, s_gim8018_c_last_target,
-                                 &s_gim8018_c_pending, s_gim8018_c_pending_tick, now);
-    HLControl_Gim8018DeliverTick(s_gim8018_d, s_gim8018_d_last_target,
-                                 &s_gim8018_d_pending, s_gim8018_d_pending_tick, now);
+    /* C→D を立て続けに投げると D 側が落ちやすい (can_bus.c / AutoRetransmission=DISABLE)。
+     * 送信順を毎回入れ替え、間に短い gap を入れる。 */
+    {
+        static uint8_t c_first = 1U;
+        if (c_first) {
+            HLControl_Gim8018DeliverTick(s_gim8018_c, s_gim8018_c_last_target,
+                                         &s_gim8018_c_pending, s_gim8018_c_pending_tick, now);
+            HAL_Delay(3);
+            HLControl_Gim8018DeliverTick(s_gim8018_d, s_gim8018_d_last_target,
+                                         &s_gim8018_d_pending, s_gim8018_d_pending_tick, now);
+        } else {
+            HLControl_Gim8018DeliverTick(s_gim8018_d, s_gim8018_d_last_target,
+                                         &s_gim8018_d_pending, s_gim8018_d_pending_tick, now);
+            HAL_Delay(3);
+            HLControl_Gim8018DeliverTick(s_gim8018_c, s_gim8018_c_last_target,
+                                         &s_gim8018_c_pending, s_gim8018_c_pending_tick, now);
+        }
+        c_first = (uint8_t)(!c_first);
+    }
 }
 
 void HLControlUDP_ResendLastTarget(uint8_t index)
@@ -457,13 +444,13 @@ void HLControlUDP_ResendLastTarget(uint8_t index)
              * commanded は grid 正規化成功時に SetGim8018Origin(home=1) が立てる
              * (= 初期角度へ homing)、または 0x05 コマンド受信時に立つ。 */
             if ((s_gim8018_c != NULL) && s_gim8018_c_commanded &&
-                GIM8018_IsStartupNormalized(s_gim8018_c)) {
+                GIM8018_IsStartupNormalized(s_gim8018_c) && s_gim8018_c->odrv.connected) {
                 ODriveCAN_SetInputPos(&s_gim8018_c->odrv, s_gim8018_c_last_target, 0.0f, 0.0f);
             }
             break;
         default:  /* index 3 */
             if ((s_gim8018_d != NULL) && s_gim8018_d_commanded &&
-                GIM8018_IsStartupNormalized(s_gim8018_d)) {
+                GIM8018_IsStartupNormalized(s_gim8018_d) && s_gim8018_d->odrv.connected) {
                 ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_last_target, 0.0f, 0.0f);
             }
             break;

@@ -131,7 +131,8 @@ def normalize_multiturn(ax):
 
 - `GIM_StartupBringUp()`: 電圧安定待ち（1s）→ GIM6010 bring-up → GIM8018 状態機械を最大 ~4s ポーリング → grid 軸へ `Set_Input_Pos(home_target)` を ~1s 送って homing。間に合わなければメインループが毎周（約1.5s）状態機械を進め、確定後は `switch` の `case 2/3` が「CLOSED_LOOP から外れたら入れ直す」だけ担当。
 - `commanded` フラグは C(0x04)/D(0x05) 別々（`s_gim8018_c_commanded` / `_d_commanded`）。
-- **配達確認つき再送**（`HLControlUDP_PeriodicResend`）: FDCAN は `AutoRetransmission = DISABLE`（Bus-Off 回避のため意図的）なので ACK が返らないフレームは再送されず捨てられ、とくに node5(0x05) が落ちやすい。落ちたフレームの取り戻しがラウンドロビン（約6秒）頼みだと「角度指令が 6 秒遅れて効く/効かない」症状になる。対策として、**目標が変わった軸だけ** `pos_estimate` が目標に近づく（`|err| < 0.05 turn`）まで `HLCONTROL_GIM8018_RESEND_MS=200ms` 間隔で `Set_Input_Pos` を撒く。到達 or `PENDING_TIMEOUT_MS=4000ms` で自動停止 → **定常状態のバス負荷は増えない**（動いている間だけ ~5 frame/s/軸）。`Delay_WithCANPoll` から呼ぶ。
+- **フレーム間ギャップ**（`ODRIVE_CAN_SEQ_GAP_MS = 5ms`, `odrive_can.c`）: `AutoRetransmission = DISABLE` のため、mode 遷移シーケンス（`Set_Controller_Mode` → `Set_Input_Pos` → `Set_Axis_Requested_State`）を**立て続けに投げると 2〜3 発目が落ちる**。ODrive の CAN RX FIFO は小さく、連続受信で溢れる。とくに配線が弱い node で顕著（**ID4 は CLOSED_LOOP に入るが ID5 は入らない → その軸だけ homing されない**）。`ODriveCAN_EnablePositionControl` / `EnablePositionControlHold` / `EnableVelocity/TorqueControl` の各サブフレーム間に `HAL_Delay(5)` を入れた（これらは hot-loop ではない）。`GIM8018_STARTUP_CL_TIMEOUT_MS` も 3s→6s に延長（arm が遅い個体でも homing まで到達させる）。
+- **配達確認つき再送**（`HLControlUDP_PeriodicResend`）: 落ちたフレームの取り戻しがラウンドロビン（約6秒）頼みだと「角度指令が 6 秒遅れて効く/効かない」症状になる。対策として、**目標が変わった軸だけ** `pos_estimate` が目標に近づく（`|err| < 0.05 turn`）まで `HLCONTROL_GIM8018_RESEND_MS=200ms` 間隔で `Set_Input_Pos` を撒く（C→D の順を毎回入れ替え＋間に 3ms gap）。到達 or `PENDING_TIMEOUT_MS=6000ms` で自動停止 → **定常状態のバス負荷ゼロ**。0x05 ハンドラは CAN を送らず pending を立てるだけにして、送信を PeriodicResend に一本化。`Delay_WithCANPoll` から呼ぶ。
 - `ODriveCAN_SetLinearCount()`（cmd `0x019`）は残してあるが未使用（IDLE で読めないため使えない）。
 - 未対応: ODrive 単独の途中リブート検出（STM32 と ODrive が同時に電源断・復帰する前提）。
 

@@ -26,6 +26,15 @@
 static ODriveCAN_Axis_t *s_axis_table[ODRIVECAN_MAX_TRACKED];
 static uint8_t s_axis_count = 0U;
 
+/* mode 遷移シーケンス (Set_Controller_Mode → [Set_Input_Pos] → Set_Axis_Requested_State) の
+ * フレーム間に空ける時間 [ms]。
+ * FDCAN は AutoRetransmission=DISABLE なので、立て続けに複数フレームを投げると、
+ * ACK が返らない / CAN RX が詰まっているノード宛のフレームがまとめて落ちる。ODrive の
+ * CAN RX FIFO は小さく、mode+state を連続で受けると溢れて 2 発目 (CLOSED_LOOP 遷移) を
+ * 取りこぼすことがある (配線が弱い node で顕著。ID4 は入るが ID5 は入らない、等)。
+ * これらの関数は hot-loop から呼ばれないので数 ms の遅延で構わない。 */
+#define ODRIVE_CAN_SEQ_GAP_MS 5U
+
 static uint32_t ODriveCAN_MakeId(uint8_t node_id, uint32_t cmd_id)
 {
     return ((uint32_t)node_id << 5) | (cmd_id & 0x1FU);
@@ -165,6 +174,7 @@ HAL_StatusTypeDef ODriveCAN_EnableVelocityControl(ODriveCAN_Axis_t *axis)
     if (status != HAL_OK) {
         return status;
     }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
 
@@ -175,6 +185,7 @@ HAL_StatusTypeDef ODriveCAN_EnablePositionControl(ODriveCAN_Axis_t *axis)
     if (status != HAL_OK) {
         return status;
     }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);   /* 連続送信で 2 発目が落ちるのを防ぐ */
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
 
@@ -195,10 +206,12 @@ HAL_StatusTypeDef ODriveCAN_EnablePositionControlHold(ODriveCAN_Axis_t *axis)
     if (status != HAL_OK) {
         return status;
     }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);
     status = ODriveCAN_SetInputPos(axis, axis->pos_estimate, 0.0f, 0.0f);
     if (status != HAL_OK) {
         return status;
     }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
 
@@ -209,6 +222,7 @@ HAL_StatusTypeDef ODriveCAN_EnableTorqueControl(ODriveCAN_Axis_t *axis)
     if (status != HAL_OK) {
         return status;
     }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
 

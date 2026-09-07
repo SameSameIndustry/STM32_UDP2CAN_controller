@@ -55,12 +55,13 @@ extern "C" {
 #define GIM8018_ENCODER_CPR                 16384
 
 /* CLOSED_LOOP 投入を要求してから axis_state==8 を確認できるまでの上限[ms]。
- * これを超えたら homing を諦めて現在値を原点にして先へ進む (ODrive が CLOSED_LOOP を
- * 拒否している = calibration / エラーを疑う)。 */
-#define GIM8018_STARTUP_CL_TIMEOUT_MS      3000U
+ * これを超えたら homing を諦めて現在値を原点にして「フォールバック確定」にする。
+ * ただし確定後もラウンドロビン / PeriodicResend が clear_errors + CL 投入を continue するので、
+ * フォールト個体が後から CL を保持できれば位置制御は復活する (grid homing はされないが)。 */
+#define GIM8018_STARTUP_CL_TIMEOUT_MS      4000U
 /* CLOSED_LOOP 投入後、pos_estimate が整定するのを待つ時間[ms] (この間に ODrive が
- * 内部で正しいマルチターン値をロードし、CAN 送信も追いつく)。 */
-#define GIM8018_STARTUP_SETTLE_MS           400U
+ * 内部で正しいマルチターン値をロードし、CAN 送信も追いつく)。短いほど早く homing 開始。 */
+#define GIM8018_STARTUP_SETTLE_MS           100U
 /* phase 0/1 で CLOSED_LOOP 投入コマンドを再送する間隔[ms] (フレーム落ち対策・バス配慮)。 */
 #define GIM8018_STARTUP_RESEND_MS           200U
 

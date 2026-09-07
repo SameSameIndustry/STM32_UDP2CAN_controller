@@ -64,21 +64,15 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
         if ((now - g->startup_entry_tick) < GIM8018_STARTUP_SETTLE_MS) {
             return HAL_BUSY;
         }
-        /* 新鮮なエンコーダフレームを受信していること (250ms 以内)。CLOSED_LOOP なのに
-         * これが満たされないまま長く経ったら homing を諦める。 */
-        if ((g->odrv.last_encoder_tick == 0U) || ((now - g->odrv.last_encoder_tick) > 250U)) {
-            if ((now - g->startup_entry_tick) > (GIM8018_STARTUP_SETTLE_MS + 2000U)) {
+        /* CLOSED_LOOP 投入後の新鮮なエンコーダフレームを 1 発待つ (300ms 以内)。
+         * これが来ないまま長く経ったら homing を諦める。 */
+        if ((g->odrv.last_encoder_tick == 0U) || ((now - g->odrv.last_encoder_tick) > 300U)) {
+            if ((now - g->startup_entry_tick) > (GIM8018_STARTUP_SETTLE_MS + 3000U)) {
                 g->startup_origin_native = g->odrv.pos_estimate;  /* best effort */
                 g->startup_to_grid       = 0U;
                 g->startup_normalized     = 1U;
                 return HAL_OK;
             }
-            return HAL_BUSY;
-        }
-        /* まだ動いているなら整定を待つ。ただし整定しないまま長く経ったら (外乱・振動)
-         * その時点の値で確定する (待ち続けるより良い)。 */
-        if (((g->odrv.vel_estimate > 0.5f) || (g->odrv.vel_estimate < -0.5f)) &&
-            ((now - g->startup_entry_tick) < (GIM8018_STARTUP_SETTLE_MS + 2500U))) {
             return HAL_BUSY;
         }
 
@@ -94,6 +88,15 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
         g->startup_to_grid       = 1U;
         g->startup_normalized     = 1U;
         return HAL_OK;
+    }
+
+    /* ★一度も応答の無いノード (node_id 不一致 / 未接続 / ボーレート不一致) には送らない。
+     * ただし「一度でも受信実績があるノード」= 応答が遅い/間欠的なだけの場合は送り続ける。
+     * (heartbeat が数百ms 遅れる程度で送信を止めると、そのノードがいつまでも
+     *  IDLE のまま = ID5 が CLOSED_LOOP に入らない、という症状になる。canBusOff=0 が
+     *  確認できているので Bus-Off の心配は不要。) */
+    if (!g->odrv.connected && (g->startup_phase < 2U)) {
+        return HAL_BUSY;
     }
 
     /* ================= phase 1: axis_state==CLOSED_LOOP を待つ ============================= */
@@ -114,6 +117,14 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
         }
         /* フレーム落ち対策に投入コマンドを定期再送。 */
         if ((now - g->startup_last_send_tick) >= GIM8018_STARTUP_RESEND_MS) {
+            /* ★axis_error が latch されていると ODrive は CLOSED_LOOP を拒否する
+             * (= その軸は永遠に IDLE)。先に Clear_Errors(cmd 0x018) を送る。
+             * CyberBeast が CAN 受信負荷で CONTROL_DEADLINE_MISSED → MOTOR_FAILED(0x40)
+             * を出すケースがあり、その復帰にはこれが必須。 */
+            if (g->odrv.axis_error != 0U) {
+                (void)ODriveCAN_ClearErrors(&g->odrv);
+                HAL_Delay(5);
+            }
             HAL_StatusTypeDef st = ODriveCAN_EnablePositionControl(&g->odrv);
             if (st == HAL_OK) {
                 g->startup_last_send_tick = now;

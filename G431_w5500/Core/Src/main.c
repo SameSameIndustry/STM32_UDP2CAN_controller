@@ -101,7 +101,7 @@
 // の +1.3 / -1.3 に相当(offset_ax は0扱い)。負値 + circular_setpoints でずれる
 // 疑いの切り分けのため、現状は node5 も +1.3(node4と同じ)にしてある。
 #define GIM8018_C_INITIAL_NATIVE_TURNS  0.2f
-#define GIM8018_D_INITIAL_NATIVE_TURNS  0.8f
+#define GIM8018_D_INITIAL_NATIVE_TURNS  0.2f
 
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U
@@ -211,6 +211,37 @@ void W5500_WriteByte(uint8_t wb) {
     }
 }
 
+// GIM8108-8 (0x04/0x05) の起動時ホーミング状態機械を進める (自前で ~100ms 間引き)。
+// メインループの周期(Delay_WithCANPoll(1500))だけで回すと状態遷移が 1.5s に 1 回に
+// なってしまい、フレーム落ちのある node5 が CLOSED_LOOP に入るまで何十秒もかかる。
+// Delay_WithCANPoll から呼んで、確定するまで ~100ms ごとに進める。
+static void GIM_StartupTick(void)
+{
+    static uint32_t s_last = 0U;
+    uint32_t now = HAL_GetTick();
+
+    if (now < HLCONTROL_MOTOR_CAN_START_MS) {
+        return;
+    }
+    if ((now - s_last) < 100U) {
+        return;
+    }
+    s_last = now;
+
+    if (!GIM8018_IsStartupNormalized(&gim8018_c)) {
+        if (GIM8018_NormalizeMultiturnStartup(&gim8018_c, GIM8018_C_INITIAL_NATIVE_TURNS) == HAL_OK) {
+            HLControlUDP_SetGim8018Origin(0U, GIM8018_GetStartupOriginNative(&gim8018_c),
+                                          GIM8018_StartupNormalizedToGrid(&gim8018_c));
+        }
+    }
+    if (!GIM8018_IsStartupNormalized(&gim8018_d)) {
+        if (GIM8018_NormalizeMultiturnStartup(&gim8018_d, GIM8018_D_INITIAL_NATIVE_TURNS) == HAL_OK) {
+            HLControlUDP_SetGim8018Origin(1U, GIM8018_GetStartupOriginNative(&gim8018_d),
+                                          GIM8018_StartupNormalizedToGrid(&gim8018_d));
+        }
+    }
+}
+
 // HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングと
 // CANBus_Poll()(Bus-Off検出・自動復帰)を挟むことで、PCからのCAN送信コマンドへの
 // 応答性と、CAN通信が止まったままにならないことを確保する (数msの粒度)
@@ -221,9 +252,8 @@ static void Delay_WithCANPoll(uint32_t ms)
         CANUDPBridge_Poll();
         CANBus_Poll();
         HLControlUDP_Poll();
-        // GIM8018(0x04/0x05) の目標位置を高頻度(内部で ~250ms 間引き)で再送する。
-        // メインループの周期(Delay_WithCANPoll(1500))は遅すぎて、AutoRetransmission=DISABLE
-        // で落ちたフレームの取り戻しがラウンドロビン(約6秒)頼みになってしまうため。
+        GIM_StartupTick();               // 起動時ホーミングを ~100ms ごとに進める
+        // GIM8018(0x04/0x05) の目標位置を「配達確認つき」で再送する (到達したら止める)。
         HLControlUDP_PeriodicResend();
         HAL_Delay(5);
     }
@@ -231,13 +261,15 @@ static void Delay_WithCANPoll(uint32_t ms)
 
 // GIM(6010 x2 / 8018 x2) の起動時 bring-up。HLControlUDP_Init() の後に1回だけ呼ぶ。
 //  1) 電源電圧が安定するまで待つ(起動から HLCONTROL_MOTOR_CAN_START_MS)。
-//  2) GIM への連続送信の間に HAL_Delay(5) を挟みながら、Set_Controller_Mode +
-//     Set_Axis_State(=EnterPositionControl) を全4軸へ 5 回ぶん送る。
-//     AutoRetransmission=DISABLE で ODrive 起動直後は ACK が返らずフレームが落ちる
-//     ため、間隔を空けて複数回投げて確実性を上げる。
-//     ★位置指令(Set_Input_Pos)はここでは送らない。最初の Set_Input_Pos はユーザーが
-//       0x04/0x05 を送った瞬間から。それまでモーターは現在位置をその場で保持する。
-// 以後の維持・復帰はメインループのラウンドロビン(1周1軸)が担当する。
+//  2) GIM6010 x2 を EnterPositionControlHold で数回叩いてクローズドループへ。
+//  3) GIM8108 x2 の起動時ホーミング状態機械を「軽く」キック(~0.5s)して、すぐ抜ける。
+//     ★以前はここで両軸の homing 確定まで最大 ~10s ブロックしていた。node5 がフォールト
+//       (0x40)して arm できないと CL_TIMEOUT まで待ってしまい、その間 while(1) に到達
+//       できず「電源投入後 10 秒くらい ID5 が全く反応しない」症状の原因だった。
+//     ★現在は非ブロッキング: 状態機械の続きは Delay_WithCANPoll 内の GIM_StartupTick()
+//       が ~100ms ごとに進め、確定した軸から順に操作可能になる。
+// 以後の維持・復帰・homing 送信はメインループ(GIM_StartupTick / PeriodicResend / ラウンド
+// ロビン)が担当する。
 static void GIM_StartupBringUp(void)
 {
     uint32_t now = HAL_GetTick();
@@ -245,44 +277,15 @@ static void GIM_StartupBringUp(void)
         Delay_WithCANPoll(HLCONTROL_MOTOR_CAN_START_MS - now);
     }
 
-    // GIM6010-8 (0x06/0x07): 従来どおり EnterPositionControlHold(現在位置を目標化してから
-    // クローズドループへ)を数回送る。位置指令(Set_Input_Pos)はユーザーが 0x04 を送るまで無し。
+    // GIM6010-8 (0x06/0x07)
     for (int i = 0; i < 5; ++i) {
         GIM6010_EnterPositionControlHold(&gim6010_a);  HAL_Delay(5);
         GIM6010_EnterPositionControlHold(&gim6010_b);  HAL_Delay(5);
     }
 
-    // --- GIM8108-8 (node 0x04 / 0x05) 起動時ホーミング ---
-    // ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2 / §5。
-    // CAN では IDLE 中の pos_estimate を読めない個体があり(Get_Encoder_Estimates が 0/古い)、
-    // その値で homing 目標を決めると誤り(実測: ID5 原点=0、ID4 が投入後に ~1回転して戻る)。
-    // → set_linear_count は使わず、先に CLOSED_LOOP へ入れ(§5.1: 遷移時にファームが
-    //   pos_setpoint=pos_estimate を自動初期化するので飛び出さない)、整定後の実測値から
-    //   最寄りグリッド点 home_target = 初期角度 + round(pos_estimate - 初期角度) を決めて
-    //   そこへ homing する(移動量は必ず出力軸 ±22.5° 以内。integer turn 部は保持:
-    //   現在 3.4・初期角度 0.2 → home_target=3.2)。GIM6010(0x06/0x07)には適用しない。
-    // phase 0(投入)→1(CLOSED_LOOP確認)→2(整定・目標確定) を最大 ~5 秒ポーリング。
-    for (int i = 0; i < 400; ++i) {
-        HAL_StatusTypeDef nc = GIM8018_NormalizeMultiturnStartup(&gim8018_c, GIM8018_C_INITIAL_NATIVE_TURNS);
-        HAL_StatusTypeDef nd = GIM8018_NormalizeMultiturnStartup(&gim8018_d, GIM8018_D_INITIAL_NATIVE_TURNS);
-        if ((nc == HAL_OK) && (nd == HAL_OK)) {
-            break;  // 両軸とも確定 (homing 目標 or フォールバック)。
-        }
-        Delay_WithCANPoll(10);
-    }
-    if (GIM8018_IsStartupNormalized(&gim8018_c)) {
-        HLControlUDP_SetGim8018Origin(0U, GIM8018_GetStartupOriginNative(&gim8018_c),
-                                      GIM8018_StartupNormalizedToGrid(&gim8018_c));
-    }
-    if (GIM8018_IsStartupNormalized(&gim8018_d)) {
-        HLControlUDP_SetGim8018Origin(1U, GIM8018_GetStartupOriginNative(&gim8018_d),
-                                      GIM8018_StartupNormalizedToGrid(&gim8018_d));
-    }
-
-    // grid homing: SetGim8018Origin(home=1) が pending を立てたので、この待ち時間の間に
-    // Delay_WithCANPoll → HLControlUDP_PeriodicResend() が home_target を ~200ms 間隔で
-    // 撒いて到達させる(到達 or 4s で自動停止)。POS_FILTER で緩やかに動く。
-    Delay_WithCANPoll(1500);
+    // GIM8108-8 (0x04/0x05): 状態機械のキックは Delay_WithCANPoll 内の GIM_StartupTick に
+    // 任せる。ここでは ~0.5s だけ回して phase 0 を送り出し、完了は待たずに while(1) へ抜ける。
+    Delay_WithCANPoll(500);
 }
 /* USER CODE END 0 */
 
@@ -457,11 +460,25 @@ int main(void)
         // (CANBus_GetTxQueueFailures()参照)。増え続けているなら、どこかのノード宛の
         // 送信が詰まって他ノードの送信も巻き添えで失敗している可能性が高い。
         {
-            char hb_msg[80];
-            int hb_len = snprintf(hb_msg, sizeof(hb_msg), "HB seq=%lu tick=%lu canBusOff=%lu txQFail=%lu\r\n",
+            char hb_msg[128];
+            // FDCAN エラーカウンタ / プロトコル状態。
+            //   TEC/REC  : 送信/受信エラーカウンタ (0付近=健全, 増減する=エラー発生中,
+            //              128以上=error-passive)
+            //   LEC      : Last Error Code (0=NoError, 1=Stuff, 2=Form, 3=Ack, 4=Bit1,
+            //              5=Bit0, 6=CRC, 7=NoChange)。Ack(3) だらけ=誰もACKしていない、
+            //              Bit/Form/Stuff/CRC=信号品質。
+            FDCAN_ErrorCountersTypeDef ec = {0};
+            FDCAN_ProtocolStatusTypeDef ps = {0};
+            (void)HAL_FDCAN_GetErrorCounters(&hfdcan1, &ec);
+            (void)HAL_FDCAN_GetProtocolStatus(&hfdcan1, &ps);
+            int hb_len = snprintf(hb_msg, sizeof(hb_msg),
+                                   "HB seq=%lu tick=%lu canBusOff=%lu txQFail=%lu TEC=%lu REC=%lu LEC=%lu passive=%lu warn=%lu\r\n",
                                    (unsigned long)hb_seq++, (unsigned long)HAL_GetTick(),
                                    (unsigned long)CANBus_GetBusOffRecoveries(),
-                                   (unsigned long)CANBus_GetTxQueueFailures());
+                                   (unsigned long)CANBus_GetTxQueueFailures(),
+                                   (unsigned long)ec.TxErrorCnt, (unsigned long)ec.RxErrorCnt,
+                                   (unsigned long)ps.LastErrorCode,
+                                   (unsigned long)ps.ErrorPassive, (unsigned long)ps.Warning);
             if (hb_len > 0) {
                 sendto(HEARTBEAT_SN, (uint8_t*)hb_msg, (uint16_t)hb_len, hb_broadcast_ip, HEARTBEAT_PORT);
             }
@@ -478,19 +495,24 @@ int main(void)
         //       err=0 かつ ph=1 のままなら投入コマンドが node5 に届いていない (配線/終端/node_id)。
         //     ★st=8,nrm=1,grid=0 → フォールバック (整定後もエンコーダフレーム無し等)。
         {
-            char gm[160];
+            char gm[200];
             uint32_t now = HAL_GetTick();
-            long c_age = gim8018_c.odrv.last_encoder_tick ? (long)(now - gim8018_c.odrv.last_encoder_tick) : -1;
-            long d_age = gim8018_d.odrv.last_encoder_tick ? (long)(now - gim8018_d.odrv.last_encoder_tick) : -1;
+            long c_ea = gim8018_c.odrv.last_encoder_tick ? (long)(now - gim8018_c.odrv.last_encoder_tick) : -1;
+            long d_ea = gim8018_d.odrv.last_encoder_tick ? (long)(now - gim8018_d.odrv.last_encoder_tick) : -1;
+            long c_ha = gim8018_c.odrv.last_heartbeat_tick ? (long)(now - gim8018_c.odrv.last_heartbeat_tick) : -1;
+            long d_ha = gim8018_d.odrv.last_heartbeat_tick ? (long)(now - gim8018_d.odrv.last_heartbeat_tick) : -1;
+            // hbAge/encAge = 直近 heartbeat / Get_Encoder_Estimates 受信からの経過[ms] (-1=未受信)。
+            // ★node4 を足した瞬間に node5 の hbAge/encAge が大きく (数百ms〜) 跳ねるなら、
+            //   node5 の受信が node4 の存在で邪魔されている (RX FIFO 溢れ / フィルタ / node_id)。
             int gl = snprintf(gm, sizeof(gm),
-                              "GIM c:st=%u,nrm=%u,grid=%u,ph=%u,err=%lu,encAge=%ld "
-                              "d:st=%u,nrm=%u,grid=%u,ph=%u,err=%lu,encAge=%ld\r\n",
+                              "GIM c:st=%u,nrm=%u,grid=%u,ph=%u,err=%lu,hbAge=%ld,encAge=%ld "
+                              "d:st=%u,nrm=%u,grid=%u,ph=%u,err=%lu,hbAge=%ld,encAge=%ld\r\n",
                               gim8018_c.odrv.axis_state, GIM8018_IsStartupNormalized(&gim8018_c),
                               GIM8018_StartupNormalizedToGrid(&gim8018_c), GIM8018_GetStartupPhase(&gim8018_c),
-                              (unsigned long)gim8018_c.odrv.axis_error, c_age,
+                              (unsigned long)gim8018_c.odrv.axis_error, c_ha, c_ea,
                               gim8018_d.odrv.axis_state, GIM8018_IsStartupNormalized(&gim8018_d),
                               GIM8018_StartupNormalizedToGrid(&gim8018_d), GIM8018_GetStartupPhase(&gim8018_d),
-                              (unsigned long)gim8018_d.odrv.axis_error, d_age);
+                              (unsigned long)gim8018_d.odrv.axis_error, d_ha, d_ea);
             if (gl > 0) {
                 sendto(HEARTBEAT_SN, (uint8_t*)gm, (uint16_t)gl, hb_broadcast_ip, HEARTBEAT_PORT);
             }
@@ -597,14 +619,16 @@ int main(void)
                     }
                     break;
                 case 2U:
-                    if (GIM8018_IsStartupNormalized(&gim8018_c) &&
+                    if (GIM8018_IsStartupNormalized(&gim8018_c) && gim8018_c.odrv.connected &&
                         (gim8018_c.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL)) {
+                        if (gim8018_c.odrv.axis_error != 0U) { ODriveCAN_ClearErrors(&gim8018_c.odrv); }
                         GIM8018_EnterPositionControlHold(&gim8018_c);
                     }
                     break;
                 default:  /* 3 */
-                    if (GIM8018_IsStartupNormalized(&gim8018_d) &&
+                    if (GIM8018_IsStartupNormalized(&gim8018_d) && gim8018_d.odrv.connected &&
                         (gim8018_d.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL)) {
+                        if (gim8018_d.odrv.axis_error != 0U) { ODriveCAN_ClearErrors(&gim8018_d.odrv); }
                         GIM8018_EnterPositionControlHold(&gim8018_d);
                     }
                     break;
@@ -626,6 +650,7 @@ int main(void)
         // Delay_WithCANPoll()を挟まない一瞬の間も取りこぼさないよう念のため呼ぶ。
         HLControlUDP_Poll();
         HLControlUDP_PeriodicResend();
+        GIM_StartupTick();
 
   }
   /* USER CODE END 3 */
@@ -697,6 +722,17 @@ static void MX_FDCAN1_Init(void)
   // 返して黙って送信キューに入れなくなる(＝一部のノードだけ動かなくなる)。DISABLEなら
   // 1回失敗した時点でそのフレームを諦めてFIFOを空けるので、この詰まりが起きない。
   // 位置制御コマンドはどうせ毎ループ再送しているので、単発のロストがあっても実害は無い。
+  //
+  // ⚠ ビットレート: FDCAN kernel clock = PCLK1 = 48MHz (SystemClock_Config 参照。
+  //   FDCAN clock source は reset default の PCLK1、ClockDivider=DIV1)。
+  //   bit rate = 48MHz / (NominalPrescaler * (1 + Seg1 + Seg2))
+  //            = 48MHz / (NominalPrescaler * 16)     ← Seg1=13, Seg2=2, sample point 87.5%
+  //     Prescaler  3 -> 1 Mbps   ★現在これ
+  //     Prescaler  6 -> 500 kbps
+  //     Prescaler 12 -> 250 kbps
+  //     Prescaler 24 -> 125 kbps
+  //   ★全 CAN ノード (GIM8108 x2, GIM6010 x2, その他) の can.config.baud_rate を
+  //     STM32 と同じ値に合わせること。1つでも違うとバス全体が停止する。
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
@@ -705,7 +741,7 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.AutoRetransmission = DISABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 3;
+  hfdcan1.Init.NominalPrescaler = 3;   /* 48MHz/(3*16) = 1 Mbps (上のコメント参照) */
   hfdcan1.Init.NominalSyncJumpWidth = 1;
   hfdcan1.Init.NominalTimeSeg1 = 13;
   hfdcan1.Init.NominalTimeSeg2 = 2;

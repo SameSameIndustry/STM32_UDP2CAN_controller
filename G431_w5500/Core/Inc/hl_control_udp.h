@@ -39,11 +39,13 @@ extern "C" {
  *     HLControlUDP_Init()に渡す(プログラム側の定数)。
  *   HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG (0x05): payload = float32 LE、角度[deg]。
  *     クランプなし。ネイティブ(モーター軸)turns へ換算: deg/360*GIM8018_GEAR_RATIO_NOMINAL(=8)
- *     = deg/45 (旧コードの ax_target[rad]/M_PI*4 と等価)。これを「偏差」とし、両軸とも
- *       Set_Input_Pos <- GIM8018_C/D_INITIAL_NATIVE_TURNS + 偏差
- *     を送る(C/D 同じ偏差。0x04 と違い符号反転しない)。初期位置は GUI からは設定
- *     できず、main.c の GIM8018_C/D_INITIAL_NATIVE_TURNS を編集して HLControlUDP_Init()
- *     に渡す(プログラム側の定数)。
+ *     = deg/45 (旧コードの ax_target[rad]/M_PI*4 と等価)。これを「偏差」とし、
+ *     ★C(0x04) と D(0x05) は逆向きに回す:
+ *       C: Set_Input_Pos <- (起動時ホーミングで確定した原点 init_c) + 偏差
+ *       D: Set_Input_Pos <- (init_d) - 偏差
+ *     原点 init_c/init_d は起動時に GIM8018_NormalizeMultiturnStartup が
+ *     GIM8018_C/D_INITIAL_NATIVE_TURNS ± 0.5turn 以内の最寄りグリッド点として確定し、
+ *     HLControlUDP_SetGim8018Origin() で渡される。GUI からは設定できない。
  *     ★電源投入後は Set_Input_Pos を一切送らない: 起動時の bring-up・ラウンドロビン
  *       とも「Set_Controller_Mode + Set_Axis_State(CLOSED_LOOP)」だけ行い、位置は
  *       モーターがその場で保持する。最初の Set_Input_Pos はユーザーが 0x04/0x05 を
@@ -89,7 +91,7 @@ extern "C" {
  *   PENDING_TIMEOUT_MS: これを超えたら高頻度再送をやめる (以後はラウンドロビンの保険のみ) */
 #define HLCONTROL_GIM8018_RESEND_MS          200U
 #define HLCONTROL_GIM8018_ARRIVE_TOL_NATIVE  0.05f
-#define HLCONTROL_GIM8018_PENDING_TIMEOUT_MS 4000U
+#define HLCONTROL_GIM8018_PENDING_TIMEOUT_MS 6000U
 
 /* GIM6010/GIM8018ピッチ角目標値のクランプ範囲。wave motorのピッチ角目標値とは別の値
  * (減速比8なので角度指定の実質可動範囲がwave motorと異なるため)。
