@@ -60,8 +60,17 @@ extern "C" {
  * フォールト個体が後から CL を保持できれば位置制御は復活する (grid homing はされないが)。 */
 #define GIM8018_STARTUP_CL_TIMEOUT_MS      4000U
 /* CLOSED_LOOP 投入後、pos_estimate が整定するのを待つ時間[ms] (この間に ODrive が
- * 内部で正しいマルチターン値をロードし、CAN 送信も追いつく)。短いほど早く homing 開始。 */
-#define GIM8018_STARTUP_SETTLE_MS           100U
+ * 内部で正しいマルチターン値をロードし、PLL(bandwidth=500)が収束し、CAN 送信も追いつく)。
+ * ★短くしすぎると、IDLE 中 / マルチターン種リロード中にサンプルされた古い pos_estimate を
+ *   掴んで origin を誤り、homing で数回転巻き戻す (ODRIVE_ABSOLUTE_ANGLE_NOTES.md §5.1)。
+ *   USB 版は set_linear_count 後 150ms 待つ。CAN 版は更に古フレーム対策も要る (下記)。 */
+#define GIM8018_STARTUP_SETTLE_MS           250U
+/* phase 2 で pos_estimate を「整定した」とみなす速度上限 [turn/s] (モーター軸)。
+ * これを超えている間は PLL 未収束 / 突入直後の揺れとみなして待つ。 */
+#define GIM8018_STARTUP_SETTLE_VEL_TURNS_S   0.5f
+/* phase 2 で origin を確定する前に、連続 2 フレームの pos_estimate がこの範囲内で
+ * 一致することを要求する [モーター軸turns]。1 フレームのグリッチで誤セクタを掴まない保険。 */
+#define GIM8018_STARTUP_PE_AGREE_TURNS       0.05f
 /* phase 0/1 で CLOSED_LOOP 投入コマンドを再送する最小間隔[ms]。実際はこれ +0..127ms の
  * ジッタを足す (node4/node5 の周期送信位相ロック対策。gim8018.c phase 1 のコメント参照)。 */
 #define GIM8018_STARTUP_RESEND_MS           300U
@@ -85,6 +94,8 @@ typedef struct {
     uint32_t startup_req_tick;      /* CLOSED_LOOP を最初に要求した HAL_GetTick() (0 = 未要求)。CL_TIMEOUT 判定 */
     uint32_t startup_entry_tick;    /* axis_state==8 を最初に確認した HAL_GetTick() (0 = 未)。SETTLE 判定 */
     uint32_t startup_last_send_tick;/* CLOSED_LOOP 投入コマンドを最後に送った tick。RESEND ペーシング */
+    float    startup_pe_prev;       /* phase 2: 前回採用候補とした pos_estimate (2フレーム一致確認用) */
+    uint32_t startup_pe_prev_tick;  /* startup_pe_prev を取ったエンコーダフレームの tick (0 = 未取得) */
     float    startup_origin_native; /* 確定した原点 [モーター軸turns]。以後の絶対位置指令はこれ基準。
                                      * grid homing 時は center + round(pos_estimate - center)
                                      * (例: 現在 3.4, 初期角度 0.2 → 3.2)。 */

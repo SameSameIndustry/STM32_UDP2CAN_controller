@@ -28,6 +28,8 @@ void GIM8018_Init(GIM8018_t *g, uint8_t node_id)
     g->startup_req_tick         = 0U;
     g->startup_entry_tick       = 0U;
     g->startup_last_send_tick    = 0U;
+    g->startup_pe_prev          = 0.0f;
+    g->startup_pe_prev_tick     = 0U;
     g->startup_origin_native    = 0.0f;
 }
 
@@ -52,20 +54,31 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
     /* ================= phase 2: CLOSED_LOOP 後、実測 pos_estimate を原点に確定 =============== */
     if (g->startup_phase == 2U) {
         float pe;
+        int32_t frame_age_since_entry;
 
-        /* CLOSED_LOOP から外れた (フォールト等) → phase 1 へ戻して入れ直す。 */
+        /* CLOSED_LOOP から外れた (フォールト等) → phase 1 へ戻して入れ直す。
+         * 途中まで貯めた 2フレーム一致確認もリセット (別 arm の古い値を混ぜない)。 */
         if (g->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-            g->startup_phase = 1U;
+            g->startup_phase        = 1U;
+            g->startup_pe_prev_tick = 0U;
             return HAL_BUSY;
         }
-        /* 投入直後は ODrive が内部でマルチターン値をロード中 & CAN 送信が追いつかない。
+        /* 投入直後は ODrive が内部でマルチターン値をロード中 & PLL 未収束 & CAN も追いつかない。
          * 一定時間待つ。 */
         if ((now - g->startup_entry_tick) < GIM8018_STARTUP_SETTLE_MS) {
             return HAL_BUSY;
         }
-        /* CLOSED_LOOP 投入後の新鮮なエンコーダフレームを 1 発待つ (300ms 以内)。
-         * これが来ないまま長く経ったら homing を諦める。 */
-        if ((g->odrv.last_encoder_tick == 0U) || ((now - g->odrv.last_encoder_tick) > 300U)) {
+        /* ★CLOSED_LOOP 投入 *後* に受信したエンコーダフレームだけを使う。
+         * encoder_rate_ms=100 だと、SETTLE だけ待って「最近のフレーム」を拾う方式では、
+         * IDLE 中 / マルチターン種リロード中にサンプルされた古い pos_estimate を掴むことが
+         * ある (ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2 手順4-5 / §5.1)。その古い種から origin を
+         * 計算すると、以後の絶対指令で数回転巻き戻す (= 「初期位置に戻るとき一旦明後日の
+         * 角度へ行ってから戻る」症状)。フレーム受信 tick が entry_tick + SETTLE より後で
+         * あることを必須にする。 */
+        frame_age_since_entry = (int32_t)(g->odrv.last_encoder_tick - g->startup_entry_tick);
+        if ((g->odrv.last_encoder_tick == 0U) ||
+            (frame_age_since_entry < (int32_t)GIM8018_STARTUP_SETTLE_MS) ||
+            ((now - g->odrv.last_encoder_tick) > 300U)) {
             if ((now - g->startup_entry_tick) > (GIM8018_STARTUP_SETTLE_MS + 3000U)) {
                 g->startup_origin_native = g->odrv.pos_estimate;  /* best effort */
                 g->startup_to_grid       = 0U;
@@ -73,6 +86,44 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
                 return HAL_OK;
             }
             return HAL_BUSY;
+        }
+
+        /* まだ回っている間は掴まない (PLL 収束前 / 突入直後の揺れ)。
+         * ただし整定しないまま長く経ったら (外乱・振動) その時点の値で確定する。 */
+        if (((g->odrv.vel_estimate > GIM8018_STARTUP_SETTLE_VEL_TURNS_S) ||
+             (g->odrv.vel_estimate < -GIM8018_STARTUP_SETTLE_VEL_TURNS_S)) &&
+            ((now - g->startup_entry_tick) < (GIM8018_STARTUP_SETTLE_MS + 3000U))) {
+            return HAL_BUSY;
+        }
+
+        /* 1 フレームのグリッチで誤ったセクタ (integer turn) を掴まないよう、投入後の
+         * 別々のエンコーダフレーム 2 発が GIM8018_STARTUP_PE_AGREE_TURNS 以内で一致する
+         * ことを確認してから確定する。 */
+        pe = g->odrv.pos_estimate;
+        {
+            /* SETTLE + 3000ms 経ってもまだ確認できないなら、その時点の値で確定する
+             * (待ち続けるより良い。フォールバック扱いではなく grid には揃える)。 */
+            uint8_t give_up = ((now - g->startup_entry_tick) > (GIM8018_STARTUP_SETTLE_MS + 3000U)) ? 1U : 0U;
+
+            if (!give_up && (g->startup_pe_prev_tick == 0U)) {
+                g->startup_pe_prev      = pe;
+                g->startup_pe_prev_tick = g->odrv.last_encoder_tick;
+                return HAL_BUSY;
+            }
+            if (!give_up && (g->odrv.last_encoder_tick == g->startup_pe_prev_tick)) {
+                return HAL_BUSY;   /* まだ同じフレーム。次の新フレームを待つ */
+            }
+            if (!give_up) {
+                float d = pe - g->startup_pe_prev;
+                if (d < 0.0f) {
+                    d = -d;
+                }
+                g->startup_pe_prev      = pe;
+                g->startup_pe_prev_tick = g->odrv.last_encoder_tick;
+                if (d > GIM8018_STARTUP_PE_AGREE_TURNS) {
+                    return HAL_BUSY;   /* まだ揺れている。次フレームで再確認 */
+                }
+            }
         }
 
         /* CLOSED_LOOP 投入後の実測 pos_estimate から「原点(= 絶対0度)」を確定する。
@@ -83,8 +134,8 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
          * (最初の 0x05 で origin+偏差 へ動く。0x05 前は電源投入位置を保持)。
          *
          * ※ どの integer turn (どの 45° 出力セクタ) になるかは起動時の種依存で非決定的
-         * (§3.2 の ±22.5° 曖昧性)。真のセクタ確定にはホスト側の不揮発保存が要る。 */
-        pe = g->odrv.pos_estimate;
+         * (§3.2 の ±22.5° 曖昧性)。真のセクタ確定にはホスト側の不揮発保存が要る。
+         * pe は上で「投入後 2 フレーム一致」を確認済みの値をそのまま使う (再読み取りしない)。 */
         {
             float dd = pe - center_native;
             int32_t k = (int32_t)((dd >= 0.0f) ? (dd + 0.5f) : (dd - 0.5f));
@@ -107,8 +158,9 @@ HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_n
     /* ================= phase 1: axis_state==CLOSED_LOOP を待つ ============================= */
     if (g->startup_phase == 1U) {
         if (g->odrv.axis_state == ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-            g->startup_entry_tick = gim8018_tick_nonzero();
-            g->startup_phase      = 2U;
+            g->startup_entry_tick   = gim8018_tick_nonzero();
+            g->startup_pe_prev_tick = 0U;   /* この arm の投入後フレームだけで一致確認する */
+            g->startup_phase        = 2U;
             return HAL_BUSY;
         }
         /* CLOSED_LOOP に入れないまま CL_TIMEOUT → homing を諦め、現在値を原点に。

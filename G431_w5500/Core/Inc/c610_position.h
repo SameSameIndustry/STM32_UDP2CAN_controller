@@ -3,7 +3,19 @@
 
 #include "stm32g4xx_hal.h"
 #include "c610_current.h"
-#include "as5600.h"
+
+/* 角度センサ 1 サンプルぶんの読み取り結果。以前は as5600.h が提供していたが、
+ * AS5600 ドライバをこの基板から削除したため、C610 位置制御が必要とする型だけを
+ * ここに残す (C610Position_Update の引数型)。別センサに差し替える場合もこの構造体を
+ * 埋めて渡せばよい。raw_angle は 0..4095 (12bit)、ok=1 で有効サンプル。 */
+typedef struct {
+    uint16_t raw_angle;   /* 0..4095 (12bit 機械角) */
+    uint16_t angle;       /* 0..4095 (フィルタ後、未使用可) */
+    uint16_t magnitude;   /* 0..4095 (未使用可) */
+    uint8_t  status;      /* センサ状態レジスタ (未使用可) */
+    uint8_t  agc;         /* 自動ゲイン (未使用可) */
+    uint8_t  ok;          /* 1 = 有効サンプル */
+} AS5600_Reading_t;
 
 #ifdef __cplusplus
 extern "C" {

@@ -37,7 +37,6 @@
 #include "gim6010.h"
 #include "gim8018.h"
 #include "hl_control_udp.h"
-#include "as5600.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -71,7 +70,17 @@
 
 #define C610_ESC_ID  1U   // C610本体のダイヤル/DIPスイッチで設定したID (1-8)
 
-// C610 位置制御 (AS5600フィードバック) の2つの基準角 [deg]。GUIからは設定せず、
+// ★DJI C610 (電流/位置制御) をこの基板で動かすか。GIM8018 (0x04/0x05) のデバッグ中は
+//   0 にして無効化する: C610Current_Tick() は ~5ms ごとに CAN(0x1FF/0x200 系)へ送信し、
+//   ESC 未接続だと ACK が返らず STM32 TxFIFO/バス調停を圧迫する。
+//   ★AS5600 ドライバはこの基板から完全に削除済み (as5600.c/.h も削除)。よって C610 を
+//     1 に戻しても「カスケード位置制御 (0x07)」は動かない (角度フィードバック源が無い)。
+//     手動電流モード (0x06) と C610Current_Tick の途絶ウォッチドッグだけが有効になる。
+//     位置制御を復活させるには as5600 ドライバを戻し、AS5600_StreamTick 相当で
+//     C610Position_Update() を周期呼び出しすること。
+#define ENDEFFECTOR_C610_ENABLED 0
+
+// C610 位置制御 の2つの基準角 [deg]。GUIからは設定せず、
 // ここを編集して書き込むことで決める (GIM6010_*_INITIAL_NATIVE_TURNS と同じ流儀)。
 //   C610_ZERO_OFFSET_DEG: AS5600 RAW角度[deg](= raw*360/4096) のうち meas_deg=0 とみなす値。
 //                         センサ取り付けのキャリブレーション用 (通常 0 でよい)。
@@ -128,13 +137,8 @@
 #define HLCONTROL_SN    3U
 #define HLCONTROL_PORT  5003U
 
-// AS5600 磁気エンコーダの角度をUDPで垂れ流す専用ソケット・ポート。
-// ハートビート(SN2)と同じくブロードキャスト(255.255.255.255)で送るので、
-// PC側はポート5004をbindするだけでよい (STM32のIPを知らなくても受かる)。
-// Pythonツール: tools/as5600_monitor/as5600_monitor.py
-#define AS5600_SN       4U
-#define AS5600_PORT     5004U
-#define AS5600_PERIOD_MS 50U   // 送信周期 (約20Hz)
+// (AS5600 磁気エンコーダのドライバとその UDP ストリーム(ソケット4/ポート5004)は
+//  この基板から削除済み。ソケット4は空き。)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -267,82 +271,9 @@ static void GIM_StartupTick(void)
     }
 }
 
-// AS5600 磁気エンコーダを AS5600_PERIOD_MS ごとに読み、角度をUDP(ポート5004)へ
-// ブロードキャストする。ハートビート等と同じく ASCII 1行テキスト。
-//   AS5600 seq=.. tick=.. ok=1 raw=2048 mdeg=180000 angle=2047 status=0x20 agc=128 mag=1234
-//     seq    : 連番
-//     tick   : STM32側 HAL_GetTick() [ms]
-//     ok     : 1 = I2C応答あり かつ 磁石検出(STATUS.MD=1)
-//     raw    : RAW_ANGLE レジスタ 0..4095 (未加工の機械角)
-//     mdeg   : raw を 0.001度単位に換算した整数 (= raw*360000/4096)。
-//              ★nano.specs + 浮動小数printf無効のため firmware では %f を使わず整数で送る。
-//     angle  : ANGLE レジスタ 0..4095 (ZPOS/MPOS/ヒステリシス適用後)
-//     status : STATUS レジスタ (bit5 MH=磁石強すぎ / bit4 ML=磁石弱すぎ / bit3 MD=検出)
-//     agc    : AGC レジスタ (3.3V動作で 0..255、中央付近が理想)
-//     mag    : MAGNITUDE レジスタ 0..4095
-// 角度[deg] への換算は受信側(Python)で raw*360/4096 で行う。
-static void AS5600_StreamTick(void)
-{
-    static uint32_t s_last = 0U;
-    static uint32_t s_seq  = 0U;
-    static uint8_t  s_sock_opened = 0U;
-    static uint16_t s_fail_run = 0U;   // 連続で ok=0 だった回数
-
-    uint32_t now = HAL_GetTick();
-    if ((now - s_last) < AS5600_PERIOD_MS) {
-        return;
-    }
-    s_last = now;
-
-    if (!s_sock_opened || (getSn_SR(AS5600_SN) == SOCK_CLOSED)) {
-        socket(AS5600_SN, Sn_MR_UDP, AS5600_PORT, 0);
-        s_sock_opened = 1U;
-    }
-
-    AS5600_Reading_t r;
-    HAL_StatusTypeDef st = AS5600_ReadAll(&r);
-
-    // AS5600_ReadAll() は失敗時に内部で1回リトライ+バス回復するが、それでも読めない
-    // 状態が続く場合 (電源投入時のモーター突入で I2C バスが wedge したまま等) は、
-    // GPIO 再設定を含む強めの回復を約1秒ごとに試みる。
-    if ((st == HAL_OK) && r.ok) {
-        s_fail_run = 0U;
-    } else if (s_fail_run < 0xFFFFU) {
-        s_fail_run++;
-        if ((s_fail_run % 20U) == 0U) {   // 20 サンプル ≒ 1秒
-            AS5600_Recover();
-        }
-    }
-
-    uint32_t mdeg = ((uint32_t)r.raw_angle * 360000U) / 4096U;
-
-    // AS5600 の生サンプルを C610 位置制御コントローラへ渡す (I2C の二重読み回避)。
-    // ok==0 のサンプルは Update 内で無視される。
-    C610Position_Update(&c610_pos, &r, now);
-
-    // C610 カスケード位置制御のテレメトリ
-    // (nano.specs で %f 不可のため全て整数: mdeg=1/1000度, mdps=1/1000度/秒, ma=1/1000A)
-    char msg[320];
-    int len = snprintf(msg, sizeof(msg),
-                       "AS5600 seq=%lu tick=%lu ok=%d raw=%u mdeg=%lu angle=%u status=0x%02X agc=%u mag=%u "
-                       "c610_en=%d c610_act=%d c610_org_mdeg=%ld c610_off_mdeg=%ld c610_tgt_mdeg=%ld "
-                       "c610_meas_mdeg=%ld c610_err_mdeg=%ld "
-                       "c610_vsp_mdps=%ld c610_vel_mdps=%ld c610_i_ma=%ld\r\n",
-                       (unsigned long)s_seq++, (unsigned long)now,
-                       (int)((st == HAL_OK) && r.ok),
-                       (unsigned)r.raw_angle, (unsigned long)mdeg, (unsigned)r.angle,
-                       (unsigned)r.status, (unsigned)r.agc, (unsigned)r.magnitude,
-                       (int)c610_pos.enabled, (int)C610Current_IsActive(&c610_current),
-                       (long)(c610_pos.origin_deg * 1000.0f), (long)(c610_pos.input_offset_deg * 1000.0f),
-                       (long)(c610_pos.target_deg * 1000.0f), (long)(c610_pos.meas_deg * 1000.0f),
-                       (long)(c610_pos.error_deg * 1000.0f),
-                       (long)(c610_pos.vel_setpoint_dps * 1000.0f), (long)(c610_pos.meas_vel_dps * 1000.0f),
-                       (long)(c610_pos.out_a * 1000.0f));
-    if (len > 0) {
-        uint8_t bcast[4] = {255, 255, 255, 255};
-        sendto(AS5600_SN, (uint8_t*)msg, (uint16_t)len, bcast, AS5600_PORT);
-    }
-}
+// (AS5600 磁気エンコーダのドライバと UDP ストリーム(AS5600_StreamTick)はこの基板から
+//  削除した。ソフトI2C の読み取り失敗リカバリがメインループを止めて GIM8018 の CAN
+//  タイミングを乱すため。C610 カスケード位置制御もこれに依存していたので同時に停止。)
 
 // HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングと
 // CANBus_Poll()(Bus-Off検出・自動復帰)を挟むことで、PCからのCAN送信コマンドへの
@@ -358,10 +289,11 @@ static void Delay_WithCANPoll(uint32_t ms)
         HLControlUDP_Gim6010StartupHomeTick();  // GIM6010(0x06/0x07) を 0度へ homing (確定後は即 return)
         // GIM8018(0x04/0x05) の目標位置を「配達確認つき」で再送する (到達したら止める)。
         HLControlUDP_PeriodicResend();
-        AS5600_StreamTick();             // AS5600 読み取り + C610 位置制御 Update + UDP(5004) 送信
-        C610Position_Failsafe(&c610_pos, HAL_GetTick()); // AS5600 サンプル停止時は電流を0に
+#if ENDEFFECTOR_C610_ENABLED
+        C610Position_Failsafe(&c610_pos, HAL_GetTick()); // 位置制御停止中は電流を0に
         C610Current_Tick(&c610_current); // DJI C610(0x01) 電流指令の送出 (起動後2秒間は無送信)。
                                          // C610はコマンド途絶で停止するため ~5ms 間隔で送り続ける
+#endif
         HAL_Delay(5);
     }
 }
@@ -505,6 +437,7 @@ int main(void)
   // CANバスの起動 (フィルタ設定 + HAL_FDCAN_Start + Rx割り込み有効化)
   CANBus_Init(&hfdcan1);
 
+#if ENDEFFECTOR_C610_ENABLED
   // DJI C610 (M2006用ESC) 電流制御ブロックの初期化。対象は CAN ID 0x01 (ESC ID 1)。
   // C610_CURRENT_Init() は内部で DJIC610_Init() も呼ぶ。ここでは CAN 送信しない。
   // ★C610ドライバは電源投入から起動完了まで時間がかかるため、C610Current_Tick() は
@@ -512,12 +445,10 @@ int main(void)
   C610Current_Init(&c610_current);
   C610Current_SetCurrentA(&c610_current, 0.0f);   // 初期目標電流 0A (必要に応じて更新する)
 
-  // AS5600 の角度をフィードバックにした C610 のカスケード位置制御 (位置P→速度PI→電流)。
-  // ★起動直後は無効 (電流0でフリー)。アプリが最初に高レベル制御UDP(0x07)を送った時点で
-  //   初めて制御開始 (自動で原点へは戻らない)。基準角(ZERO_OFFSET/ORIGIN)とゲイン
-  //   (c610_position.h)はコンパイル時定数。0x07 では「原点からの差分角」のみ設定する。
-  // 実際の AS5600 読み取りは AS5600_StreamTick() 内で行い、そこから C610Position_Update() を呼ぶ。
+  // C610 位置制御ブロック (手動電流モード 0x06 のための構造体初期化)。
+  // ★AS5600 を削除したため角度フィードバックが無く、カスケード位置制御 (0x07) は動かない。
   C610Position_Init(&c610_pos, &c610_current, C610_ZERO_OFFSET_DEG, C610_POS_ORIGIN_DEG);
+#endif
 
   // GIM8018-8の初期化。本命としてODrive CAN Simpleプロトコルで扱う。
   ODriveCAN_Init(&gim_axis, GIM_NODE_ID, GIM_GEAR_RATIO);
@@ -555,19 +486,17 @@ int main(void)
                      &gim8018_c, &gim8018_d,
                      GIM8018_C_INITIAL_NATIVE_TURNS, GIM8018_D_INITIAL_NATIVE_TURNS);
 
+#if ENDEFFECTOR_C610_ENABLED
   // Python GUI から C610(0x01) の目標電流[A]を受け取れるようにする
   // (HLCONTROL_CMD_SET_C610_CURRENT_A = 0x06)。目標値の記憶のみで、実送信は
   // C610Current_Tick() が担当 (起動後2秒間は無送信)。
   HLControlUDP_SetC610(&c610_current, &c610_pos);
+#endif
 
   // 電源電圧安定待ち(起動から HLCONTROL_MOTOR_CAN_START_MS=1秒)後、昔のコードと
   // 同じく GIM への連続送信の間に HAL_Delay(5) を挟みながら、クローズドループ投入を
   // 5回ぶん・基準位置の Set_Input_Pos を2回ぶん送る。フレームロスト対策。
   GIM_StartupBringUp();
-
-  // AS5600 磁気エンコーダ (ソフトウェアI2C: SCL=PA15, SDA=PB7)。
-  // 角度は AS5600_StreamTick() が UDPポート5004へ周期送信する。
-  AS5600_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -779,13 +708,12 @@ int main(void)
         HLControlUDP_PeriodicResend();
         GIM_StartupTick();
         HLControlUDP_Gim6010StartupHomeTick();
-        AS5600_StreamTick();   // AS5600 読み取り + C610 位置制御 Update + UDP(5004) 送信
-
+#if ENDEFFECTOR_C610_ENABLED
         // DJI C610 (CAN ID 0x01) の電流指令を送る。起動から2秒間はこの関数が
-        // 何もせず即 return する (C610ドライバの起動待ち)。電流値は位置制御
-        // コントローラ(C610Position_Update)または手動コマンド(0x06)が設定する。
+        // 何もせず即 return する (C610ドライバの起動待ち)。電流値は手動コマンド(0x06)が設定する。
         C610Position_Failsafe(&c610_pos, HAL_GetTick());
         C610Current_Tick(&c610_current);
+#endif
 
   }
   /* USER CODE END 3 */
