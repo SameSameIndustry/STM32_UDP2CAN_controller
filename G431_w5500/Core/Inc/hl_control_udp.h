@@ -80,8 +80,10 @@ extern "C" {
 /* 電源投入直後は電源電圧が安定しないため、GIM(6010/8018)への CAN 送信
  * (Set_Controller_Mode / Set_Axis_State / Set_Input_Pos = モード設定・クローズドループ
  *  移行・目標値)は、STM32 起動(HAL_GetTick()=0)からこの時間[ms]が経過するまで
- * 一切行わない。起動時 bring-up も周期再送も 0x04/0x05 ハンドラの送信もすべて対象。 */
-#define HLCONTROL_MOTOR_CAN_START_MS 1000U
+ * 一切行わない。起動時 bring-up も周期再送も 0x04/0x05 ハンドラの送信もすべて対象。
+ * (GIM_StartupTick / GIM6010_StartupClTick / GIM_StartupBringUp / while(1) ラウンドロビン
+ *  も同じ定数でゲートしている。) */
+#define HLCONTROL_MOTOR_CAN_START_MS 2000U
 
 /* GIM8018 (0x04/0x05) の「配達確認つき」再送 (HLControlUDP_PeriodicResend)。
  * 目標が変わった時だけ、到達 or タイムアウトするまで RESEND_MS 間隔で Set_Input_Pos を

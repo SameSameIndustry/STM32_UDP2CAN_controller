@@ -233,6 +233,59 @@ static void GIM_StartupTick(void)
     }
 }
 
+// GIM6010 (0x06/0x07) の起動時 CLOSED_LOOP 投入を「速く・確実に」進める。
+//   問題: while(1) のラウンドロビン (switch) は各軸 ~6s に1回しか投入コマンドを叩けない。
+//   FDCAN は AutoRetransmission=DISABLE なので、混雑したバスでは STM32 の
+//   Set_Axis_State(CLOSED_LOOP) (node6=0x0C7 / node7=0x0E7、ほぼ最低優先度) が調停負けで
+//   黙って捨てられ続け、CL に入るまで ~1分かかる。その間モーターは IDLE = 無トルクでフリー。
+//   (ODrive 側は auto_retransmission=ON なので、逆向きの encoder テレメトリは遅れても届く
+//    → GUI では角度が読めるのにトルクがかからない、という非対称な症状になる。)
+//   対策: Delay_WithCANPoll から呼び、両軸が heartbeat で CLOSED_LOOP 確認できるまで
+//   GIM6010_STARTUP_CL_RETRY_MS 間隔で EnterPositionControlHold を撒く。確認 or
+//   GIM6010_STARTUP_CL_GIVEUP_MS 経過で s_done=1 → 以後は即 return (維持はラウンドロビン)。
+#define GIM6010_STARTUP_CL_RETRY_MS   400U     // 投入リトライ間隔
+#define GIM6010_STARTUP_CL_GIVEUP_MS  20000U   // これ以降はブロッキング投入を止めラウンドロビン任せ
+static void GIM6010_StartupClTick(void)
+{
+    static uint8_t  s_done = 0U;
+    static uint32_t s_last = 0U;
+    uint32_t now;
+    uint8_t a_cl, b_cl;
+
+    if (s_done) {
+        return;
+    }
+    now = HAL_GetTick();
+    if (now < HLCONTROL_MOTOR_CAN_START_MS) {
+        return;
+    }
+
+    a_cl = GIM6010_IsClosedLoop(&gim6010_a);
+    b_cl = GIM6010_IsClosedLoop(&gim6010_b);
+    if (a_cl && b_cl) {
+        s_done = 1U;   // 両軸 CL。以後はラウンドロビンが「外れたら入れ直す」を担当
+        return;
+    }
+    if (now > (HLCONTROL_MOTOR_CAN_START_MS + GIM6010_STARTUP_CL_GIVEUP_MS)) {
+        s_done = 1U;   // ここまで入らなければバスが本当に壊れている。以後はラウンドロビンに委ねる
+        return;
+    }
+    if ((now - s_last) < GIM6010_STARTUP_CL_RETRY_MS) {
+        return;
+    }
+    s_last = now;
+
+    // CL でない軸だけ叩く。axis_error が latch されていると CLOSED_LOOP を拒否されるので先にクリア。
+    if (!a_cl && gim6010_a.odrv.connected) {
+        if (gim6010_a.odrv.axis_error != 0U) { (void)ODriveCAN_ClearErrors(&gim6010_a.odrv); }
+        GIM6010_EnterPositionControlHold(&gim6010_a);
+    }
+    if (!b_cl && gim6010_b.odrv.connected) {
+        if (gim6010_b.odrv.axis_error != 0U) { (void)ODriveCAN_ClearErrors(&gim6010_b.odrv); }
+        GIM6010_EnterPositionControlHold(&gim6010_b);
+    }
+}
+
 // HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングと
 // CANBus_Poll()(Bus-Off検出・自動復帰)を挟むことで、PCからのCAN送信コマンドへの
 // 応答性と、CAN通信が止まったままにならないことを確保する (数msの粒度)
@@ -243,7 +296,8 @@ static void Delay_WithCANPoll(uint32_t ms)
         CANUDPBridge_Poll();
         CANBus_Poll();
         HLControlUDP_Poll();
-        GIM_StartupTick();               // 起動時ホーミングを ~100ms ごとに進める
+        GIM_StartupTick();               // GIM8018(0x04/0x05) 起動時ホーミングを ~100ms ごとに進める
+        GIM6010_StartupClTick();         // GIM6010(0x06/0x07) を起動時に確実に CLOSED_LOOP へ (確認後は即 return)
         // GIM8018(0x04/0x05) の目標位置を「配達確認つき」で再送する (到達したら止める)。
         HLControlUDP_PeriodicResend();
         HAL_Delay(5);
@@ -268,15 +322,16 @@ static void GIM_StartupBringUp(void)
         Delay_WithCANPoll(HLCONTROL_MOTOR_CAN_START_MS - now);
     }
 
-    // GIM6010-8 (0x06/0x07)
-    for (int i = 0; i < 5; ++i) {
-        GIM6010_EnterPositionControlHold(&gim6010_a);  HAL_Delay(5);
-        GIM6010_EnterPositionControlHold(&gim6010_b);  HAL_Delay(5);
-    }
+    // GIM6010-8 (0x06/0x07): CLOSED_LOOP 投入は Delay_WithCANPoll 内の GIM6010_StartupClTick()
+    //   が「両軸 CL 確認まで ~400ms ごとにリトライ」で担当する (以前の 5 連投ブラインドは
+    //   混雑バスで全滅して ~1分無トルクの原因だった)。ここでは一発キックだけ。
+    GIM6010_EnterPositionControlHold(&gim6010_a);  HAL_Delay(5);
+    GIM6010_EnterPositionControlHold(&gim6010_b);  HAL_Delay(5);
 
     // GIM8108-8 (0x04/0x05): 状態機械のキックは Delay_WithCANPoll 内の GIM_StartupTick に
-    // 任せる。ここでは ~0.5s だけ回して phase 0 を送り出し、完了は待たずに while(1) へ抜ける。
-    Delay_WithCANPoll(500);
+    // 任せる。ここでは ~1s 回して phase 0 の送出 + GIM6010 の CL 投入リトライを進めてから
+    // while(1) へ抜ける (完了は待たない)。
+    Delay_WithCANPoll(1000);
 }
 /* USER CODE END 0 */
 
@@ -423,9 +478,8 @@ int main(void)
                      &gim8018_c, &gim8018_d,
                      GIM8018_C_INITIAL_NATIVE_TURNS, GIM8018_D_INITIAL_NATIVE_TURNS);
 
-  // 電源電圧安定待ち(起動から HLCONTROL_MOTOR_CAN_START_MS=1秒)後、昔のコードと
-  // 同じく GIM への連続送信の間に HAL_Delay(5) を挟みながら、クローズドループ投入を
-  // 5回ぶん・基準位置の Set_Input_Pos を2回ぶん送る。フレームロスト対策。
+  // 電源電圧安定待ち(起動から HLCONTROL_MOTOR_CAN_START_MS=2秒)後に、GIM への
+  // クローズドループ投入を開始する。それまでは GIM へ CAN を一切送らない。
   GIM_StartupBringUp();
   /* USER CODE END 2 */
 
@@ -620,6 +674,7 @@ int main(void)
         HLControlUDP_Poll();
         HLControlUDP_PeriodicResend();
         GIM_StartupTick();
+        GIM6010_StartupClTick();
 
   }
   /* USER CODE END 3 */
