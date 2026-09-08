@@ -44,21 +44,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// GIM8018-8はODrive互換と認識されているとのことなので、まずODrive CAN Simple
-// プロトコルのnode_idとして扱う (ODrive公式デフォルトは0)。
-// tools/can_id_scanner/can_id_scanner.py の「ODrive heartbeat」欄に出てくる
-// node IDを見て、実機に合わせて確認・変更すること。
-#define GIM_NODE_ID 0U
-
-// GIM8018-8は減速比1/8 (モータ8回転 = 出力1回転)。
-// SteadyWin公式のGIM6010-8マニュアル(同じ駆動基板ファミリー、tools/odrive_setup/
-// odrive_configure.py 冒頭のコメント参照)によれば、このファームウェアには
-// ODrive Pro(v0.6系)にあるload_encoder/commutation_encoderのような「出力軸専用
-// エンコーダ」概念は存在せず、pos_estimate/Input_Posは常にモーター軸(エンコーダ)
-// 基準のturnsである。よってGIM_GEAR_RATIO=8.0fが妥当なはずだが、GIM8018-8固有の
-// マニュアルそのものは未確認なので、念のため出力軸を手でちょうど1回転させ
-// can_id_scannerのPos[turn]の変化量が8.0になることを確認してから運用すること。
-#define GIM_GEAR_RATIO 8.0f
+// ★旧 gim_axis (node_id=0 固定の GIM8018 位置制御テスト) は削除した。
+//   GIM8018-8 は gim8018_c(node 0x04)/gim8018_d(node 0x05) で正式に扱う。
+//   旧テストは frame ID 0x007/0x00B/0x00C (= node_id 0) へ最高優先度で送っており、
+//   もしバス上のどれかの ODrive が node_id 0 (ODrive/CyberBeast の工場出荷デフォルト、
+//   または save_configuration が効かず設定が飛んだ個体) だと、その実機が
+//   Set_Axis_State(CLOSED_LOOP) + Set_Input_Pos(0↔2.0turn の往復) を食らって
+//   電源投入時から勝手に回り続ける (node 4 の症状と一致)。
 
 // 比較用: 2025年のM5_Lower-Controller(lib/VescCAN)ではController ID 10, 20が
 // 使われていた形跡があるが、GIM8018-8がこちらの可能性も完全には排除できないため
@@ -128,7 +120,6 @@ TIM_HandleTypeDef htim1;
 DMA_HandleTypeDef hdma_tim1_ch1;
 
 /* USER CODE BEGIN PV */
-ODriveCAN_Axis_t gim_axis;         // GIM8018-8 (本命: ODrive CAN Simple)
 VescCAN_Motor_t vesc_test_motor;   // 比較用 (受信のみ監視、VESCプロトコルだった場合の保険)
 TTLServoCAN_t ttl_servo;           // TTLサーボ基板 (CAN_PROTOCOL_TTL-SERVO.md, node_id=0x21)
 WaveMotorCAN_t wave_motor;         // wave motor基板 1台目 (CAN_PROTOCOL_wave_motor.md, node_id=0x11)
@@ -401,13 +392,8 @@ int main(void)
   // DJI C610 (M2006用ESC) の初期化。ESC側のIDは基板のダイヤルATC/DIPで1〜8に設定しておく
   DJIC610_Init();
 
-  // GIM8018-8の初期化。本命としてODrive CAN Simpleプロトコルで扱う。
-  ODriveCAN_Init(&gim_axis, GIM_NODE_ID, GIM_GEAR_RATIO);
-  // Position Controlに入る (Set_Controller_Mode(POSITION, POS_FILTER) +
-  // Set_Axis_Requested_State(CLOSED_LOOP_CONTROL))。
-  // モーター/エンコーダのキャリブレーションが済んでいない個体だと失敗するが、その場合も
-  // 送信自体は害がなく、失敗はheartbeatのaxis_error/axis_stateから分かる。
-  ODriveCAN_EnablePositionControl(&gim_axis);
+  // GIM8018-8 は下の gim8018_c(0x04)/gim8018_d(0x05) で正式に初期化・制御する
+  // (旧 gim_axis(node_id=0) の初期化・EnablePositionControl はここから削除した)。
 
   // 比較用: VESCプロトコルだった場合に備え、受信のみ監視する(コマンドは送らない)
   VescCAN_Init(&vesc_test_motor, VESC_TEST_ID);
@@ -545,28 +531,11 @@ int main(void)
 		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // 生存確認用LED (LD2)
 //		HAL_Delay(1000); // 1秒おき
 
-        // GIM8018-8 (ODrive CAN Simple) の位置制御テスト。
-        // 出力軸換算で 0 turn ⇔ 0.25 turn (90°) を約6秒(ループ4周)ごとに往復する。
-        // ⚠ GIM_NODE_IDが実機と合っているか、GIM_GEAR_RATIOが実機と合っているか
-        //    (odrive_can.hのコメント参照。誤っていると指令値と実移動量が8倍ズレる)、
-        //    tools/can_id_scanner の「ODrive heartbeat」欄(axis_state=8 =
-        //    CLOSED_LOOP_CONTROLになっているか)で確認してから通電すること。
-        //    負荷を外した状態・電流制限をかけた電源でまず試すこと。
-        //    axis_errorが非0だったり反応がなければ、モーター/エンコーダのキャリブレーションが
-        //    済んでいない可能性がある(ODrive/GIM設定ツール側での作業が必要)。
-        // ⚠ 電源投入直後は電圧が不安定なので、GIM への CAN 送信は起動から
-        //   HLCONTROL_MOTOR_CAN_START_MS(=1秒) 経過するまで一切行わない。
-        if (HAL_GetTick() >= HLCONTROL_MOTOR_CAN_START_MS) {
-            static uint8_t pos_toggle_count = 0U;
-            static float pos_target_turns = 0.0f;
-
-            pos_toggle_count++;
-            if (pos_toggle_count >= 4U) {
-                pos_toggle_count = 0U;
-                pos_target_turns = (pos_target_turns == 0.0f) ? 0.25f : 0.0f;
-            }
-            ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
-        }
+        // ★旧 gim_axis (node_id=0) の「出力 0⇔0.25turn を約6秒ごとに往復」テストはここから
+        //   削除した。frame ID 0x00C (= node_id 0) の Set_Input_Pos を最高優先度で撒くため、
+        //   バス上のどれかの ODrive が node_id 0 だとその実機が勝手に往復してしまう
+        //   (node 4 が電源投入時から回り続ける症状と一致)。GIM8018 は下の
+        //   gim8018_c/gim8018_d のラウンドロビン + HLControlUDP で正式に制御する。
 
         // GIM6010-8 2台 (0x06,0x07) / GIM8018-8 2台 (0x04,0x05) を確実にクローズドループ
         // (位置制御)で回し続けるため、Set_Controller_Mode + Set_Axis_Requested_State
@@ -583,8 +552,8 @@ int main(void)
         //     約6秒に1回。複数軸をまとめて送らないので burst にならない。
         //   - EnterPositionControl(2フレーム)は axis_state != CLOSED_LOOP のとき(=復帰時)
         //     だけ。定常状態は ResendLastTarget の1フレームのみ。
-        //   - 1周回の合計は gim_axis(1) + 再アサート(定常0/復帰2) + ResendLastTarget(1)
-        //     = 定常2フレーム(TxFIFO3段に収まる)。復帰時のみ4で、その時は can_bus.c の
+        //   - 1周回の合計は 再アサート(定常0/復帰2) + ResendLastTarget(1)
+        //     = 定常1フレーム。復帰時のみ3で、その時は can_bus.c の
         //     リトライ(空き待ち)が吸収する。
         if (HAL_GetTick() >= HLCONTROL_MOTOR_CAN_START_MS) {
             static uint8_t gim_reassert_idx = 0U;

@@ -93,6 +93,21 @@ extern "C" {
 #define HLCONTROL_GIM8018_ARRIVE_TOL_NATIVE  0.05f
 #define HLCONTROL_GIM8018_PENDING_TIMEOUT_MS 6000U
 
+/* GIM6010 (0x06/0x07) の「配達確認つき」再送。GIM8018 と同じ考え方 (HLControlUDP_PeriodicResend)。
+ * A/B は機械結合しているので pending はペアで 1 つ。両軸とも |pos_estimate - last_target| が
+ * TOL 以内になったら止める。TOL は GIM8018 より少し緩め: A/B 同期トリム
+ * (HLControlUDP_UpdateGim6010Sync) が last_target を常時 ±0.025turn 程度動かすため。
+ * 到達後もラウンドロビン (HLControlUDP_ResendLastTarget, 各軸 ~6s) が保険として撒き続ける。 */
+#define HLCONTROL_GIM6010_RESEND_MS          200U
+#define HLCONTROL_GIM6010_ARRIVE_TOL_NATIVE  0.08f
+#define HLCONTROL_GIM6010_PENDING_TIMEOUT_MS 6000U
+/* GIM6010 の配達確認つき再送 (PeriodicResend の GIM6010 セクション) を開始する、
+ * 電源投入からの待ち時間[ms]。この間は GIM8018 (0x04/0x05) の「一番最初の原点確定
+ * (起動時マルチターン正規化)」がバスを使うので、GIM6010 の高頻度再送でバスを圧迫しない。
+ * 0x04 受信時の即時 1 発は送る (占拠にはならない)。
+ * ★判定は電源投入からの経過時間のみ (CAN バスの状態は見ない)。 */
+#define HLCONTROL_GIM6010_RESEND_START_MS    3000U
+
 /* GIM6010/GIM8018ピッチ角目標値のクランプ範囲。wave motorのピッチ角目標値とは別の値
  * (減速比8なので角度指定の実質可動範囲がwave motorと異なるため)。
  * GIM6010は実機の出力角可動範囲が-60〜0degのため、符号反転する前の「入力値」
@@ -118,13 +133,15 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
 /* メインループから毎回呼ぶ (非ブロッキング)。受信したコマンドをその場で処理する。 */
 void HLControlUDP_Poll(void);
 
-/* GIM8018 (0x04/0x05) の「配達確認つき」再送。Delay_WithCANPoll から呼ぶ。
- * FDCAN は AutoRetransmission=DISABLE なので ACK が返らないフレームは黙って捨てられ、
- * とくに node5(0x05) は落ちやすい。ラウンドロビン(約6秒)頼みだと「角度指令が 6 秒
- * 遅れて効く/効かない」症状になる。
- * この関数は「目標が変わってからまだ到達していない軸」だけ、HLCONTROL_GIM8018_RESEND_MS
- * 間隔で Set_Input_Pos を撒き、pos_estimate が目標に十分近づいたら止める
- * (= 定常状態ではバスに何も足さない)。PENDING_TIMEOUT_MS を超えても止める。 */
+/* GIM6010 (0x06/0x07) と GIM8018 (0x04/0x05) の「配達確認つき」再送。Delay_WithCANPoll
+ * とメインループから呼ぶ。
+ * FDCAN は AutoRetransmission=DISABLE なので、調停に負けた/ACK が返らないフレームは
+ * 黙って捨てられる (同一バスに ODrive が複数あると周期送信と衝突して頻発)。ラウンド
+ * ロビン(約6秒)頼みだと「角度指令が 6 秒遅れて効く/効かない」症状になる。
+ * この関数は「目標が変わってからまだ到達していない軸」だけ、RESEND_MS 間隔で
+ * Set_Input_Pos を撒き、pos_estimate が目標に十分近づいたら止める (= 定常状態では
+ * バスに何も足さない)。PENDING_TIMEOUT_MS を超えても止める。GIM6010 は A/B ペアで、
+ * 両軸とも到達したら止める。CLOSED_LOOP から外れている軸は入れ直してから撒く。 */
 void HLControlUDP_PeriodicResend(void);
 
 /* GIM8018 (GIM8108-8, node 0x04 / 0x05) の「初期位置」を、起動時マルチターン正規化

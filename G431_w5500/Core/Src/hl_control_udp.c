@@ -54,6 +54,11 @@ static uint8_t  s_gim8018_d_pending = 0U;
 static uint32_t s_gim8018_c_pending_tick = 0U;
 static uint32_t s_gim8018_d_pending_tick = 0U;
 
+/* GIM6010 (0x06/0x07) の配達確認つき再送。A/B は機械結合しているので pending はペアで 1 つ。
+ * 0x04 ハンドラで 1 にし、A/B 両軸が last_target に十分近づいたら 0 (or PENDING_TIMEOUT)。 */
+static uint8_t  s_gim6010_pending = 0U;
+static uint32_t s_gim6010_pending_tick = 0U;
+
 /* GIM6010 A/Bの「トリム前」の目標値(ネイティブturns、initial_native + HLコマンドの
  * 偏差)。HLControlUDP_UpdateGim6010Sync()が実測ズレから s_gim6010_sync_trim_native
  * を更新するたびに、ここから±trim/2を加減して s_gim6010_a/b_last_target を
@@ -195,6 +200,7 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
     s_gim8018_d_last_target = gim8018_d_initial_native;
     s_gim8018_c_commanded = 0U;   /* 起動時ホーミング確定 & 初回 0x05 まで Set_Input_Pos を送らない */
     s_gim8018_d_commanded = 0U;
+    s_gim6010_pending = 0U;
 
     socket(s_sn, Sn_MR_UDP, listen_port, 0);
     /* recvfrom()をノンブロッキングにする。can_udp_bridge.cと同じ理由
@@ -283,7 +289,11 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
         s_gim6010_a_base_native = s_gim6010_a_initial_native + native_delta;
         s_gim6010_b_base_native = s_gim6010_b_initial_native + native_delta;
         s_gim6010_commanded = 1U;   /* 以後ラウンドロビンが last_target を再送してよい */
-        HLControl_ApplyGim6010Targets();
+        HLControl_ApplyGim6010Targets();   /* まず即時 1 発 (バスが空いていれば最速) */
+        /* 到達するまで HLControlUDP_PeriodicResend() が ~200ms 間隔で撒き直す
+         * (調停負け / TxFIFO 溢れで即時分が落ちても数百 ms で追いつく)。 */
+        s_gim6010_pending      = 1U;
+        s_gim6010_pending_tick = HAL_GetTick();
     } else if (cmd == HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG) {
         float pitch_deg;
         float native_delta;
@@ -340,6 +350,43 @@ uint8_t HLControlUDP_HasReceived(void)
     return s_has_received;
 }
 
+/* GIM6010 1 軸ぶんの配達確認つき再送。arrived には「この軸は目標に到達済み」を返す
+ * (ペアの pending は A/B 両方 arrived で初めてクリアする。呼び出し側で判定)。 */
+static void HLControl_Gim6010DeliverAxis(GIM6010_t *g, float target_native, uint8_t *arrived)
+{
+    float err;
+
+    *arrived = 0U;
+    if (g == NULL) {
+        *arrived = 1U;   /* 存在しない軸はペアをブロックしない */
+        return;
+    }
+    /* 一度も応答の無いノードには送らない (間欠的なだけなら送り続ける)。
+     * arrived は立てないので、ペアの pending は PENDING_TIMEOUT で解除される。 */
+    if (!g->odrv.connected) {
+        return;
+    }
+    /* CLOSED_LOOP から外れていたら入れ直してから撒く (移行前に現在位置を目標化=飛び出し防止)。
+     * axis_error が latch されていると CLOSED_LOOP を拒否されるので先にクリア。 */
+    if (g->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
+        if (g->odrv.axis_error != 0U) {
+            (void)ODriveCAN_ClearErrors(&g->odrv);
+        }
+        GIM6010_EnterPositionControlHold(g);
+        return;
+    }
+    /* 到達したら止める (pos_estimate は CLOSED_LOOP なら有効)。 */
+    err = g->odrv.pos_estimate - target_native;
+    if (err < 0.0f) {
+        err = -err;
+    }
+    if (err < HLCONTROL_GIM6010_ARRIVE_TOL_NATIVE) {
+        *arrived = 1U;
+        return;
+    }
+    ODriveCAN_SetInputPos(&g->odrv, target_native, 0.0f, 0.0f);
+}
+
 /* 1 軸ぶんの配達確認つき再送。pending 中だけ動く。 */
 static void HLControl_Gim8018DeliverTick(GIM8018_t *g, float target_native,
                                          uint8_t *pending, uint32_t pending_tick, uint32_t now)
@@ -390,7 +437,7 @@ void HLControlUDP_PeriodicResend(void)
     if (!HLControl_MotorCanReady()) {
         return;
     }
-    if (!s_gim8018_c_pending && !s_gim8018_d_pending) {
+    if (!s_gim6010_pending && !s_gim8018_c_pending && !s_gim8018_d_pending) {
         return;   /* 定常状態: バスに何も足さない */
     }
     now = HAL_GetTick();
@@ -399,9 +446,43 @@ void HLControlUDP_PeriodicResend(void)
     }
     last = now;
 
-    /* C→D を立て続けに投げると D 側が落ちやすい (can_bus.c / AutoRetransmission=DISABLE)。
-     * 送信順を毎回入れ替え、間に短い gap を入れる。 */
-    {
+    /* --- GIM6010 (0x06/0x07): A/B ペアの配達確認つき再送 ---
+     * ★電源投入から HLCONTROL_GIM6010_RESEND_START_MS(=3s) 経過するまでは GIM6010 の
+     *   高頻度再送を行わない。この間は GIM8018 (0x04/0x05) の「一番最初の原点確定
+     *   (起動時マルチターン正規化)」がバスを使う。判定は経過時間のみ (CAN の状態は見ない)。
+     *   0x04 受信時の即時 1 発は HandlePacket 側で送済み。 */
+    if (s_gim6010_pending) {
+        if (now < HLCONTROL_GIM6010_RESEND_START_MS) {
+            /* ゲート閉: 撒かない。pending は保持。PENDING_TIMEOUT はゲート解除後から数える。 */
+            s_gim6010_pending_tick = now;
+        } else if ((now - s_gim6010_pending_tick) > HLCONTROL_GIM6010_PENDING_TIMEOUT_MS) {
+            s_gim6010_pending = 0U;   /* これ以上撒かない。以後はラウンドロビンの保険 */
+        } else {
+            static uint8_t a_first = 1U;
+            uint8_t a_arr = 0U, b_arr = 0U;
+            /* A→B を立て続けに投げると後発が落ちやすい。順を入れ替え + 間に gap。 */
+            if (a_first) {
+                HLControl_Gim6010DeliverAxis(s_gim6010_a, s_gim6010_a_last_target, &a_arr);
+                HAL_Delay(3);
+                HLControl_Gim6010DeliverAxis(s_gim6010_b, s_gim6010_b_last_target, &b_arr);
+            } else {
+                HLControl_Gim6010DeliverAxis(s_gim6010_b, s_gim6010_b_last_target, &b_arr);
+                HAL_Delay(3);
+                HLControl_Gim6010DeliverAxis(s_gim6010_a, s_gim6010_a_last_target, &a_arr);
+            }
+            a_first = (uint8_t)(!a_first);
+            if (a_arr && b_arr) {
+                s_gim6010_pending = 0U;   /* 両軸到達 → 停止 */
+            }
+            if (s_gim8018_c_pending || s_gim8018_d_pending) {
+                HAL_Delay(3);   /* GIM6010 と GIM8018 の送信の間にも gap */
+            }
+        }
+    }
+
+    /* --- GIM8018 (0x04/0x05): C→D を立て続けに投げると D 側が落ちやすい
+     * (can_bus.c / AutoRetransmission=DISABLE)。送信順を毎回入れ替え、間に短い gap。 --- */
+    if (s_gim8018_c_pending || s_gim8018_d_pending) {
         static uint8_t c_first = 1U;
         if (c_first) {
             HLControl_Gim8018DeliverTick(s_gim8018_c, s_gim8018_c_last_target,
