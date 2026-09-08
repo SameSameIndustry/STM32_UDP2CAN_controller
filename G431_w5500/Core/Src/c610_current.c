@@ -71,6 +71,11 @@ HAL_StatusTypeDef C610Current_Tick(C610Current_t *blk)
     }
     blk->active = 1U;
 
+#if (C610_CURRENT_CAN_TX_ENABLED == 0)
+    /* 診断スイッチ: C610 へ CAN を一切出さない。 */
+    return HAL_OK;
+#endif
+
     /* 送信レート制限 (バス混雑対策)。前回送信から一定時間未満ならスキップ。
      * last_tx_tick==0 の初回は必ず送る。 */
 #if (C610_CURRENT_MIN_TX_INTERVAL_MS > 0U)

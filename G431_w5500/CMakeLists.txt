@@ -52,10 +52,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/dji_c610.c
     Core/Src/c610_current.c
     Core/Src/c610_position.c
-    Core/Src/vesc_can.c
-    Core/Src/odrive_can.c
-    Core/Src/gim6010.c
-    Core/Src/gim8018.c
     Core/Src/ttl_servo_can.c
     Core/Src/wave_motor_can.c
     Core/Src/hl_control_udp.c

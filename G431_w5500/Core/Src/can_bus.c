@@ -48,20 +48,22 @@ static HAL_StatusTypeDef CANBus_Send(uint32_t id, uint32_t id_type, const uint8_
 
     {
         HAL_StatusTypeDef status;
-        uint8_t retry;
+        uint32_t retry;
 
         /* Tx FIFO/Queueは3要素しかない(STM32G4 HW仕様)。直前に別のフレームを積んだ
-         * 直後だと空きが無く送信に失敗することがある(例: hl_control_udp.cが
-         * GIM8018 C(0x04)・D(0x05)を立て続けに送るケースで、後発のDの方が弾かれ
-         * やすく、その分だけ反映が遅れる不具合として実機で確認した)。1フレームは
-         * バス速度で見れば数百us程度で送信完了するはずなので、わずかに待って
-         * 空きができるのを待ってからリトライする。それでも空かなければ本当に
-         * 詰まっている(Bus-Off等)ので諦めてカウンタに記録する。 */
-        for (retry = 0U; retry < 3U; retry++) {
+         * 直後だと空きが無く送信に失敗することがある。1フレームはバス速度で見れば
+         * 数百us程度で送信完了するはずなので、空きができるのを「短く」待つ。
+         * ★以前は HAL_Delay(1) を最大3回=最大3ms メインループをブロックしていたが、
+         *   C610 のフィードバック大量受信等でバスが混むとここで長時間止まり、他の
+         *   周期処理(C610電流指令の2ms周期・wave/AS5600)のタイミングを乱していた。
+         *   HAL_Delay をやめ、バウンドした NOP スピンに変更 (最大 ~数百us)。
+         *   それでも空かなければ諦めてカウンタに記録し、呼び出し側の定期再送に任せる
+         *   (wave motor は HLControlUDP_WaveTick、C610 は毎ループ)。 */
+        for (retry = 0U; retry < 1000U; retry++) {
             if (HAL_FDCAN_GetTxFifoFreeLevel(s_hfdcan) > 0U) {
                 break;
             }
-            HAL_Delay(1);
+            __NOP();
         }
 
         status = HAL_FDCAN_AddMessageToTxFifoQ(s_hfdcan, &TxHeader, (uint8_t *)data);

@@ -1,9 +1,11 @@
 # 高レベル制御UDP プロトコル仕様書
 
 Python (PC) 側から STM32 (G431_w5500) へ、TTLサーボ (CAN ID 0x21) / wave motor (CAN ID
-0x11, 0x12) / GIM6010-8 (CAN ID 0x06, 0x07) / GIM8018-8 (CAN ID 0x04, 0x05) /
-DJI C610 (CAN ID 0x01) を直接操作するための、生CANフレーム中継 (`can_udp_bridge.c`,
+0x11, 0x12) / DJI C610 (CAN ID 0x01) を直接操作するための、生CANフレーム中継 (`can_udp_bridge.c`,
 ポート5001) とは別系統の**専用・単方向 (PC→STM32のみ)** UDPプロトコル。
+
+★`enndeffector_UDP` ブランチのファームは **GIM6010/GIM8018 (旧 0x04 / 0x05) を扱わない**
+(この基板では GIM モータを制御しないため削除済み)。0x04/0x05 は別ファームの GIM 基板専用。
 
 実装:
 - STM32側: [`Core/Inc/hl_control_udp.h`](../../G431_w5500/Core/Inc/hl_control_udp.h) /
@@ -17,10 +19,12 @@ PC に 2 枚の基板を同一 LAN で繋ぐ。**このブランチ (`enndeffect
 
 | 基板 | IP | ファーム | 役割 (この 5003 プロトコルで操作するもの) |
 |------|----|----------|-------------------------------------------|
-| GIM基板 | `192.168.1.100` | 別ブランチ | `0x01` (wave motor pitch)、`0x04` (GIM6010)、`0x05` (GIM8018) |
-| エンドエフェクタ基板 | `192.168.1.101` | このブランチ | `0x02`/`0x03` (エンドエフェクタ サーボ開閉 = TTLサーボ 0x21)、`0x06`/`0x07` (C610 0x01 位置制御) |
+| GIM基板 | `192.168.1.100` | 別ブランチ | `0x04` (GIM6010)、`0x05` (GIM8018) |
+| エンドエフェクタ基板 | `192.168.1.101` | このブランチ | `0x01`/`0x08`/`0x09` (wave motor 0x11/0x12 差動 ピッチ/ヨー)、`0x02`/`0x03` (サーボ開閉 = TTLサーボ 0x21)、`0x06`/`0x07` (C610 0x01 位置制御) |
 
-同じ 5003 プロトコルだが、コマンドの宛先は**基板の IP で分ける** (Python アプリが GIM系は .100 へ、サーボ/C610 系は .101 へ送信する)。MAC は基板ごとに別 (`main.c` の `gWIZNETINFO.mac`、末尾 `0x65` = 101)。
+同じ 5003 プロトコルだが、コマンドの宛先は**基板の IP で分ける**。MAC は基板ごとに別 (`main.c` の `gWIZNETINFO.mac`、末尾 `0x65` = 101)。
+★wave motor (0x11/0x12) と TTLサーボ (0x21) が同一 CAN バス・同一ファームの構成なら、
+Python アプリの `ee_ip` と `gim_ip` は同じ IP を指すように設定する (0x01/0x08/0x09 も 0x02/0x03 も同じ基板へ届く必要がある)。
 
 ## 通信設定
 
@@ -44,6 +48,8 @@ PC に 2 枚の基板を同一 LAN で繋ぐ。**このブランチ (`enndeffect
 | `SET_GIM8018_PITCH_TARGET_DEG` | `0x05` | `float32` LE、角度 `[deg]` | `05 <4byte float>` (計5byte) |
 | `SET_C610_CURRENT_A` | `0x06` | `float32` LE、電流 `[A]` (手動モード) | `06 <4byte float>` (計5byte) |
 | `SET_C610_TARGET_DEG` | `0x07` | `float32` LE、**原点からの差分角** `[deg]` (カスケード位置制御) | `07 <4byte float>` (計5byte) |
+| `SET_YAW_TARGET` | `0x08` | `float32` LE、ヨー角目標値 `[deg]` | `08 <4byte float>` (計5byte) |
+| `SET_PITCH_YAW_TARGET` | `0x09` | `float32` LE ピッチ `[deg]` + `float32` LE ヨー `[deg]` | `09 <4byte float> <4byte float>` (計9byte) |
 
 未知のコマンド・不正な長さのパケットは無視される。
 
@@ -51,9 +57,13 @@ PC に 2 枚の基板を同一 LAN で繋ぐ。**このブランチ (`enndeffect
 
 | コマンド | STM32側の挙動 |
 |---|---|
-| `SET_PITCH_TARGET` (value=v) | `v` を `-100.0 〜 +100.0` の範囲にクランプしてから、CAN ID `0x11` (wave motor 1台目) へ **符号反転した値 (`-v`)** を、CAN ID `0x12` (2台目) へ **そのままの値 (`v`)** を、それぞれ `SET_TARGET` (絶対原点180°からのオフセット、`CAN_PROTOCOL_wave_motor.md` 準拠) として送信する。範囲チェック・クランプは全てSTM32側で行うため、Python側は範囲外の値をそのまま送ってよい。 |
-| `TTL_OPEN` | CAN ID `0x21` (TTLサーボ) へ、`SET_TARGET` (絶対原点180°固定からのオフセット、`CAN_PROTOCOL_TTL-SERVO.md` 準拠) でオフセット `-25.0°` を送信する。 |
-| `TTL_CLOSE` | 同じくCAN ID `0x21` へ、オフセット `+50.0°` を送信する。 |
+| `SET_PITCH_TARGET` (value=v) | **0x11/0x12 は差動機構**。内部の「ピッチ状態」だけを `v` に更新 (ヨー状態は保持) し、両モータの目標オフセット角を差動キネマティクスで再計算して `SET_TARGET` (絶対原点180°からのオフセット、`CAN_PROTOCOL_wave_motor.md` 準拠) で送信する:<br>　`θ(0x11) = WAVE_YAW_DIR·Ky·yaw − WAVE_PITCH_DIR·Kp·pitch`<br>　`θ(0x12) = WAVE_YAW_DIR·Ky·yaw + WAVE_PITCH_DIR·Kp·pitch`<br>ピッチ=差動成分 (2台を逆向き)、ヨー=共通成分 (2台を同じ向きに同じだけ)。`yaw=0` のとき従来の「0x11へ`-v` / 0x12へ`v`」と完全一致 (後方互換)。ピッチは `HLCONTROL_PITCH_TARGET_MIN_DEG 〜 MAX_DEG` (`±100`)、ヨーは `HLCONTROL_YAW_TARGET_MIN_DEG 〜 MAX_DEG` (`±90`) にSTM32側でクランプ。伝達比 `Kp`/`Ky` (`HLCONTROL_WAVE_PITCH_GAIN`/`_YAW_GAIN`、既定1.0)・符号 (`_PITCH_DIR`/`_YAW_DIR`)・モータ可動域 (`HLCONTROL_WAVE_MOTOR_LIMIT_DEG`、既定160°) は `hl_control_udp.h` のコンパイル時定数。 |
+| `SET_YAW_TARGET` (value=v) | 同じ差動機構の内部「ヨー状態」だけを `v` に更新 (ピッチ状態は保持) し、両モータを再計算して送信する。式・クランプ・定数は `SET_PITCH_TARGET` と共通。 |
+| `SET_PITCH_YAW_TARGET` (pitch, yaw) | 内部のピッチ状態とヨー状態を**同時 (原子的) に**更新して両モータを再計算する。両軸を同時掃引するときに、片方だけ先に反映される過渡を避けたい場合に使う。 |
+| (差動の予算配分) | 片側モータが受ける角度は `\|Kp·pitch\| + \|Ky·yaw\|` まで振れる (差動機構は両成分の和)。STM32側はまずピッチを `HLCONTROL_WAVE_MOTOR_LIMIT_DEG` 内に収め、残り予算をヨーに割り当てる (**ピッチ優先**)。到達可能領域は `(pitch, yaw)` 空間のひし形 `\|Kp·pitch\| + \|Ky·yaw\| ≤ HLCONTROL_WAVE_MOTOR_LIMIT_DEG`。フルピッチとフルヨーは同時には出せない。 |
+| `TTL_OPEN` | 0x21 の開閉状態を「開 (`-25.0°`)」に更新する。**0x21 は 0x11/0x12 のヨー軸と機械的に連動している**ため、実際に送るオフセットは `TTL_YAW_FOLLOW_GAIN·yaw_est + 開閉オフセット` (`CAN_PROTOCOL_TTL-SERVO.md` 準拠の `SET_TARGET`)。ボタンを押した瞬間は現在の `yaw_est` で即時1発送信する。 |
+| `TTL_CLOSE` | 同じく 0x21 の開閉状態を「閉 (`+50.0°`)」に更新して即時1発送信する。 |
+| (0x21 のヨー追従) | 0x11/0x12 の差動ヨー軸は遅い (実機 ~10°/s) が 0x21 は速いので、0x21 へ一気に最終目標を送ると実ヨー軸より先行して機構がねじれる。STM32側は **一度でも open/close を受けたら**、`HLCONTROL_TTL_FOLLOW_PERIOD_MS` (=500ms) ごとに `yaw_est` を最大 `HLCONTROL_TTL_YAW_RAMP_RATE_DPS` (=10°/s) ずつ差動機構の実効ヨー角へ寄せながら `0x21` へ `SET_TARGET` を再送し続ける。実効ヨーに追いついたら送信停止 (定常時バス負荷ゼロ)。ゲイン/レート/周期は `hl_control_udp.h` のコンパイル時定数。0x08/0x09 でヨーを先に動かしておけば、open/close の瞬間には `yaw_est` が既にヨー軸へ同期している。 |
 | `SET_GIM6010_PITCH_TARGET_DEG` (value=deg) | `deg` を `-100.0 〜 +100.0` の範囲にクランプしてから、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM6010_GEAR_RATIO`) を計算する。CAN ID `0x06`・`0x07` の両方へ、ODrive CAN Simpleの `Set_Input_Pos` (絶対位置、ネイティブturns) で `(各軸の初期位置) + delta` を送信する(**0x06と0x07は全く同じ目標値**、符号反転はしない)。例: 初期位置がどちらも0のとき、90°を送ると `delta = 90/360*8 = 2.0` となり、0x06・0x07ともに目標値は+2.0になる。 |
 | `SET_GIM8018_PITCH_TARGET_DEG` (value=deg) | **クランプせず**、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM8018_GEAR_RATIO_NOMINAL`) を計算する。CAN ID `0x04` へ `(0x04の初期位置) + delta` を、CAN ID `0x05` へ `(0x05の初期位置) - delta` (**符号反転・同じ大きさ**、GIM6010とは逆に互い違い) を、それぞれ`Set_Input_Pos`で送信する。例: 初期位置がどちらも0のとき、90°を送ると `delta = 2.0` となり、0x04の目標値は+2.0、0x05の目標値は-2.0になる。 |
 | `SET_C610_CURRENT_A` (value=amps) | **手動電流モード**。位置制御コントローラ (`c610_position`) を無効化してから、DJI C610 (CAN ID `0x01` = ESC ID 1) の電流を直接指令する。`amps` を `-10.0 〜 +10.0` にクランプし `raw = amps / 10.0 * 10000` (int16) に変換して記憶する。**この時点ではCAN送信しない**。実送信は `c610_current.c` の `C610Current_Tick()` が担当し、**電源投入から `C610_CURRENT_STARTUP_DELAY_MS` = 2秒 の間は C610 へ一切フレームを出さない**。2秒経過後は指令 `raw` を C610 のグループ電流フレーム `0x200` (ID1-4分、対象以外は0) として `C610_CURRENT_MIN_TX_INTERVAL_MS`(=2ms) 以上の間隔で送り続ける。負の電流も指定可 — C610の電流指令は**符号付き int16 ビッグエンディアン**なので、負値は2の補数 (例: `-1.0A` → `raw -1000` = `0xFC18`)。`STOP` は `amps=0`。位置制御へ戻すには `0x07` を送る。 |
@@ -95,12 +105,18 @@ CMD_SET_GIM6010_PITCH_TARGET_DEG = 0x04
 CMD_SET_GIM8018_PITCH_TARGET_DEG = 0x05
 CMD_SET_C610_CURRENT_A = 0x06
 CMD_SET_C610_TARGET_DEG = 0x07
+CMD_SET_YAW_TARGET = 0x08
+CMD_SET_PITCH_YAW_TARGET = 0x09
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # --- GIM基板 (192.168.1.100) ---
-# ピッチ角目標値を+42.5degに設定 (0x11には-42.5、0x12には+42.5が送られる)
+# wave motor 差動: ピッチ角目標値を+42.5degに設定 (ヨーは現状維持。yaw=0なら0x11へ-42.5/0x12へ+42.5)
 sock.sendto(struct.pack("<Bf", CMD_SET_PITCH_TARGET, 42.5), (GIM_IP, HLCONTROL_PORT))
+# wave motor 差動: ヨー角目標値を+20degに設定 (ピッチは現状維持 = 42.5degのままヨーだけ回す)
+sock.sendto(struct.pack("<Bf", CMD_SET_YAW_TARGET, 20.0), (GIM_IP, HLCONTROL_PORT))
+# wave motor 差動: ピッチ+ヨーを同時 (原子的) に設定 (ピッチ30deg, ヨー-15deg)
+sock.sendto(struct.pack("<Bff", CMD_SET_PITCH_YAW_TARGET, 30.0, -15.0), (GIM_IP, HLCONTROL_PORT))
 # GIM6010のピッチ角目標値を90degに設定 (0x06・0x07とも同じ値 = 初期位置+2.0)
 sock.sendto(struct.pack("<Bf", CMD_SET_GIM6010_PITCH_TARGET_DEG, 90.0), (GIM_IP, HLCONTROL_PORT))
 # GIM8018のピッチ角目標値を90degに設定 (0x04は初期位置+2.0、0x05は初期位置-2.0)

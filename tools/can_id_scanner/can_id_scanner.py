@@ -4,12 +4,14 @@
 PC に 2 枚の STM32(G431_w5500) 基板を同一 LAN で繋いで使う:
 
   ┌ GIM基板 (192.168.1.100、別ファーム) ─────────────────────────────
-  │  GIM6010-8 (0x06/0x07) / GIM8018-8 (0x04/0x05) / wave motor (0x11/0x12)
-  │  のピッチ角目標値を高レベル制御UDP(5003)で送る。
+  │  GIM6010-8 (0x06/0x07) / GIM8018-8 (0x04/0x05) のピッチ角目標値、
+  │  wave motor (0x11/0x12) 差動のピッチ/ヨー角 (0x01/0x08/0x09) を高レベル制御UDP(5003)で送る。
   │  CAN<->UDPブリッジ(5001)で ODrive heartbeat/encoder を監視、生CANログ、手動CAN送信。
   │
   └ エンドエフェクタ基板 (192.168.1.101、このリポジトリの enndeffector_UDP ブランチ) ──
-     エンドエフェクタのサーボ開閉 (TTLサーボ 0x21、HLCONTROL 0x02/0x03)。
+     エンドエフェクタのサーボ開閉 (TTLサーボ 0x21、HLCONTROL 0x02/0x03) と
+     ヨー軸角 (0x11/0x12 差動、HLCONTROL 0x08)。0x21 は 0.5s周期・~10°/sでヨー軸に追従する。
+     (0x11/0x12 と 0x21 が同一CANバス・同一ファームの構成なら ee_ip=gim_ip でよい)
      C610 (0x01) の AS5600 フィードバック カスケード位置制御:
         0x07 = 原点(C610_POS_ORIGIN_DEG)からの差分角[deg]  (位置ループP→速度ループPI→電流±0.5A)
         0x06 = 手動電流[A] (位置制御OFF・テスト用)
@@ -66,13 +68,15 @@ ODRIVE_AXIS_STATE_NAMES = {
 }
 
 # ---- 高レベル制御UDP (STM32 Core/Src/hl_control_udp.c と対応) ----
-HLCONTROL_CMD_SET_PITCH_TARGET = 0x01              # float32 LE deg  -> wave motor 0x11/0x12
+HLCONTROL_CMD_SET_PITCH_TARGET = 0x01              # float32 LE deg  -> wave motor 0x11/0x12 差動 (ピッチのみ更新)
 HLCONTROL_CMD_TTL_OPEN = 0x02                      # payloadなし     -> TTLサーボ 0x21 (エンドエフェクタ開)
 HLCONTROL_CMD_TTL_CLOSE = 0x03                     # payloadなし     -> TTLサーボ 0x21 (エンドエフェクタ閉)
 HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG = 0x04  # float32 LE deg  -> GIM6010 0x06/0x07
 HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG = 0x05  # float32 LE deg  -> GIM8018 0x04/0x05
 HLCONTROL_CMD_SET_C610_CURRENT_A = 0x06            # float32 LE A    -> C610 手動電流 (位置制御OFF)
 HLCONTROL_CMD_SET_C610_TARGET_DEG = 0x07           # float32 LE deg  -> C610 原点からの差分角 (位置制御ON)
+HLCONTROL_CMD_SET_YAW_TARGET = 0x08                # float32 LE deg  -> wave motor 0x11/0x12 差動 (ヨーのみ更新)
+HLCONTROL_CMD_SET_PITCH_YAW_TARGET = 0x09          # float32 LE deg x2 -> wave motor 0x11/0x12 差動 (ピッチ+ヨー同時)
 
 C610_CURRENT_AMP_MAX = 10.0
 
@@ -326,6 +330,10 @@ class HLSender:
     def cmd_f32(cmd_id: int, value: float) -> bytes:
         return struct.pack("<Bf", cmd_id, value)
 
+    @staticmethod
+    def cmd_2f32(cmd_id: int, a: float, b: float) -> bytes:
+        return struct.pack("<Bff", cmd_id, a, b)
+
 
 # ============================================================ GIM基板 =======
 class GimSection(ttk.LabelFrame):
@@ -363,13 +371,20 @@ class GimSection(ttk.LabelFrame):
 
         f3 = ttk.Frame(self)
         f3.pack(fill="x", pady=(4, 0))
-        ttk.Label(f3, text="wave motor ピッチ角 [deg]:").pack(side="left")
-        self.wave_var = tk.StringVar(value="0")
-        e = ttk.Entry(f3, textvariable=self.wave_var, width=8)
+        ttk.Label(f3, text="wave motor 差動 [deg]  ピッチ:").pack(side="left")
+        self.wave_pitch_var = tk.StringVar(value="0")
+        e = ttk.Entry(f3, textvariable=self.wave_pitch_var, width=7)
         e.pack(side="left", padx=4)
         e.bind("<Return>", lambda *_: self._send_wave())
-        ttk.Button(f3, text="送信 (0x01)", command=self._send_wave).pack(side="left", padx=4)
-        ttk.Label(f3, text="(0x11へ符号反転した値、0x12へそのままの値)").pack(side="left", padx=4)
+        ttk.Label(f3, text="ヨー:").pack(side="left")
+        self.wave_yaw_var = tk.StringVar(value="0")
+        e = ttk.Entry(f3, textvariable=self.wave_yaw_var, width=7)
+        e.pack(side="left", padx=4)
+        e.bind("<Return>", lambda *_: self._send_wave())
+        ttk.Button(f3, text="送信 (0x09)", command=self._send_wave).pack(side="left", padx=4)
+        ttk.Button(f3, text="P のみ (0x01)", command=self._send_wave_pitch).pack(side="left", padx=2)
+        ttk.Button(f3, text="Y のみ (0x08)", command=self._send_wave_yaw).pack(side="left", padx=2)
+        ttk.Label(f3, text="(差動: ピッチ=2台逆回転 / ヨー=2台同回転)").pack(side="left", padx=4)
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", pady=6)
 
@@ -433,7 +448,20 @@ class GimSection(ttk.LabelFrame):
         self._send_deg(self.g8_var, HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG, "GIM8018 ピッチ角")
 
     def _send_wave(self):
-        self._send_deg(self.wave_var, HLCONTROL_CMD_SET_PITCH_TARGET, "wave motor ピッチ角")
+        """ピッチ+ヨーを同時 (0x09) に送る。差動キネマティクスはSTM32側で計算。"""
+        try:
+            p = float(self.wave_pitch_var.get())
+            y = float(self.wave_yaw_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "wave motor ピッチ/ヨー の入力が不正です")
+            return
+        self.hl.send(HLSender.cmd_2f32(HLCONTROL_CMD_SET_PITCH_YAW_TARGET, p, y))
+
+    def _send_wave_pitch(self):
+        self._send_deg(self.wave_pitch_var, HLCONTROL_CMD_SET_PITCH_TARGET, "wave motor ピッチ角")
+
+    def _send_wave_yaw(self):
+        self._send_deg(self.wave_yaw_var, HLCONTROL_CMD_SET_YAW_TARGET, "wave motor ヨー角")
 
     def _send_manual(self):
         try:
@@ -523,6 +551,27 @@ class EndEffectorSection(ttk.LabelFrame):
         ttk.Button(f1, text="開く  OPEN (0x02)", command=lambda: self.hl.send(HLSender.cmd(HLCONTROL_CMD_TTL_OPEN))).pack(side="left", padx=6)
         ttk.Button(f1, text="閉じる  CLOSE (0x03)", command=lambda: self.hl.send(HLSender.cmd(HLCONTROL_CMD_TTL_CLOSE))).pack(side="left", padx=4)
 
+        fy = ttk.Frame(self)
+        fy.pack(fill="x", pady=(4, 0))
+        ttk.Label(fy, text="wave motor 差動 [deg]  ピッチ:").pack(side="left")
+        self.wave_pitch_var = tk.StringVar(value="0")
+        e = ttk.Entry(fy, textvariable=self.wave_pitch_var, width=7)
+        e.pack(side="left", padx=4)
+        e.bind("<Return>", lambda *_: self._send_wave())
+        ttk.Label(fy, text="ヨー:").pack(side="left")
+        self.yaw_var = tk.StringVar(value="0")
+        e = ttk.Entry(fy, textvariable=self.yaw_var, width=7)
+        e.pack(side="left", padx=4)
+        e.bind("<Return>", lambda *_: self._send_wave())
+        ttk.Button(fy, text="送信 (0x09)", command=self._send_wave).pack(side="left", padx=4)
+        ttk.Button(fy, text="P のみ (0x01)", command=self._send_wave_pitch).pack(side="left", padx=2)
+        ttk.Button(fy, text="Y のみ (0x08)", command=self._send_wave_yaw).pack(side="left", padx=2)
+
+        fy2 = ttk.Frame(self)
+        fy2.pack(fill="x", pady=(2, 0))
+        ttk.Label(fy2, text="  (ピッチ=2台逆回転 / ヨー=2台同回転。もう一方の軸は保持。0x21 は 0.5s周期でヨーに追従)",
+                  foreground="#777777").pack(side="left")
+
         f2 = ttk.Frame(self)
         f2.pack(fill="x", pady=(6, 0))
         ttk.Label(f2, text="C610 目標 = 原点からの差分 [deg]:").pack(side="left")
@@ -576,6 +625,38 @@ class EndEffectorSection(ttk.LabelFrame):
         ttk.Label(r3, textvariable=self.c610_tele_var, font=("Consolas", 10), foreground="#aa5500").pack(side="left")
 
     # -- 送信 --
+    def _wave_pitch_yaw(self):
+        p = float(self.wave_pitch_var.get())
+        y = float(self.yaw_var.get())
+        return p, y
+
+    def _send_wave(self):
+        """ピッチ+ヨーを同時 (0x09) に送る。差動キネマティクスはSTM32側で計算。"""
+        try:
+            p, y = self._wave_pitch_yaw()
+        except ValueError:
+            messagebox.showerror("エラー", "wave motor ピッチ/ヨー の入力が不正です")
+            return
+        self.hl.send(HLSender.cmd_2f32(HLCONTROL_CMD_SET_PITCH_YAW_TARGET, p, y))
+
+    def _send_wave_pitch(self):
+        """ピッチのみ更新 (0x01)。ヨーは現状維持。"""
+        try:
+            p = float(self.wave_pitch_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "wave motor ピッチ角の入力が不正です")
+            return
+        self.hl.send(HLSender.cmd_f32(HLCONTROL_CMD_SET_PITCH_TARGET, p))
+
+    def _send_wave_yaw(self):
+        """ヨーのみ更新 (0x08)。ピッチは現状維持。"""
+        try:
+            y = float(self.yaw_var.get())
+        except ValueError:
+            messagebox.showerror("エラー", "wave motor ヨー角の入力が不正です")
+            return
+        self.hl.send(HLSender.cmd_f32(HLCONTROL_CMD_SET_YAW_TARGET, y))
+
     def _send_c610_target(self):
         try:
             deg = float(self.c610_tgt_var.get())   # 原点からの差分角

@@ -2,88 +2,50 @@
 #include "socket.h"
 #include <string.h>
 
-#define HLCONTROL_MAX_PACKET_LEN 5U   /* 1(コマンド) + 4(float32) が最大 */
+#define HLCONTROL_MAX_PACKET_LEN 9U   /* 1(コマンド) + 8(float32 x2, 0x09) が最大 */
 
 static uint8_t s_sn;
 static TTLServoCAN_t   *s_ttl      = NULL;
-static WaveMotorCAN_t  *s_wave1    = NULL;
-static WaveMotorCAN_t  *s_wave2    = NULL;
-static GIM6010_t       *s_gim6010_a = NULL;   /* node_id 0x06 */
-static GIM6010_t       *s_gim6010_b = NULL;   /* node_id 0x07 */
-static GIM8018_t       *s_gim8018_c = NULL;   /* node_id 0x04 */
-static GIM8018_t       *s_gim8018_d = NULL;   /* node_id 0x05 */
+static WaveMotorCAN_t  *s_wave1    = NULL;   /* node_id 0x11 */
+static WaveMotorCAN_t  *s_wave2    = NULL;   /* node_id 0x12 */
 static C610Current_t   *s_c610      = NULL;   /* DJI C610 電流制御ブロック (CAN ID 0x01) */
 static C610Position_t  *s_c610_pos  = NULL;   /* DJI C610 位置制御コントローラ (AS5600 FB) */
 
-/* GIM6010/GIM8018の「初期位置」(ネイティブ=モーター軸turns)。HLControlUDP_Init()の
- * 引数でプログラム側(main.c)の固定値として渡され、以後変更されない(GUIからは設定不可)。
- * SET_*_PITCH_TARGET_DEGはこれに「ユーザー入力角度の偏差」を足した絶対値を
- * Set_Input_Posで送る(target = initial_native + 偏差)。
- * 実機の電源投入時の実位置とは無関係(単なる基準点のオフセット)。
- * 電源投入時は Set_Input_Pos を一切送らない。最初の Set_Input_Pos はユーザーが
- * 0x04/0x05 を送った瞬間から(下の s_gim6010_commanded / s_gim8018_commanded)。 */
-static float s_gim6010_a_initial_native = 0.0f;
-static float s_gim6010_b_initial_native = 0.0f;
-static float s_gim8018_c_initial_native = 0.0f;
-static float s_gim8018_d_initial_native = 0.0f;
-
-/* 各軸に最後に指令した絶対目標位置(ネイティブturns)。Init時はinitial_nativeで
- * 初期化し、SET_*_PITCH_TARGET_DEG処理のたびに更新する。
- * HLControlUDP_ResendLastTarget()が、GUIから新しいコマンドが来ない間もこの値を
- * 継続的に再送するために使う(旧gim_axis(node0)がSet_Input_Posを毎ループ送り
- * 続けていたのと同じ考え方。GIM8108-8側に入力タイムアウト/ウォッチドッグの
- * ような仕組みがあり、単発のコマンドだけでは目標を見失っている可能性がある
- * ため)。★ただしユーザーが一度も 0x04/0x05 を送っていない間は再送しない。 */
-static float s_gim6010_a_last_target = 0.0f;
-static float s_gim6010_b_last_target = 0.0f;
-static float s_gim8018_c_last_target = 0.0f;
-static float s_gim8018_d_last_target = 0.0f;
-
-/* ユーザーが 0x04(GIM6010) / 0x05(GIM8018) を一度でも受信したら1。
- * これが0の間は電源投入後の bring-up・ラウンドロビンとも Set_Input_Pos を送らない
- * (制御モード設定とクローズドループ移行だけ行い、位置はモーターが保持する)。
- * GIM8018 は C(0x04)/D(0x05) 別々に持つ: §4.2 grid 正規化に成功した軸は起動時に
- * HLControlUDP_SetGim8018Origin(home=1) が commanded を立てて「初期角度へ homing」する
- * (フォールバックした軸は立てない)。0x05 コマンド受信時は両軸を立てる。 */
-static uint8_t s_gim6010_commanded = 0U;
-static uint8_t s_gim8018_c_commanded = 0U;
-static uint8_t s_gim8018_d_commanded = 0U;
-
-/* GIM6010 (0x06/0x07) を起動時に「0度」(= initial_native と同じ小数部の最寄りグリッド点)
- * へ homing 済みか。1 になると HLControlUDP_Gim6010StartupHomeTick() は何もしない。 */
-static uint8_t s_gim6010_startup_homed = 0U;
-
-/* 「目標が変わってからまだ到達していない」= 高頻度再送の対象。到達 or タイムアウトで 0。
- * 目標を更新する箇所 (0x05 ハンドラ / HLControlUDP_SetGim8018Origin) で 1 にする。 */
-static uint8_t  s_gim8018_c_pending = 0U;
-static uint8_t  s_gim8018_d_pending = 0U;
-static uint32_t s_gim8018_c_pending_tick = 0U;
-static uint32_t s_gim8018_d_pending_tick = 0U;
-
-/* GIM6010 A/Bの「トリム前」の目標値(ネイティブturns、initial_native + HLコマンドの
- * 偏差)。HLControlUDP_UpdateGim6010Sync()が実測ズレから s_gim6010_sync_trim_native
- * を更新するたびに、ここから±trim/2を加減して s_gim6010_a/b_last_target を
- * 再計算し直す(HLコマンド自体はA/Bに全く同じ値を送る仕様なので、トリムは
- * この基準値には反映せず別枠で持つ)。 */
-static float s_gim6010_a_base_native = 0.0f;
-static float s_gim6010_b_base_native = 0.0f;
-
-/* A/Bの実測出力角のズレ(定常偏差)を消すための低速積分トリム(ネイティブturns)。
- * 正の値(B側の出力角がAより進んでいる)はAを+trim/2、Bを-trim/2する向き
- * (=A・Bを実測角度の差が縮まる方向に補正する。HLControlUDP_UpdateGim6010Sync参照)。
- * GIM6010_A/B_INITIAL_NATIVE_TURNS(OFFSET)そのものは変更しない。 */
-static float s_gim6010_sync_trim_native = 0.0f;
-
-/* 積分ゲイン。呼び出し1回あたり、実測ズレ[ネイティブturns]のこの割合をトリムに
- * 積算する。小さめにして発振を避ける(定常偏差を消すだけなので急ぐ必要はない)。 */
-#define HLCONTROL_GIM6010_SYNC_KI 0.02f
-/* トリム量の安全上限(ネイティブturns)。±0.05turn = 出力軸換算で±2.25deg相当。
- * 符号を間違えていた場合でもこの範囲に収まるよう小さめに設定してある。 */
-#define HLCONTROL_GIM6010_SYNC_TRIM_MAX_NATIVE 0.05f
-
-/* PCから1度でも高レベル制御コマンドを受信したら1になる(以後0に戻らない)。
- * 通信状態表示LED等の診断用。 */
+/* PCから1度でも高レベル制御コマンドを受信したら1になる(以後0に戻らない)。診断用。 */
 static uint8_t s_has_received = 0U;
+
+/* 0x11/0x12 差動機構の現在の目標ピッチ角・ヨー角 [deg] (出力軸換算)。
+ * 0x01=ピッチのみ / 0x08=ヨーのみ / 0x09=両方 を受けてどちらか(または両方)を更新する。 */
+static float s_wave_pitch_deg = 0.0f;
+static float s_wave_yaw_deg   = 0.0f;
+
+/* 差動キネマティクスで計算した各モータの目標オフセット角 [deg] (絶対原点180°から)。
+ * 実送信は HLControlUDP_WaveTick() が行う (ソフトスタート後)。 */
+static float   s_wave1_target_deg = 0.0f;
+static float   s_wave2_target_deg = 0.0f;
+static uint8_t s_wave_target_dirty = 0U;   /* 未送出の新しい目標があるか */
+
+/* ソフトスタート状態機械: 0=起動待ち, 1=オフセット0送信済み・整定待ち, 2=運用中 */
+static uint8_t  s_wave_phase = 0U;
+static uint32_t s_wave_phase_tick = 0U;
+static uint32_t s_wave_send_tick = 0U;   /* 直近に 0x11/0x12 へ目標を送った tick [ms] */
+static uint32_t s_wave_cmd_tick  = 0U;   /* 直近に目標が変わった tick [ms] (集中再送の起点) */
+
+/* 予算配分(ピッチ優先)を通した後の「実効ヨー角」[deg]。0x21 のヨー軸追従の目標。 */
+static float s_wave_yaw_effective_deg = 0.0f;
+/* ユーザーが 0x08 / 0x09 を一度でも送ったか (0x21 ヨー追従の同期開始条件)。 */
+static uint8_t s_wave_yaw_commanded = 0U;
+
+/* 0x21 (TTLサーボ) のヨー軸追従状態。 */
+static float    s_ttl_openclose_offset_deg = 0.0f;  /* 直近の open/close オフセット (-25 / +50) */
+static uint8_t  s_ttl_openclose_commanded  = 0U;    /* 0x02/0x03 を一度でも受けたか */
+static float    s_ttl_yaw_est_deg          = 0.0f;  /* 現在 0x21 に反映済みのヨー追従量の推定 [deg] */
+static uint32_t s_ttl_follow_last_tick     = 0U;    /* 直近に TtlYawFollowTick が走った tick [ms] */
+
+static float HLControl_Absf(float v)
+{
+    return (v < 0.0f) ? -v : v;
+}
 
 static float HLControl_ClampPitchDeg(float deg)
 {
@@ -96,129 +58,185 @@ static float HLControl_ClampPitchDeg(float deg)
     return deg;
 }
 
-static float HLControl_ClampGim6010PitchDeg(float deg)
+static float HLControl_ClampYawDeg(float deg)
 {
-    if (deg < HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG) {
-        return HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG;
+    if (deg < HLCONTROL_YAW_TARGET_MIN_DEG) {
+        return HLCONTROL_YAW_TARGET_MIN_DEG;
     }
-    if (deg > HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG) {
-        return HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG;
+    if (deg > HLCONTROL_YAW_TARGET_MAX_DEG) {
+        return HLCONTROL_YAW_TARGET_MAX_DEG;
     }
     return deg;
 }
 
-/* メインループ側のラウンドロビン再送(main.c)は約6秒に1回しか各軸を見に行かない
- * ため、その間にクローズドループから外れていると、目標値だけ送っても反映
- * されない(実機でクローズドループが0x07だけ外れる不具合として発現した)。
- * 新しい目標値を送る直前に、Heartbeatで実際に確認済みのaxis_state(受信のたびに
- * odrive_can.cが更新している)を見て、CLOSED_LOOP_CONTROLでなければその場で
- * モードを再設定する。既にCLOSED_LOOP_CONTROLなら何もしない(モード設定は不要な
- * 再設定を避けるため)。 */
-/* 電源投入(HAL_GetTick()=0)から HLCONTROL_MOTOR_CAN_START_MS 経過したら1。
- * それまでは GIM への CAN 送信(モード設定・クローズドループ移行・目標値)を
- * 一切行わない(電源電圧が安定しないため)。 */
-static uint8_t HLControl_MotorCanReady(void)
+/* s_wave_pitch_deg / s_wave_yaw_deg から 0x11・0x12 の目標オフセット角を差動
+ * キネマティクスで計算し、s_wave1/2_target_deg に格納する (CAN 送信はしない)。
+ *
+ * 差動機構: モータ角 = (ヨー=共通成分, 両軸同符号) ± (ピッチ=差動成分, 両軸逆符号)。
+ *   pm = WAVE_PITCH_DIR * WAVE_PITCH_GAIN * pitch   (差動成分)
+ *   ym = WAVE_YAW_DIR   * WAVE_YAW_GAIN   * yaw     (共通成分)
+ *   θ(0x11) = ym − pm ,  θ(0x12) = ym + pm
+ * 片側モータが受ける絶対角は |ym| + |pm| まで振れるので、ピッチ優先で
+ * HLCONTROL_WAVE_MOTOR_LIMIT_DEG の予算を配分する (まずピッチ、残りをヨー)。 */
+static void HLControl_RecomputeWaveTargets(void)
 {
-    return (HAL_GetTick() >= HLCONTROL_MOTOR_CAN_START_MS) ? 1U : 0U;
-}
+    float pitch = HLControl_ClampPitchDeg(s_wave_pitch_deg);
+    float yaw   = HLControl_ClampYawDeg(s_wave_yaw_deg);
 
-static void HLControl_EnsureGim6010ClosedLoop(GIM6010_t *g)
-{
-    if (g->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-        /* 移行時の飛び出し防止に現在位置を目標化してから入る。直後に本来の目標を
-         * 送るので、その1フレームで上書きされる。 */
-        GIM6010_EnterPositionControlHold(g);
+    float pm = HLCONTROL_WAVE_PITCH_DIR * HLCONTROL_WAVE_PITCH_GAIN * pitch;
+    float ym = HLCONTROL_WAVE_YAW_DIR   * HLCONTROL_WAVE_YAW_GAIN   * yaw;
+
+    float y_head;
+    if (pm >  HLCONTROL_WAVE_MOTOR_LIMIT_DEG) {
+        pm =  HLCONTROL_WAVE_MOTOR_LIMIT_DEG;
+    } else if (pm < -HLCONTROL_WAVE_MOTOR_LIMIT_DEG) {
+        pm = -HLCONTROL_WAVE_MOTOR_LIMIT_DEG;
     }
+    y_head = HLCONTROL_WAVE_MOTOR_LIMIT_DEG - HLControl_Absf(pm);
+    if (ym >  y_head) {
+        ym =  y_head;
+    } else if (ym < -y_head) {
+        ym = -y_head;
+    }
+
+    /* 予算配分後の実効ヨー角 (0x21 追従の目標)。dir*gain は既定 1.0 (定数)。 */
+    {
+        float k = HLCONTROL_WAVE_YAW_DIR * HLCONTROL_WAVE_YAW_GAIN;
+        s_wave_yaw_effective_deg = (k != 0.0f) ? (ym / k) : yaw;
+    }
+
+    s_wave1_target_deg = ym - pm;   /* 0x11 */
+    s_wave2_target_deg = ym + pm;   /* 0x12 */
+    s_wave_target_dirty = 1U;
+    s_wave_cmd_tick = HAL_GetTick();   /* 集中再送ウィンドウの起点 */
 }
 
-/* GIM8018 (0x04/0x05) の CLOSED_LOOP 維持・Set_Input_Pos 送信は
- * HLControlUDP_PeriodicResend() / HLControl_Gim8018DeliverTick() に一本化した
- * (startup ホーミング未確定の軸を弾く判定もそちら側)。 */
-
-/* s_gim6010_a/b_base_native と s_gim6010_sync_trim_native から実際に送る絶対位置を
- * 計算し直すだけで、CAN送信はしない。呼ぶだけならFDCAN TxFIFOを消費しないので、
- * 毎ループ呼ばれるHLControlUDP_UpdateGim6010Sync()から使う(送信は既存のラウンド
- * ロビン(main.cのHLControlUDP_ResendLastTarget呼び出し)が担当し、最大でも約6秒
- * 以内に反映される)。 */
-static void HLControl_RecomputeGim6010Targets(void)
+static void HLControl_SendWaveTargets(void)
 {
-    s_gim6010_a_last_target = s_gim6010_a_base_native + (s_gim6010_sync_trim_native * 0.5f);
-    s_gim6010_b_last_target = s_gim6010_b_base_native - (s_gim6010_sync_trim_native * 0.5f);
+    if (s_wave1 != NULL) {
+        WaveMotorCAN_SetTargetOffsetDeg(s_wave1, s_wave1_target_deg);
+    }
+    /* 0x11 と 0x12 を数十us差で立て続けに送ると、wave 基板の受信ポーリングが遅い場合に
+     * 片方しか拾えないことがある (C610 洪水下で顕著)。間に短い gap を入れて、基板側に
+     * 2 回別々の取り込み機会を与える。 */
+    if ((s_wave1 != NULL) && (s_wave2 != NULL)) {
+        HAL_Delay(2);
+    }
+    if (s_wave2 != NULL) {
+        WaveMotorCAN_SetTargetOffsetDeg(s_wave2, s_wave2_target_deg);
+    }
+    s_wave_target_dirty = 0U;
+    s_wave_send_tick = HAL_GetTick();
 }
 
-/* 上記の再計算に加えて、両軸へSet_Input_Posを即座に送る。GUIから新規コマンドを
- * 受信した直後(HLControl_HandlePacket、単発イベント)にのみ使うこと。毎ループ
- * 呼ぶとFDCAN TxFIFO(HW上3要素)を超えて他フレームを溢れさせる原因になるので、
- * 周期呼び出しにはHLControl_RecomputeGim6010Targets()を使うこと。 */
-static void HLControl_ApplyGim6010Targets(void)
+void HLControlUDP_WaveTick(void)
 {
-    HLControl_RecomputeGim6010Targets();
-    /* 起動直後(電圧不安定期間)は目標値を計算だけして送信しない。
-     * HLCONTROL_MOTOR_CAN_START_MS 経過後、main.c のラウンドロビン経由で送られる。 */
-    if (!HLControl_MotorCanReady()) {
+    uint32_t now = HAL_GetTick();
+
+    if (s_wave_phase == 0U) {
+        /* 起動直後: 基板自身の電源投入時ホーミングが落ち着くまで待ってから
+         * 明示的にオフセット 0 を1回送る (基板の原点とこちらの認識を一致させる)。 */
+        if (now < HLCONTROL_WAVE_HOME_START_MS) {
+            return;
+        }
+        if (s_wave1 != NULL) {
+            WaveMotorCAN_SetTargetOffsetDeg(s_wave1, 0.0f);
+        }
+        if (s_wave2 != NULL) {
+            WaveMotorCAN_SetTargetOffsetDeg(s_wave2, 0.0f);
+        }
+        s_wave_phase      = 1U;
+        s_wave_phase_tick = now;
         return;
     }
-    if (s_gim6010_a != NULL) {
-        HLControl_EnsureGim6010ClosedLoop(s_gim6010_a);
-        ODriveCAN_SetInputPos(&s_gim6010_a->odrv, s_gim6010_a_last_target, 0.0f, 0.0f);
+
+    if (s_wave_phase == 1U) {
+        /* オフセット 0 の整定待ち。この間の 0x01/0x08/0x09 は目標を記憶するだけ。 */
+        if ((now - s_wave_phase_tick) < HLCONTROL_WAVE_HOME_SETTLE_MS) {
+            return;
+        }
+        s_wave_phase = 2U;
+        HLControl_SendWaveTargets();   /* 整定完了。目標 (未指令なら 0) を送る */
+        return;
     }
-    if (s_gim6010_b != NULL) {
-        HLControl_EnsureGim6010ClosedLoop(s_gim6010_b);
-        ODriveCAN_SetInputPos(&s_gim6010_b->odrv, s_gim6010_b_last_target, 0.0f, 0.0f);
+
+    /* phase 2 (運用中):
+     *  - dirty (目標更新済み・未送出): WAVE_TICK_MS 以内に送る。
+     *  - コマンド後 WAVE_BURST_DURATION_MS の間: WAVE_BURST_MS 周期で集中再送
+     *    (C610 洪水で wave 基板が取りこぼすので何度も撒いて 1 発通す)。
+     *  - それ以降: WAVE_RESEND_MS 周期の定常再送 (単発ロストの保険)。 */
+    {
+        uint32_t interval;
+        if (s_wave_target_dirty) {
+            interval = HLCONTROL_WAVE_TICK_MS;
+        } else if ((now - s_wave_cmd_tick) < HLCONTROL_WAVE_BURST_DURATION_MS) {
+            interval = HLCONTROL_WAVE_BURST_MS;
+        } else {
+            interval = HLCONTROL_WAVE_RESEND_MS;
+        }
+        if ((now - s_wave_send_tick) >= interval) {
+            HLControl_SendWaveTargets();
+        }
     }
 }
 
-void HLControlUDP_Gim6010StartupHomeTick(void)
+/* 0x01/0x08/0x09 受信時に呼ぶ。目標を再計算するだけ (実送信は HLControlUDP_WaveTick)。 */
+static void HLControl_ApplyWaveCommand(void)
 {
-    float pea, peb, da, db, davg;
-    int32_t k;
+    HLControl_RecomputeWaveTargets();
+}
+
+/* 現在のヨー追従推定 s_ttl_yaw_est_deg と直近の open/close オフセットから、
+ * 0x21 (TTLサーボ) の目標オフセット角を 1 発送る。s_ttl==NULL なら何もしない。 */
+static void HLControl_ApplyTtlTarget(void)
+{
+    if (s_ttl == NULL) {
+        return;
+    }
+    TTLServoCAN_SetTargetOffsetDeg(
+        s_ttl, (HLCONTROL_TTL_YAW_FOLLOW_GAIN * s_ttl_yaw_est_deg) + s_ttl_openclose_offset_deg);
+}
+
+void HLControlUDP_TtlYawFollowTick(void)
+{
     uint32_t now;
+    float diff, step;
 
-    if (s_gim6010_startup_homed) {
+    /* ヨーも open/close も一度も来ていない間は 0x21 へ何も送らない (従来通り)。 */
+    if ((s_ttl == NULL) || (!s_wave_yaw_commanded && !s_ttl_openclose_commanded)) {
         return;
     }
-    if ((s_gim6010_a == NULL) || (s_gim6010_b == NULL) || !HLControl_MotorCanReady()) {
-        return;
-    }
-    /* A/B とも CLOSED_LOOP + 新鮮なエンコーダ + 低速 になってから (pos_estimate が有効な状態)。 */
-    if (!GIM6010_IsClosedLoop(s_gim6010_a) || !GIM6010_IsClosedLoop(s_gim6010_b)) {
-        return;
-    }
+
     now = HAL_GetTick();
-    if ((s_gim6010_a->odrv.last_encoder_tick == 0U) || ((now - s_gim6010_a->odrv.last_encoder_tick) > 300U) ||
-        (s_gim6010_b->odrv.last_encoder_tick == 0U) || ((now - s_gim6010_b->odrv.last_encoder_tick) > 300U)) {
+    if ((now - s_ttl_follow_last_tick) < HLCONTROL_TTL_FOLLOW_PERIOD_MS) {
         return;
     }
-    if ((s_gim6010_a->odrv.vel_estimate > 0.5f) || (s_gim6010_a->odrv.vel_estimate < -0.5f) ||
-        (s_gim6010_b->odrv.vel_estimate > 0.5f) || (s_gim6010_b->odrv.vel_estimate < -0.5f)) {
+    s_ttl_follow_last_tick = now;
+
+    diff = s_wave_yaw_effective_deg - s_ttl_yaw_est_deg;
+
+    /* 実効ヨーに十分追いついた: 送信しない (定常時バス負荷ゼロ)。 */
+    if (HLControl_Absf(diff) <= HLCONTROL_TTL_FOLLOW_SETTLE_DEG) {
         return;
     }
 
-    /* 「0度」= initial_native と同じ小数部を持つ最寄りグリッド点。A/B は機械的に結合して
-     * いるので同じ integer turn(k) を使う (davg で決める)。移動量は ≤ ~0.5 モーター回転。 */
-    pea  = s_gim6010_a->odrv.pos_estimate;
-    peb  = s_gim6010_b->odrv.pos_estimate;
-    da   = pea - s_gim6010_a_initial_native;
-    db   = peb - s_gim6010_b_initial_native;
-    davg = (da + db) * 0.5f;
-    k    = (int32_t)((davg >= 0.0f) ? (davg + 0.5f) : (davg - 0.5f));
+    /* 1周期あたりの最大移動量でクランプしてランプ (遅いヨー軸に 0x21 が先行しない)。 */
+    step = HLCONTROL_TTL_YAW_RAMP_RATE_DPS * ((float)HLCONTROL_TTL_FOLLOW_PERIOD_MS / 1000.0f);
+    if (diff >  step) {
+        diff =  step;
+    } else if (diff < -step) {
+        diff = -step;
+    }
+    s_ttl_yaw_est_deg += diff;
 
-    s_gim6010_a_initial_native += (float)k;   /* 以後の 0x04 はこの原点(0度)基準 */
-    s_gim6010_b_initial_native += (float)k;
-    s_gim6010_a_base_native     = s_gim6010_a_initial_native;
-    s_gim6010_b_base_native     = s_gim6010_b_initial_native;
-    s_gim6010_sync_trim_native  = 0.0f;
-    s_gim6010_commanded         = 1U;
-    s_gim6010_startup_homed     = 1U;
-    HLControl_ApplyGim6010Targets();          /* 即時 1 発。以後はラウンドロビン + Sync が維持 */
+    /* まだ一度も open/close していなければ、yaw_est の同期だけ進めて 0x21 へは送らない。 */
+    if (s_ttl_openclose_commanded) {
+        HLControl_ApplyTtlTarget();
+    }
 }
 
 void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
-                        TTLServoCAN_t *ttl, WaveMotorCAN_t *wave1, WaveMotorCAN_t *wave2,
-                        GIM6010_t *gim6010_a, GIM6010_t *gim6010_b,
-                        float gim6010_a_initial_native, float gim6010_b_initial_native,
-                        GIM8018_t *gim8018_c, GIM8018_t *gim8018_d,
-                        float gim8018_c_initial_native, float gim8018_d_initial_native)
+                        TTLServoCAN_t *ttl, WaveMotorCAN_t *wave1, WaveMotorCAN_t *wave2)
 {
     uint8_t nonblock = SOCK_IO_NONBLOCK;
 
@@ -226,31 +244,26 @@ void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
     s_ttl = ttl;
     s_wave1 = wave1;
     s_wave2 = wave2;
-    s_gim6010_a = gim6010_a;
-    s_gim6010_b = gim6010_b;
-    s_gim6010_a_initial_native = gim6010_a_initial_native;
-    s_gim6010_b_initial_native = gim6010_b_initial_native;
-    s_gim8018_c = gim8018_c;
-    s_gim8018_d = gim8018_d;
-    s_gim8018_c_initial_native = gim8018_c_initial_native;
-    s_gim8018_d_initial_native = gim8018_d_initial_native;
 
-    /* GUIからまだ一度もコマンドが来ていない間は、初期位置をそのまま「最後の目標値」
-     * として継続的に再送する(旧gim_axisが起動直後から現在位置を送り続けるのと同じ) */
-    s_gim6010_a_base_native = gim6010_a_initial_native;
-    s_gim6010_b_base_native = gim6010_b_initial_native;
-    s_gim6010_sync_trim_native = 0.0f;
-    s_gim6010_a_last_target = gim6010_a_initial_native;
-    s_gim6010_b_last_target = gim6010_b_initial_native;
-    s_gim8018_c_last_target = gim8018_c_initial_native;
-    s_gim8018_d_last_target = gim8018_d_initial_native;
-    s_gim8018_c_commanded = 0U;   /* 起動時ホーミング確定まで Set_Input_Pos を送らない */
-    s_gim8018_d_commanded = 0U;
-    s_gim6010_startup_homed = 0U;
+    s_wave_pitch_deg          = 0.0f;
+    s_wave_yaw_deg            = 0.0f;
+    s_wave1_target_deg        = 0.0f;
+    s_wave2_target_deg        = 0.0f;
+    s_wave_target_dirty       = 0U;
+    s_wave_phase              = 0U;
+    s_wave_phase_tick         = 0U;
+    s_wave_send_tick          = 0U;
+    s_wave_cmd_tick           = 0U;
+    s_wave_yaw_effective_deg  = 0.0f;
+    s_wave_yaw_commanded      = 0U;
+
+    s_ttl_openclose_offset_deg = 0.0f;
+    s_ttl_openclose_commanded  = 0U;
+    s_ttl_yaw_est_deg          = 0.0f;
+    s_ttl_follow_last_tick     = 0U;
 
     socket(s_sn, Sn_MR_UDP, listen_port, 0);
-    /* recvfrom()をノンブロッキングにする。can_udp_bridge.cと同じ理由
-     * (ブロッキングのままだとメインループの他の処理が止まってしまう) */
+    /* recvfrom()をノンブロッキングにする (can_udp_bridge.c と同じ理由)。 */
     ctlsocket(s_sn, CS_SET_IOMODE, &nonblock);
 }
 
@@ -258,31 +271,6 @@ void HLControlUDP_SetC610(C610Current_t *c610, C610Position_t *c610_pos)
 {
     s_c610     = c610;
     s_c610_pos = c610_pos;
-}
-
-void HLControlUDP_SetGim8018Origin(uint8_t which, float origin_native, uint8_t home)
-{
-    /* 起動時ホーミング状態機械が確定した「原点(= 絶対0度)」を受け取る。
-     * origin_native = center_native + round(pos_estimate - center_native)
-     *              (= 初期角度と同じ小数部を持つ最寄りグリッド点)。
-     * ★CLOSED_LOOP + 角度読み取り可 になったので、モーターを能動的に origin(0度) へ
-     *   ホーミングする (commanded=1, pending=1 → PeriodicResend/DeliverTick が
-     *   Set_Input_Pos(origin) を到達まで撒く)。移動量は必ず ≤0.5 モーター回転(出力軸±22.5°)。
-     * 以後の 0x05 は Set_Input_Pos = origin ± ユーザー角度。home 引数は未使用。 */
-    (void)home;
-    if (which == 0U) {
-        s_gim8018_c_initial_native = origin_native;
-        s_gim8018_c_last_target    = origin_native;
-        s_gim8018_c_commanded      = 1U;
-        s_gim8018_c_pending        = 1U;
-        s_gim8018_c_pending_tick   = HAL_GetTick();
-    } else {
-        s_gim8018_d_initial_native = origin_native;
-        s_gim8018_d_last_target    = origin_native;
-        s_gim8018_d_commanded      = 1U;
-        s_gim8018_d_pending        = 1U;
-        s_gim8018_d_pending_tick   = HAL_GetTick();
-    }
 }
 
 static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
@@ -301,83 +289,43 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&pitch_deg, &buf[1], sizeof(float));
-        pitch_deg = HLControl_ClampPitchDeg(pitch_deg);
+        /* 差動機構: ピッチ状態だけ更新し、ヨー状態は保持したまま両モータを再計算。 */
+        s_wave_pitch_deg = pitch_deg;
+        HLControl_ApplyWaveCommand();
+    } else if (cmd == HLCONTROL_CMD_SET_YAW_TARGET) {
+        float yaw_deg;
 
-        /* 0x11には符号反転した値、0x12にはそのままの値を送る
-         * (0x11と0x12は常に逆方向に同じ角度だけ回転させる運用のため) */
-        if (s_wave1 != NULL) {
-            WaveMotorCAN_SetTargetOffsetDeg(s_wave1, -pitch_deg);
+        if (len < (int32_t)(1U + sizeof(float))) {
+            return;
         }
-        if (s_wave2 != NULL) {
-            WaveMotorCAN_SetTargetOffsetDeg(s_wave2, pitch_deg);
+        memcpy(&yaw_deg, &buf[1], sizeof(float));
+        s_wave_yaw_deg = yaw_deg;
+        s_wave_yaw_commanded = 1U;   /* 0x21 ヨー追従の同期を開始してよい */
+        HLControl_ApplyWaveCommand();
+    } else if (cmd == HLCONTROL_CMD_SET_PITCH_YAW_TARGET) {
+        float pitch_deg;
+        float yaw_deg;
+
+        if (len < (int32_t)(1U + 2U * sizeof(float))) {
+            return;
         }
+        memcpy(&pitch_deg, &buf[1], sizeof(float));
+        memcpy(&yaw_deg, &buf[1 + sizeof(float)], sizeof(float));
+        /* ピッチとヨーを同時 (原子的) に更新。 */
+        s_wave_pitch_deg = pitch_deg;
+        s_wave_yaw_deg   = yaw_deg;
+        s_wave_yaw_commanded = 1U;
+        HLControl_ApplyWaveCommand();
     } else if (cmd == HLCONTROL_CMD_TTL_OPEN) {
-        if (s_ttl != NULL) {
-            TTLServoCAN_SetTargetOffsetDeg(s_ttl, HLCONTROL_TTL_OPEN_DEG);
-        }
+        /* 開閉状態を「開」に更新し、現在のヨー追従推定を足して 0x21 へ即時 1 発。
+         * 以後は HLControlUDP_TtlYawFollowTick() が 500ms ごとにヨー軸へランプ追従させながら再送。 */
+        s_ttl_openclose_offset_deg = HLCONTROL_TTL_OPEN_DEG;
+        s_ttl_openclose_commanded  = 1U;
+        HLControl_ApplyTtlTarget();
     } else if (cmd == HLCONTROL_CMD_TTL_CLOSE) {
-        if (s_ttl != NULL) {
-            TTLServoCAN_SetTargetOffsetDeg(s_ttl, HLCONTROL_TTL_CLOSE_DEG);
-        }
-    } else if (cmd == HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG) {
-        float pitch_deg;
-        float native_delta;
-
-        if (len < (int32_t)(1U + sizeof(float))) {
-            return;
-        }
-        memcpy(&pitch_deg, &buf[1], sizeof(float));
-        /* まず入力値そのものを-60〜0degにクランプし、そのあと符号反転してから
-         * 偏差計算に使う(要求仕様通り: 入力値は目標値と符号反転した値を渡す)。 */
-        pitch_deg = HLControl_ClampGim6010PitchDeg(pitch_deg);
-        pitch_deg = -pitch_deg;
-        /* 出力角[deg] -> ネイティブ(モーター軸)turnsの偏差。減速比8なので出力1回転(360°)
-         * = ネイティブ8turnsで、90°入力なら偏差は2.0になる (要求仕様通り) */
-        native_delta = (pitch_deg / 360.0f) * GIM6010_GEAR_RATIO;
-
-        /* 0x06・0x07とも「各軸の初期位置 + 偏差」を絶対位置のベースとする(全く同じ値)。
-         * GIM6010_t::odrvはネイティブturns基準なのでODriveCAN_SetInputPos()を直接
-         * 使う(GIM6010_SetOutputPos*()は出力軸換算=gear_ratio倍が入ってしまうため、
-         * 既にネイティブで計算済みのここでは使わない)。実際に送る値は
-         * HLControl_ApplyGim6010Targets()内でs_gim6010_sync_trim_nativeを加減した
-         * ものになる。 */
-        s_gim6010_a_base_native = s_gim6010_a_initial_native + native_delta;
-        s_gim6010_b_base_native = s_gim6010_b_initial_native + native_delta;
-        s_gim6010_commanded = 1U;   /* 以後ラウンドロビンが last_target を再送してよい */
-        HLControl_ApplyGim6010Targets();
-    } else if (cmd == HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG) {
-        float pitch_deg;
-        float native_delta;
-
-        if (len < (int32_t)(1U + sizeof(float))) {
-            return;
-        }
-        memcpy(&pitch_deg, &buf[1], sizeof(float));
-        /* GIM8018(GIM8108-8)は角度クランプなし。deg -> ネイティブ(モーター軸)turns。
-         * deg/360*8 = deg/45 (= 旧コードの ax_target[rad]/M_PI*4 と等価)。 */
-        native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
-
-        /* 目標 = 「原点(絶対0度) init」+「ユーザー入力角度」。init は起動時ホーミングが
-         * 確定した center_native と同じ小数部の値 (0.2 / 1.2 / -0.8 ...)。
-         * 例: 現在 0.4, init 0.2, ユーザー +1 → Set_Input_Pos = 1.2 (差分 0.8 動く)。
-         * ★C(0x04) と D(0x05) は逆向き: C = init_c + delta, D = init_d - delta。 */
-        s_gim8018_c_last_target = s_gim8018_c_initial_native + native_delta;
-        s_gim8018_d_last_target = s_gim8018_d_initial_native - native_delta;
-        s_gim8018_c_commanded = 1U;
-        s_gim8018_d_commanded = 1U;
-        /* ここでは CAN を一切送らない。目標を記憶して pending を立てるだけ。
-         * 実際の送信は HLControlUDP_PeriodicResend() が担当する:
-         *   - C→D を毎回入れ替え + 間に gap を入れて撒く (立て続け送信で D が落ちるのを防ぐ)
-         *   - pos_estimate が目標に十分近づいたら止める (定常状態はバス負荷ゼロ)
-         *   - CLOSED_LOOP から外れていたら入れ直してから撒く
-         * 起動時の電圧不安定期間 / startup ホーミング未確定の軸は PeriodicResend 側で弾く。
-         * ★早すぎる 0x05 (ホーミング確定前) は、確定時に SetGim8018Origin が
-         *   commanded/last_target/pending を上書きするので破棄される (ユーザーは再送が必要)。 */
-        {
-            uint32_t t = HAL_GetTick();
-            s_gim8018_c_pending = 1U;  s_gim8018_c_pending_tick = t;
-            s_gim8018_d_pending = 1U;  s_gim8018_d_pending_tick = t;
-        }
+        s_ttl_openclose_offset_deg = HLCONTROL_TTL_CLOSE_DEG;
+        s_ttl_openclose_commanded  = 1U;
+        HLControl_ApplyTtlTarget();
     } else if (cmd == HLCONTROL_CMD_SET_C610_CURRENT_A) {
         float amps;
 
@@ -386,8 +334,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
         }
         memcpy(&amps, &buf[1], sizeof(float));
         /* 手動電流モード: 位置制御を止めてから直接電流を指令する。
-         * 実際の CAN 送信は C610Current_Tick() が行う (電源投入から2秒間は送らない)。
-         * 負値も可 (C610 は符号付き int16 電流指令)。 */
+         * 実際の CAN 送信は C610Current_Tick() が行う (電源投入から2秒間は送らない)。 */
         if (s_c610_pos != NULL) {
             C610Position_SetEnabled(s_c610_pos, 0U);
         }
@@ -407,7 +354,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             C610Position_SetTargetOffsetDeg(s_c610_pos, offset_deg);
         }
     }
-    /* 未知のコマンドは無視する */
+    /* 未知のコマンド (旧 GIM 用 0x04 / 0x05 を含む) は無視する */
 }
 
 void HLControlUDP_Poll(void)
@@ -427,157 +374,4 @@ void HLControlUDP_Poll(void)
 uint8_t HLControlUDP_HasReceived(void)
 {
     return s_has_received;
-}
-
-/* 1 軸ぶんの配達確認つき再送。pending 中だけ動く。 */
-static void HLControl_Gim8018DeliverTick(GIM8018_t *g, float target_native,
-                                         uint8_t *pending, uint32_t pending_tick, uint32_t now)
-{
-    float err;
-
-    if (!*pending || (g == NULL)) {
-        return;
-    }
-    if (!GIM8018_IsStartupNormalized(g)) {
-        return;   /* startup ホーミング未確定。状態機械側に任せる */
-    }
-    /* 一度も応答の無いノードには送らない (応答が間欠的なだけなら送り続ける)。 */
-    if (!g->odrv.connected) {
-        return;
-    }
-    /* タイムアウト: これ以上は撒かない (ラウンドロビンの保険に委ねる)。 */
-    if ((now - pending_tick) > HLCONTROL_GIM8018_PENDING_TIMEOUT_MS) {
-        *pending = 0U;
-        return;
-    }
-    /* CLOSED_LOOP から外れていたら入れ直してから位置を撒く。
-     * axis_error が latch されていると CLOSED_LOOP を拒否されるので先にクリア。 */
-    if (g->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-        if (g->odrv.axis_error != 0U) {
-            (void)ODriveCAN_ClearErrors(&g->odrv);
-        }
-        GIM8018_EnterPositionControlHold(g);
-        return;
-    }
-    /* 到達したら止める (pos_estimate は CLOSED_LOOP なら有効)。 */
-    err = g->odrv.pos_estimate - target_native;
-    if (err < 0.0f) {
-        err = -err;
-    }
-    if (err < HLCONTROL_GIM8018_ARRIVE_TOL_NATIVE) {
-        *pending = 0U;
-        return;
-    }
-    ODriveCAN_SetInputPos(&g->odrv, target_native, 0.0f, 0.0f);
-}
-
-void HLControlUDP_PeriodicResend(void)
-{
-    static uint32_t last = 0U;
-    uint32_t now;
-
-    if (!HLControl_MotorCanReady()) {
-        return;
-    }
-    if (!s_gim8018_c_pending && !s_gim8018_d_pending) {
-        return;   /* 定常状態: バスに何も足さない */
-    }
-    now = HAL_GetTick();
-    if ((now - last) < HLCONTROL_GIM8018_RESEND_MS) {
-        return;
-    }
-    last = now;
-
-    /* C→D を立て続けに投げると D 側が落ちやすい (can_bus.c / AutoRetransmission=DISABLE)。
-     * 送信順を毎回入れ替え、間に短い gap を入れる。 */
-    {
-        static uint8_t c_first = 1U;
-        if (c_first) {
-            HLControl_Gim8018DeliverTick(s_gim8018_c, s_gim8018_c_last_target,
-                                         &s_gim8018_c_pending, s_gim8018_c_pending_tick, now);
-            HAL_Delay(3);
-            HLControl_Gim8018DeliverTick(s_gim8018_d, s_gim8018_d_last_target,
-                                         &s_gim8018_d_pending, s_gim8018_d_pending_tick, now);
-        } else {
-            HLControl_Gim8018DeliverTick(s_gim8018_d, s_gim8018_d_last_target,
-                                         &s_gim8018_d_pending, s_gim8018_d_pending_tick, now);
-            HAL_Delay(3);
-            HLControl_Gim8018DeliverTick(s_gim8018_c, s_gim8018_c_last_target,
-                                         &s_gim8018_c_pending, s_gim8018_c_pending_tick, now);
-        }
-        c_first = (uint8_t)(!c_first);
-    }
-}
-
-void HLControlUDP_ResendLastTarget(uint8_t index)
-{
-    /* 電源投入直後(電圧不安定期間)は GIM へ一切送らない。 */
-    if (!HLControl_MotorCanReady()) {
-        return;
-    }
-    /* ユーザーが一度も 0x04/0x05 を送っていない軸には Set_Input_Pos を送らない
-     * (電源投入後はクローズドループにするだけ。位置はモーターがその場で保持する)。 */
-    switch (index) {
-        case 0U:
-            if ((s_gim6010_a != NULL) && s_gim6010_commanded) {
-                ODriveCAN_SetInputPos(&s_gim6010_a->odrv, s_gim6010_a_last_target, 0.0f, 0.0f);
-            }
-            break;
-        case 1U:
-            if ((s_gim6010_b != NULL) && s_gim6010_commanded) {
-                ODriveCAN_SetInputPos(&s_gim6010_b->odrv, s_gim6010_b_last_target, 0.0f, 0.0f);
-            }
-            break;
-        case 2U:
-            /* ★§4.2: 起動時マルチターン正規化が済むまでは Set_Input_Pos を送らない
-             * (古い種のまま絶対目標を送ると暴走。正規化は main.c 側が進める)。
-             * commanded は grid 正規化成功時に SetGim8018Origin(home=1) が立てる
-             * (= 初期角度へ homing)、または 0x05 コマンド受信時に立つ。 */
-            if ((s_gim8018_c != NULL) && s_gim8018_c_commanded &&
-                GIM8018_IsStartupNormalized(s_gim8018_c) && s_gim8018_c->odrv.connected) {
-                ODriveCAN_SetInputPos(&s_gim8018_c->odrv, s_gim8018_c_last_target, 0.0f, 0.0f);
-            }
-            break;
-        default:  /* index 3 */
-            if ((s_gim8018_d != NULL) && s_gim8018_d_commanded &&
-                GIM8018_IsStartupNormalized(s_gim8018_d) && s_gim8018_d->odrv.connected) {
-                ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_last_target, 0.0f, 0.0f);
-            }
-            break;
-    }
-}
-
-void HLControlUDP_UpdateGim6010Sync(void)
-{
-    float pos_a_deg, pos_b_deg, error_deg, error_native;
-
-    if ((s_gim6010_a == NULL) || (s_gim6010_b == NULL)) {
-        return;
-    }
-    /* ユーザーが一度も 0x04 を送っていない間は目標値を送っていない(その場保持)ので、
-     * A/B 同期トリムも積分しない(ノイズでのワインドアップ防止)。 */
-    if (!s_gim6010_commanded) {
-        return;
-    }
-    /* どちらかがまだCLOSED_LOOP_CONTROLに入っていない間はpos_estimateが更新
-     * されていない(またはトルクが入っていない)可能性があるので何もしない。 */
-    if (!GIM6010_IsClosedLoop(s_gim6010_a) || !GIM6010_IsClosedLoop(s_gim6010_b)) {
-        return;
-    }
-
-    pos_a_deg = GIM6010_GetOutputPosDeg(s_gim6010_a);
-    pos_b_deg = GIM6010_GetOutputPosDeg(s_gim6010_b);
-    error_deg = pos_b_deg - pos_a_deg; /* 正 = Bの方が進んでいる */
-    error_native = (error_deg / 360.0f) * GIM6010_GEAR_RATIO;
-
-    s_gim6010_sync_trim_native += HLCONTROL_GIM6010_SYNC_KI * error_native;
-    if (s_gim6010_sync_trim_native > HLCONTROL_GIM6010_SYNC_TRIM_MAX_NATIVE) {
-        s_gim6010_sync_trim_native = HLCONTROL_GIM6010_SYNC_TRIM_MAX_NATIVE;
-    } else if (s_gim6010_sync_trim_native < -HLCONTROL_GIM6010_SYNC_TRIM_MAX_NATIVE) {
-        s_gim6010_sync_trim_native = -HLCONTROL_GIM6010_SYNC_TRIM_MAX_NATIVE;
-    }
-
-    /* ここではCAN送信はせず値の再計算のみ。実際の送信はmain.cのラウンドロビンが
-     * HLControlUDP_ResendLastTarget()経由で担当する(FDCAN TxFIFO溢れ対策)。 */
-    HLControl_RecomputeGim6010Targets();
 }
