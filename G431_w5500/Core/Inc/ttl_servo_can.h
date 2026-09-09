@@ -52,7 +52,7 @@ HAL_StatusTypeDef TTLServoCAN_SetTargetOffsetDeg(TTLServoCAN_t *s, float offset_
  * 交互に送信し続けるヘルパー。呼び出し側はメインループ毎回これを呼ぶだけでよい
  * (非ブロッキング)。内部でHAL_GetTick()を見て、半周期(period_ms/2)経過するたびに
  * SET_TARGETを1回だけ送る。
- *   例: TTLServoCAN_UpdateTargetOffsetToggleDeg(s, 50.0f, -25.0f, WAVE_MOTOR_SWING_PERIOD_MS)
+ *   例: TTLServoCAN_UpdateTargetOffsetToggleDeg(s, 50.0f, -25.0f, 2000U)
  */
 void TTLServoCAN_UpdateTargetOffsetToggleDeg(TTLServoCAN_t *s, float deg_a, float deg_b, uint32_t period_ms);
 
