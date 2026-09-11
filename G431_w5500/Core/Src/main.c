@@ -34,6 +34,7 @@
 #include "gim6010.h"
 #include "gim8018.h"
 #include "hl_control_udp.h"
+#include "ros2_link.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -249,6 +250,8 @@ static void Delay_WithCANPoll(uint32_t ms)
         HLControlUDP_Poll();
         GIM_StartupTick();
         HLControlUDP_ResendTick();   // 最後の目標値を ~300ms ごとに再送 (ウォッチドッグ feed)
+        ROS2Link_Poll();             // ROS2 0x01 受信 (未接続なら no-op)
+        ROS2Link_Tick();             // ROS2 0x81 送信 + FlushOneAxis (未接続なら no-op)
         HAL_Delay(5);
     }
 }
@@ -446,6 +449,11 @@ int main(void)
                      &gim8018_c, &gim8018_d,
                      GIM8018_C_INITIAL_NATIVE_TURNS, GIM8018_D_INITIAL_NATIVE_TURNS);
 
+  // ROS2 (sharmech) 連携。UDP 8888 で 0x01 polar を受信、8889 へ 0x81 feedback を
+  // 100Hz 自発送信。既存の CAN 層・5003 番プロトコルには影響しない (docs/mcu_spec.md §10.2)。
+  // フィードバック宛先は dest_ip (= ROS2 側 PC) と同じにしておく。
+  ROS2Link_Init(dest_ip);
+
   // 電源電圧安定待ち(起動から HLCONTROL_MOTOR_CAN_START_MS=2秒)後に、GIM への
   // クローズドループ投入を開始する。それまでは GIM へ CAN を一切送らない。
   GIM_StartupBringUp();
@@ -563,6 +571,8 @@ int main(void)
         HLControlUDP_Poll();
         GIM_StartupTick();          // 正規化完了後は即 return
         HLControlUDP_ResendTick();
+        ROS2Link_Poll();
+        ROS2Link_Tick();
 
   }
   /* USER CODE END 3 */

@@ -37,6 +37,10 @@ static uint8_t s_gim8018_c_armed = 0U, s_gim8018_d_armed = 0U;
 /* PCから1度でも高レベル制御コマンドを受信したら1になる(以後0に戻らない)。診断用。 */
 static uint8_t s_has_received = 0U;
 
+/* ROS2 (0x01 polar) から一度でも目標を受け取ったら1。以後 HLControlUDP_FlushOneAxis() が
+ * ラウンドロビン送信を行う。0 の間は FlushOneAxis は何もしない (従来挙動と完全一致)。 */
+static uint8_t s_ros2_active = 0U;
+
 static float HLControl_ClampGim6010PitchDeg(float deg)
 {
     if (deg < HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG) {
@@ -48,8 +52,8 @@ static float HLControl_ClampGim6010PitchDeg(float deg)
     return deg;
 }
 
-/* 0x06 (r 座標指令) で逆算した GIM8018 ピッチ角 [deg] を機構可動域にクランプする。
- * 0x05 (ピッチ生指令) はこのクランプを通さない (従来どおりクランプなし)。 */
+/* GIM8018 ピッチ角 [deg] を機構可動域 -50〜0deg にクランプする。
+ * 0x05 (ピッチ生指令) / 0x06 (r 座標指令) / ROS2 の全経路で通す。 */
 static float HLControl_ClampGim8018PitchDeg(float deg)
 {
     if (deg < HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG) {
@@ -66,6 +70,38 @@ static float HLControl_ClampUnit(float v)
     if (v > 1.0f)  { return 1.0f; }
     if (v < -1.0f) { return -1.0f; }
     return v;
+}
+
+/* ===== 簡易キネマティクス (0x06 / 0x07 / ROS2 0x01 共用)。係数は hl_control_udp.h ===== */
+
+/* z [m] → GIM6010 ピッチ角 [deg] (0〜70 にクランプ済み)。 z = A*sin(theta + phase) の逆。 */
+static float HLControl_ThetaDegFromZ(float z_m)
+{
+    float ratio = HLControl_ClampUnit(z_m / HLCONTROL_RZ_Z_AMPLITUDE_M);
+    float theta = (asinf(ratio) * HLCONTROL_RAD2DEG) - HLCONTROL_RZ_Z_PHASE_DEG;
+    return HLControl_ClampGim6010PitchDeg(theta);
+}
+
+/* r [m] → GIM8018 ピッチ角 [deg] (-50〜0 にクランプ済み)。 r = A*cos(phi + phase) + offset の逆。 */
+static float HLControl_PhiDegFromR(float r_m)
+{
+    float ratio = HLControl_ClampUnit((r_m - HLCONTROL_RZ_R_OFFSET_M) / HLCONTROL_RZ_R_AMPLITUDE_M);
+    float phi = (acosf(ratio) * HLCONTROL_RAD2DEG) - HLCONTROL_RZ_R_PHASE_DEG;
+    return HLControl_ClampGim8018PitchDeg(phi);
+}
+
+/* 順変換 (0x81 feedback 用)。 */
+static float HLControl_ZFromThetaDeg(float theta_deg)
+{
+    return HLCONTROL_RZ_Z_AMPLITUDE_M
+           * sinf((theta_deg + HLCONTROL_RZ_Z_PHASE_DEG) / HLCONTROL_RAD2DEG);
+}
+
+static float HLControl_RFromPhiDeg(float phi_deg)
+{
+    return (HLCONTROL_RZ_R_AMPLITUDE_M
+            * cosf((phi_deg + HLCONTROL_RZ_R_PHASE_DEG) / HLCONTROL_RAD2DEG))
+           + HLCONTROL_RZ_R_OFFSET_M;
 }
 
 /* 電源投入(HAL_GetTick()=0)から HLCONTROL_MOTOR_CAN_START_MS 経過したら1。
@@ -114,9 +150,8 @@ static void HLControl_CommandGim6010PitchDeg(float pitch_deg)
 
 /* GIM8018 (0x04/0x05) を「ピッチ角 [deg]」で指令する共通処理。
  * 0x05 ハンドラと全く同じ換算・順序 (偏差、C=原点+Δ / D=原点-Δ、node5(D) → 5ms → node4(C))。
- * do_clamp=1 のとき phi を -50〜0deg にクランプする (0x06 = r 座標指令の経路)。
- * 正規化未完了なら何もしない (0x05 と同じガード)。 */
-static void HLControl_CommandGim8018PitchDeg(float pitch_deg, uint8_t do_clamp)
+ * phi は常に -50〜0deg にクランプする。正規化未完了なら何もしない (0x05 と同じガード)。 */
+static void HLControl_CommandGim8018PitchDeg(float pitch_deg)
 {
     float native_delta;
 
@@ -124,9 +159,7 @@ static void HLControl_CommandGim8018PitchDeg(float pitch_deg, uint8_t do_clamp)
         ((s_gim8018_d != NULL) && !GIM8018_IsStartupNormalized(s_gim8018_d))) {
         return;
     }
-    if (do_clamp) {
-        pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);
-    }
+    pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);
     native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
     if (s_gim8018_d != NULL) {
@@ -140,6 +173,119 @@ static void HLControl_CommandGim8018PitchDeg(float pitch_deg, uint8_t do_clamp)
         HLControl_Command(&s_gim8018_c->odrv, s_gim8018_c_initial_native + native_delta,
                           &s_gim8018_c_target, &s_gim8018_c_armed);
     }
+}
+
+/* ===== ROS2 連携 (ros2_link.c から呼ばれる公開 API) ===== */
+
+void HLControlUDP_Ros2SetTargetsMeters(float r_m, float z_m)
+{
+    float theta_deg;
+    float phi_deg;
+    float d6;
+    float d8;
+
+    if (!HLControl_MotorCanReady()) {
+        return;
+    }
+    s_ros2_active = 1U;
+
+    theta_deg = HLControl_ThetaDegFromZ(z_m);   /* 0〜70deg クランプ済み */
+    phi_deg   = HLControl_PhiDegFromR(r_m);     /* -50〜0deg クランプ済み */
+    d6 = (-theta_deg / 360.0f) * GIM6010_GEAR_RATIO;
+    d8 = ( phi_deg   / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
+
+    /* 記憶のみ。CAN 送信は HLControlUDP_FlushOneAxis() / HLControlUDP_ResendTick() が行う。 */
+    if (s_gim6010_a != NULL) {
+        s_gim6010_a_target = s_gim6010_a_initial_native + d6;
+        s_gim6010_a_armed = 1U;
+    }
+    if (s_gim6010_b != NULL) {
+        s_gim6010_b_target = s_gim6010_b_initial_native + d6;
+        s_gim6010_b_armed = 1U;
+    }
+    /* GIM8018 は起動時マルチターン正規化が済むまで絶対位置を触らない (0x05 と同じガード)。 */
+    if (((s_gim8018_c == NULL) || GIM8018_IsStartupNormalized(s_gim8018_c)) &&
+        ((s_gim8018_d == NULL) || GIM8018_IsStartupNormalized(s_gim8018_d))) {
+        if (s_gim8018_c != NULL) {
+            s_gim8018_c_target = s_gim8018_c_initial_native + d8;
+            s_gim8018_c_armed = 1U;
+        }
+        if (s_gim8018_d != NULL) {
+            s_gim8018_d_target = s_gim8018_d_initial_native - d8;
+            s_gim8018_d_armed = 1U;
+        }
+    }
+}
+
+void HLControlUDP_FlushOneAxis(void)
+{
+    static uint8_t idx = 0U;
+
+    if (!s_ros2_active || !HLControl_MotorCanReady()) {
+        return;
+    }
+    /* node7(B) → node6(A) → node5(D) → node4(C)。ResendTick と同じ順 (低優先ノード先行)。 */
+    switch (idx & 3U) {
+    case 0U:
+        if (s_gim6010_b_armed && (s_gim6010_b != NULL)) {
+            (void)ODriveCAN_SetInputPos(&s_gim6010_b->odrv, s_gim6010_b_target, 0.0f, 0.0f);
+        }
+        break;
+    case 1U:
+        if (s_gim6010_a_armed && (s_gim6010_a != NULL)) {
+            (void)ODriveCAN_SetInputPos(&s_gim6010_a->odrv, s_gim6010_a_target, 0.0f, 0.0f);
+        }
+        break;
+    case 2U:
+        if (s_gim8018_d_armed && (s_gim8018_d != NULL)) {
+            (void)ODriveCAN_SetInputPos(&s_gim8018_d->odrv, s_gim8018_d_target, 0.0f, 0.0f);
+        }
+        break;
+    default:
+        if (s_gim8018_c_armed && (s_gim8018_c != NULL)) {
+            (void)ODriveCAN_SetInputPos(&s_gim8018_c->odrv, s_gim8018_c_target, 0.0f, 0.0f);
+        }
+        break;
+    }
+    idx = (uint8_t)((idx + 1U) & 3U);
+}
+
+void HLControlUDP_Ros2GetFeedback(float *r_m, float *z_m,
+                                  float *shoulder_rad, float *knee_rad,
+                                  uint8_t *ready, uint8_t *driver_error)
+{
+    uint8_t rdy = 1U;
+    uint8_t derr = 0U;
+    float theta_deg = 0.0f;
+    float phi_deg = 0.0f;
+
+    if (s_gim6010_a != NULL) {
+        theta_deg = -(((s_gim6010_a->odrv.pos_estimate - s_gim6010_a_initial_native)
+                       / GIM6010_GEAR_RATIO) * 360.0f);
+        if (s_gim6010_a->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) { rdy = 0U; }
+        if (s_gim6010_a->odrv.axis_error != 0U) { derr = 1U; }
+    }
+    if (s_gim6010_b != NULL) {
+        if (s_gim6010_b->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) { rdy = 0U; }
+        if (s_gim6010_b->odrv.axis_error != 0U) { derr = 1U; }
+    }
+    if (s_gim8018_c != NULL) {
+        phi_deg = ((s_gim8018_c->odrv.pos_estimate - s_gim8018_c_initial_native)
+                   / GIM8018_GEAR_RATIO_NOMINAL) * 360.0f;
+        if (!GIM8018_IsStartupNormalized(s_gim8018_c)) { rdy = 0U; }
+        if (s_gim8018_c->odrv.axis_error != 0U) { derr = 1U; }
+    }
+    if (s_gim8018_d != NULL) {
+        if (!GIM8018_IsStartupNormalized(s_gim8018_d)) { rdy = 0U; }
+        if (s_gim8018_d->odrv.axis_error != 0U) { derr = 1U; }
+    }
+
+    if (r_m != NULL)          { *r_m = HLControl_RFromPhiDeg(phi_deg); }
+    if (z_m != NULL)          { *z_m = HLControl_ZFromThetaDeg(theta_deg); }
+    if (shoulder_rad != NULL) { *shoulder_rad = phi_deg / HLCONTROL_RAD2DEG; }
+    if (knee_rad != NULL)     { *knee_rad = theta_deg / HLCONTROL_RAD2DEG; }
+    if (ready != NULL)        { *ready = rdy; }
+    if (driver_error != NULL) { *driver_error = derr; }
 }
 
 void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
@@ -241,7 +387,8 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&pitch_deg, &buf[1], sizeof(float));
-        native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;  /* クランプなし */
+        pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);  /* -50〜0deg にクランプ */
+        native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
         /* C(0x04) = 原点 + 偏差、D(0x05) = 原点 - 偏差。★node5(D) → 5ms → node4(C) の順。 */
         if (s_gim8018_d != NULL) {
@@ -257,7 +404,6 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
         }
     } else if (cmd == HLCONTROL_CMD_SET_R_TARGET_M) {
         float r_m;
-        float phi_deg;
 
         if (len < (int32_t)(1U + sizeof(float))) {
             return;
@@ -266,14 +412,10 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&r_m, &buf[1], sizeof(float));
-        /* r = A*cos(phi + phase)  =>  phi = acos(r/A) - phase。acos の定義域は [-1,1]。
-         * phi は GIM8018 経路で -50〜0deg にクランプされる。 */
-        phi_deg = (acosf(HLControl_ClampUnit(r_m / HLCONTROL_RZ_R_AMPLITUDE_M)) * HLCONTROL_RAD2DEG)
-                  - HLCONTROL_RZ_R_PHASE_DEG;
-        HLControl_CommandGim8018PitchDeg(phi_deg, 1U);
+        /* r [m] → phi [deg] (acos で逆変換、-50〜0deg クランプ) → 0x05 と同じ経路。 */
+        HLControl_CommandGim8018PitchDeg(HLControl_PhiDegFromR(r_m));
     } else if (cmd == HLCONTROL_CMD_SET_Z_TARGET_M) {
         float z_m;
-        float theta_deg;
 
         if (len < (int32_t)(1U + sizeof(float))) {
             return;
@@ -282,11 +424,8 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&z_m, &buf[1], sizeof(float));
-        /* z = A*sin(theta + phase)  =>  theta = asin(z/A) - phase。asin の定義域は [-1,1]。
-         * theta は 0x04 と同じ 0〜70deg クランプを通る。 */
-        theta_deg = (asinf(HLControl_ClampUnit(z_m / HLCONTROL_RZ_Z_AMPLITUDE_M)) * HLCONTROL_RAD2DEG)
-                    - HLCONTROL_RZ_Z_PHASE_DEG;
-        HLControl_CommandGim6010PitchDeg(theta_deg);
+        /* z [m] → theta [deg] (asin で逆変換、0〜70deg クランプ) → 0x04 と同じ経路。 */
+        HLControl_CommandGim6010PitchDeg(HLControl_ThetaDegFromZ(z_m));
     }
     /* 未知のコマンドは無視する */
 }

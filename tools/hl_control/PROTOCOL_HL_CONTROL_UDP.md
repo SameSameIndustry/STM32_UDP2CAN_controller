@@ -47,9 +47,11 @@ STM32のIPアドレスは他の通信 (CAN-UDPブリッジ等) と共通 (`main.
 | `TTL_OPEN` | CAN ID `0x21` (TTLサーボ) へ、`SET_TARGET` (絶対原点180°固定からのオフセット、`CAN_PROTOCOL_TTL-SERVO.md` 準拠) でオフセット `-25.0°` を送信する。 |
 | `TTL_CLOSE` | 同じくCAN ID `0x21` へ、オフセット `+50.0°` を送信する。 |
 | `SET_GIM6010_PITCH_TARGET_DEG` (value=deg) | `deg` を `0.0 〜 +70.0` の範囲にクランプしてから、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM6010_GEAR_RATIO`) を計算する。CAN ID `0x06`・`0x07` の両方へ、ODrive CAN Simpleの `Set_Input_Pos` (絶対位置、ネイティブturns) で `(各軸の初期位置) + delta` を送信する(**0x06と0x07は全く同じ目標値**、符号反転はしない)。例: 初期位置がどちらも0のとき、90°を送ると `delta = 90/360*8 = 2.0` となり、0x06・0x07ともに目標値は+2.0になる。 |
-| `SET_GIM8018_PITCH_TARGET_DEG` (value=deg) | **クランプせず**、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM8018_GEAR_RATIO_NOMINAL`) を計算する。CAN ID `0x04` へ `(0x04の初期位置) + delta` を、CAN ID `0x05` へ `(0x05の初期位置) - delta` (**符号反転・同じ大きさ**、GIM6010とは逆に互い違い) を、それぞれ`Set_Input_Pos`で送信する。例: 初期位置がどちらも0のとき、90°を送ると `delta = 2.0` となり、0x04の目標値は+2.0、0x05の目標値は-2.0になる。 |
-| `SET_R_TARGET_M` (value=r [m]) | 簡易キネマティクス `r = 0.33·cos(phi + 60°)` の逆変換で `phi = acos(clamp(r/0.33, -1, 1))·180/π − 60°` を求め、**`phi` を `-50° 〜 0°` にクランプ**してから、`SET_GIM8018_PITCH_TARGET_DEG` と同じ経路 (C=原点+Δ / D=原点−Δ) で送信する。`phi` の可動域は機構由来。係数は `hl_control_udp.h` の `HLCONTROL_RZ_R_AMPLITUDE_M` / `HLCONTROL_RZ_R_PHASE_DEG`。r の有効範囲は約 `0.165 〜 0.325 m`。 |
+| `SET_GIM8018_PITCH_TARGET_DEG` (value=deg) | `deg` を **`-50.0 〜 0.0` の範囲にクランプ**してから (2026-09-11〜。以前はクランプなしだった)、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM8018_GEAR_RATIO_NOMINAL`) を計算する。CAN ID `0x04` へ `(0x04の初期位置) + delta` を、CAN ID `0x05` へ `(0x05の初期位置) - delta` (**符号反転・同じ大きさ**、GIM6010とは逆に互い違い) を、それぞれ`Set_Input_Pos`で送信する。例: 初期位置がどちらも0のとき、-30°を送ると `delta = -30/360*8 ≈ -0.667` となり、0x04の目標値は約-0.667、0x05の目標値は約+0.667になる。 |
+| `SET_R_TARGET_M` (value=r [m]) | 簡易キネマティクス `r = 2·0.33·cos(phi + 60°) + 0.2` の逆変換で `phi = acos(clamp((r-0.2)/0.66, -1, 1))·180/π − 60°` を求め、**`phi` を `-50° 〜 0°` にクランプ**してから、`SET_GIM8018_PITCH_TARGET_DEG` と同じ経路 (C=原点+Δ / D=原点−Δ) で送信する。`phi` の可動域は機構由来。係数は `hl_control_udp.h` の `HLCONTROL_RZ_R_AMPLITUDE_M` / `HLCONTROL_RZ_R_PHASE_DEG` / `HLCONTROL_RZ_R_OFFSET_M`。r の有効範囲は約 `0.53 〜 0.85 m`。 |
 | `SET_Z_TARGET_M` (value=z [m]) | 簡易キネマティクス `z = 0.12·sin(theta + 10°)` の逆変換で `theta = asin(clamp(z/0.12, -1, 1))·180/π − 10°` を求め、`SET_GIM6010_PITCH_TARGET_DEG` と**同じ `0° 〜 70°` クランプ**を通してから、同じ経路 (0x06・0x07 とも 初期位置+Δ) で送信する。係数は `hl_control_udp.h` の `HLCONTROL_RZ_Z_AMPLITUDE_M` / `HLCONTROL_RZ_Z_PHASE_DEG`。z の有効範囲は約 `0.021 〜 0.118 m`。 |
+
+**GIM6010 は全経路 `0° 〜 70°`、GIM8018 は全経路 `-50° 〜 0°` にクランプされる** (0x04/0x05/0x06/0x07、および後述の ROS2 0x01 も共通)。
 
 0x06・0x07 / 0x04・0x05それぞれの「初期位置」(ネイティブturns) は本プロトコルでは
 設定できない。STM32側 [`main.c`](../../G431_w5500/Core/Src/main.c) の
@@ -103,11 +105,34 @@ sock.sendto(struct.pack("<Bf", CMD_SET_GIM6010_PITCH_TARGET_DEG, 90.0), (STM32_I
 # GIM8018のピッチ角目標値を90degに設定 (0x04は初期位置+2.0、0x05は初期位置-2.0が送られる)
 sock.sendto(struct.pack("<Bf", CMD_SET_GIM8018_PITCH_TARGET_DEG, 90.0), (STM32_IP, HLCONTROL_PORT))
 
-# r 座標 0.30m を指令 (STM32側で phi = acos(0.30/0.33) - 60° ≈ -34.5° を逆算し -50〜0° にクランプ)
-sock.sendto(struct.pack("<Bf", CMD_SET_R_TARGET_M, 0.30), (STM32_IP, HLCONTROL_PORT))
+# r 座標 0.70m を指令 (STM32側で phi = acos((0.70-0.2)/0.66) - 60° ≈ -19.6° を逆算し -50〜0° にクランプ)
+sock.sendto(struct.pack("<Bf", CMD_SET_R_TARGET_M, 0.70), (STM32_IP, HLCONTROL_PORT))
 
 # z 座標 0.08m を指令 (STM32側で theta = asin(0.08/0.12) - 10° ≈ 31.8° を逆算し 0〜70° にクランプ)
 sock.sendto(struct.pack("<Bf", CMD_SET_Z_TARGET_M, 0.08), (STM32_IP, HLCONTROL_PORT))
 ```
 
-r,z 用の対話 GUI: [`tools/hl_control/rz_control.py`](rz_control.py)
+r,z 用の対話 GUI (5003番、本プロトコル): [`tools/hl_control/rz_control.py`](rz_control.py)
+
+## ROS2 (sharmech) 連携との関係
+
+本プロトコル (5003番) とは別に、r/z 基板は ROS2 (sharmech) スタックとの通信も実装している
+(`ros2_link.c/.h` + `ros2_protocol.h`)。仕様の正本は `sharmech/docs/mcu_spec.md` §3
+(protocol_version=2)。**この基板は r,z のみ使う** (θ/pitch/yaw/gripper はθ基板 192.168.1.101 の担当)。
+
+| 項目 | 値 |
+|---|---|
+| 受信 (ROS2 → MCU) | UDP **8888** 番、`packet_type=0x01` polar packet (60byte)。mcu_spec は100Hzを想定するが、W5500ソケットバッファ・CANバス負荷に余裕を持たせるため**初版は10Hzまで間引く運用** (ROS2側の送信周期をこれに合わせる) |
+| 送信 (MCU → ROS2) | UDP **8889** 番 (フィードバック宛先 = `main.c` の `dest_ip`)、`packet_type=0x81` feedback packet (64byte)、**マイコン起動直後から自発送信 (既定10Hz、`ROS2_LINK_FB_PERIOD_MS`)** |
+| STM32側ソケット番号 | `4` (`ROS2_LINK_SN`) |
+| 0x01 → r,z の扱い | `control_flags` bit0=0 またはビット2=1 の間はホールド (目標を更新しない)。bit0=1・bit2=0 のときだけ `payload.r`,`payload.z` を [m] のまま `HLControlUDP_Ros2SetTargetsMeters()` に渡す (5003番の 0x06/0x07 と同じ逆変換・クランプ) |
+| CAN 送信 | ラウンドロビンで 1 tick (~5ms) に 1 軸だけ送信 (`HLControlUDP_FlushOneAxis()`)。5003番のような HAL_Delay を挟んだ一括送信はしない |
+| 0x81 → 埋めるもの | `r`,`z` (GIM の `pos_estimate` からの順運動学)、`joint_positions[shoulder_left/right]` = phi[rad]、`joint_positions[knee_left/right]` = theta[rad]、`status_flags` (bit1 ドライバ異常, bit2 ウォッチドッグ, bit3 未初期化, bit4 直近破棄)。`theta`,`pitch`,`yaw`,`gripper_state`,`joint_positions[turntable]` は 0 (θ基板の担当) |
+
+**初版でやっていないこと** (`ros2_link.h` のコメント参照):
+mcu_spec §4.2 の速度補間・§4.4 のスルーレート制限 (受信位置をそのまま目標にする)、
+0x02 (関節指令、黙って破棄)、§4.6 の初期位置移動 (`control_flags` bit2 は暫定的に
+「ホールド」として扱い、`status_flags` bit5 は立てない)、pitch/yaw の連続値。
+
+試験用 GUI (ROS2 役のスタブ、8888 送信 / 8889 受信):
+[`tools/hl_control/ros2_rz_control.py`](ros2_rz_control.py)

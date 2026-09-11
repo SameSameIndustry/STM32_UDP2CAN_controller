@@ -5,8 +5,8 @@ r/z 座標コントローラ GUI (192.168.1.100 の r/z 基板専用)。
 STM32 側が簡易キネマティクスの逆変換とクランプを行うので、この GUI は座標 [m] を
 そのまま送るだけ (fire-and-forget、STM32 からの応答は無い)。
 
-  z [m] = 0.12 * sin(theta + 10deg)   theta = GIM6010 ピッチ角 [deg]、STM32側で 0〜70deg クランプ
-  r [m] = 0.33 * cos(phi   + 60deg)   phi   = GIM8018 ピッチ角 [deg]、STM32側で -50〜0deg クランプ
+  z [m] = 0.12 * sin(theta + 10deg)          theta = GIM6010 ピッチ角 [deg]、STM32側で 0〜70deg クランプ
+  r [m] = 2*0.33 * cos(phi + 60deg) + 0.2    phi   = GIM8018 ピッチ角 [deg]、STM32側で -50〜0deg クランプ
 
 係数の正本は STM32 側 hl_control_udp.h (HLCONTROL_RZ_*)。ここの値は表示・スライダ範囲用の複製。
 仕様: tools/hl_control/PROTOCOL_HL_CONTROL_UDP.md
@@ -26,11 +26,12 @@ from tkinter import ttk
 CMD_SET_R_TARGET_M = 0x06
 CMD_SET_Z_TARGET_M = 0x07
 
-# --- 簡易キネマティクス係数 (STM32側 HLCONTROL_RZ_* と一致させること) ---
+# --- 簡易キネマティクス係数 (STM32側 hl_control_udp.h の HLCONTROL_RZ_* と一致させること) ---
 Z_AMPLITUDE_M = 0.12
 Z_PHASE_DEG = 10.0
-R_AMPLITUDE_M = 0.33
+R_AMPLITUDE_M = 2.0 * 0.33   # = 0.66
 R_PHASE_DEG = 60.0
+R_OFFSET_M = 0.2
 
 # STM32 側のクランプ範囲 (deg)
 GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 70.0
@@ -44,8 +45,8 @@ def clamp(v, lo, hi):
 
 
 def r_to_phi_deg(r_m):
-    """STM32 と同じ逆変換: phi = acos(clamp(r/A, -1, 1)) - phase、その後 -50〜0deg クランプ。"""
-    ratio = clamp(r_m / R_AMPLITUDE_M, -1.0, 1.0)
+    """STM32 と同じ逆変換: phi = acos(clamp((r-offset)/A, -1, 1)) - phase、その後 -50〜0deg クランプ。"""
+    ratio = clamp((r_m - R_OFFSET_M) / R_AMPLITUDE_M, -1.0, 1.0)
     phi = math.degrees(math.acos(ratio)) - R_PHASE_DEG
     return clamp(phi, GIM8018_MIN_DEG, GIM8018_MAX_DEG)
 
@@ -58,8 +59,8 @@ def z_to_theta_deg(z_m):
 
 
 # スライダの端 = クランプ後の角度が端に一致する座標 (端の外を出しても STM32 が弾く)
-R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))  # phi=0  -> 0.165
-R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG))  # phi=-50 -> 0.325
+R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG)) + R_OFFSET_M  # phi=0   -> 0.53
+R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG)) + R_OFFSET_M  # phi=-50 -> 0.85
 Z_MIN_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MIN_DEG + Z_PHASE_DEG))  # theta=0  -> 0.021
 Z_MAX_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MAX_DEG + Z_PHASE_DEG))  # theta=70 -> 0.118
 
