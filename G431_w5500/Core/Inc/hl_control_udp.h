@@ -118,9 +118,12 @@ extern "C" {
 #define HLCONTROL_WAVE_BURST_DURATION_MS  700U
 #define HLCONTROL_WAVE_RESEND_MS          200U
 
-/* open/closeボタンで送るTTLサーボのオフセット値 (仕様通り: open=-25deg, close=+50deg) */
-#define HLCONTROL_TTL_OPEN_DEG   (-25.0f)
-#define HLCONTROL_TTL_CLOSE_DEG   (50.0f)
+/* open/closeボタンで送るTTLサーボのオフセット値。
+ * ★2026-09-11 実機確認: 元の割り当て (open=-25deg, close=+50deg) だと実際の開閉が
+ * 逆になっていたため、ここで入れ替えて補正する (呼び出し側の TTL_OPEN/TTL_CLOSE/
+ * SetGripperClosed はすべてこの2つの定数を経由するので、ここを直すだけで全経路が直る)。 */
+#define HLCONTROL_TTL_OPEN_DEG   (50.0f)
+#define HLCONTROL_TTL_CLOSE_DEG   (-25.0f)
 
 /* 0x21 (TTLサーボ) の 0x11/0x12 ヨー軸追従 (HLControlUDP_TtlYawFollowTick)。
  * 0x21 の目標オフセット角 = TTL_YAW_FOLLOW_GAIN * yaw_est + 直近の open/close オフセット。
@@ -157,6 +160,36 @@ void HLControlUDP_TtlYawFollowTick(void);
 /* PCから1度でも高レベル制御コマンドを受信済みなら1を返す。通信状態表示LED等に使う診断用。
  * 一度1になったら以後0に戻ることはない。 */
 uint8_t HLControlUDP_HasReceived(void);
+
+/* ===== ROS2 連携 (ros2_link.c) 用の公開 API。docs/mcu_spec.md §10.3。
+ * いずれも既存ハンドラ (0x07 / 0x02・0x03 / 0x09) と全く同じ経路・換算を通す薄いラッパー。 ===== */
+
+/* 0x07 ハンドラと同じ (C610 カスケード位置制御、原点からの差分角 [deg])。 */
+void HLControlUDP_SetC610TargetOffsetDeg(float offset_deg);
+
+/* 0x02/0x03 ハンドラと同じ (TTLサーボ開閉。closed=0→開、closed=1→閉)。 */
+void HLControlUDP_SetGripperClosed(uint8_t closed);
+
+/* 0x09 ハンドラと同じ (0x11/0x12 差動機構のピッチ・ヨーを原子的に更新)。 */
+void HLControlUDP_SetWristPitchYawDeg(float pitch, float yaw);
+
+/* AS5600 由来の現在測定角 [deg] (0x81 の FK 用)。C610 未登録なら 0。 */
+float HLControlUDP_GetC610MeasDeg(void);
+
+/* C610 カスケード位置制御の現在の目標絶対角 [deg] (追従誤差判定用)。C610 未登録なら 0。 */
+float HLControlUDP_GetC610TargetDeg(void);
+
+/* C610 カスケード位置制御の原点角 [deg] (main.c の C610_POS_ORIGIN_DEG、順運動学用)。 */
+float HLControlUDP_GetC610OriginDeg(void);
+
+/* AS5600 サンプルが C610_POS_FEEDBACK_TIMEOUT_MS 以内に届いているか (=1)。 */
+uint8_t HLControlUDP_IsC610FeedbackAlive(void);
+
+/* C610 位置制御コントローラが有効化されているか (0x07 を一度でも受けたか)。 */
+uint8_t HLControlUDP_IsC610Enabled(void);
+
+/* 直近の open/close 指令の状態 (0=開, 1=閉)。一度も指令していなければ 0。 */
+uint8_t HLControlUDP_IsGripperClosed(void);
 
 #ifdef __cplusplus
 }

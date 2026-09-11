@@ -32,3 +32,10 @@ _autosave-*
 *.hex
 *.map
 *.list
+
+# 別管理の外部リポジトリ (SameSameIndustry/sharmech) — この親リポジトリでは追跡しない
+/sharmech/
+
+# Python
+__pycache__/
+*.pyc

@@ -34,6 +34,7 @@
 #include "wave_motor_can.h"
 #include "hl_control_udp.h"
 #include "as5600.h"
+#include "ros2_link.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -281,6 +282,8 @@ static void Delay_WithCANPoll(uint32_t ms)
         C610Position_Failsafe(&c610_pos, HAL_GetTick()); // AS5600 サンプル停止時は電流を0に
         C610Current_Tick(&c610_current); // DJI C610(0x01) 電流指令の送出 (起動後2秒間は無送信)。
                                          // C610はコマンド途絶で停止するため ~5ms 間隔で送り続ける
+        ROS2Link_Poll();                 // ROS2 0x01 受信 (未接続なら no-op)
+        ROS2Link_Tick();                 // ROS2 0x81 送信 (未接続なら no-op)
         HAL_Delay(5);
     }
 }
@@ -432,6 +435,11 @@ int main(void)
   // AS5600 磁気エンコーダ (ソフトウェアI2C: SCL=PA15, SDA=PB7)。
   // 角度は AS5600_StreamTick() が UDPポート5004へ周期送信する。
   AS5600_Init();
+
+  // ROS2 (sharmech) 連携。UDP 8888 で 0x01 polar (theta/gripper/bit1) を受信、
+  // 8889 へ 0x81 feedback を送信。既存の CAN 層・5003 番プロトコルには影響しない
+  // (docs/mcu_spec.md §10.3)。フィードバック宛先は dest_ip (= ROS2 側 PC) と同じにしておく。
+  ROS2Link_Init(dest_ip);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -516,6 +524,8 @@ int main(void)
         // コントローラ(C610Position_Update)または手動コマンド(0x06)が設定する。
         C610Position_Failsafe(&c610_pos, HAL_GetTick());
         C610Current_Tick(&c610_current);
+        ROS2Link_Poll();
+        ROS2Link_Tick();
 
   }
   /* USER CODE END 3 */

@@ -37,8 +37,9 @@ static float s_wave_yaw_effective_deg = 0.0f;
 static uint8_t s_wave_yaw_commanded = 0U;
 
 /* 0x21 (TTLサーボ) のヨー軸追従状態。 */
-static float    s_ttl_openclose_offset_deg = 0.0f;  /* 直近の open/close オフセット (-25 / +50) */
+static float    s_ttl_openclose_offset_deg = 0.0f;  /* 直近の open/close オフセット (HLCONTROL_TTL_*_DEG) */
 static uint8_t  s_ttl_openclose_commanded  = 0U;    /* 0x02/0x03 を一度でも受けたか */
+static uint8_t  s_gripper_closed           = 0U;    /* 直近の開閉状態 (0=開,1=閉)。0x81 feedback 用 */
 static float    s_ttl_yaw_est_deg          = 0.0f;  /* 現在 0x21 に反映済みのヨー追従量の推定 [deg] */
 static uint32_t s_ttl_follow_last_tick     = 0U;    /* 直近に TtlYawFollowTick が走った tick [ms] */
 
@@ -321,10 +322,12 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
          * 以後は HLControlUDP_TtlYawFollowTick() が 500ms ごとにヨー軸へランプ追従させながら再送。 */
         s_ttl_openclose_offset_deg = HLCONTROL_TTL_OPEN_DEG;
         s_ttl_openclose_commanded  = 1U;
+        s_gripper_closed = 0U;
         HLControl_ApplyTtlTarget();
     } else if (cmd == HLCONTROL_CMD_TTL_CLOSE) {
         s_ttl_openclose_offset_deg = HLCONTROL_TTL_CLOSE_DEG;
         s_ttl_openclose_commanded  = 1U;
+        s_gripper_closed = 1U;
         HLControl_ApplyTtlTarget();
     } else if (cmd == HLCONTROL_CMD_SET_C610_CURRENT_A) {
         float amps;
@@ -374,4 +377,64 @@ void HLControlUDP_Poll(void)
 uint8_t HLControlUDP_HasReceived(void)
 {
     return s_has_received;
+}
+
+/* ===== ROS2 連携 (ros2_link.c) 用の公開 API。既存ハンドラと同じ経路・換算を呼ぶだけ。 ===== */
+
+void HLControlUDP_SetC610TargetOffsetDeg(float offset_deg)
+{
+    if (s_c610_pos != NULL) {
+        C610Position_SetTargetOffsetDeg(s_c610_pos, offset_deg);
+    }
+}
+
+void HLControlUDP_SetGripperClosed(uint8_t closed)
+{
+    /* HLCONTROL_CMD_TTL_OPEN/CLOSE ハンドラと全く同じ処理。 */
+    s_ttl_openclose_offset_deg = closed ? HLCONTROL_TTL_CLOSE_DEG : HLCONTROL_TTL_OPEN_DEG;
+    s_ttl_openclose_commanded  = 1U;
+    s_gripper_closed = closed ? 1U : 0U;
+    HLControl_ApplyTtlTarget();
+}
+
+void HLControlUDP_SetWristPitchYawDeg(float pitch, float yaw)
+{
+    /* HLCONTROL_CMD_SET_PITCH_YAW_TARGET ハンドラと全く同じ処理。 */
+    s_wave_pitch_deg = pitch;
+    s_wave_yaw_deg   = yaw;
+    s_wave_yaw_commanded = 1U;
+    HLControl_ApplyWaveCommand();
+}
+
+float HLControlUDP_GetC610MeasDeg(void)
+{
+    return (s_c610_pos != NULL) ? s_c610_pos->meas_deg : 0.0f;
+}
+
+float HLControlUDP_GetC610TargetDeg(void)
+{
+    return (s_c610_pos != NULL) ? s_c610_pos->target_deg : 0.0f;
+}
+
+float HLControlUDP_GetC610OriginDeg(void)
+{
+    return (s_c610_pos != NULL) ? s_c610_pos->origin_deg : 0.0f;
+}
+
+uint8_t HLControlUDP_IsC610FeedbackAlive(void)
+{
+    if (s_c610_pos == NULL) {
+        return 0U;
+    }
+    return ((HAL_GetTick() - s_c610_pos->last_ok_tick) < C610_POS_FEEDBACK_TIMEOUT_MS) ? 1U : 0U;
+}
+
+uint8_t HLControlUDP_IsC610Enabled(void)
+{
+    return (s_c610_pos != NULL) ? s_c610_pos->enabled : 0U;
+}
+
+uint8_t HLControlUDP_IsGripperClosed(void)
+{
+    return s_gripper_closed;
 }

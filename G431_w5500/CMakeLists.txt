@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/wave_motor_can.c
     Core/Src/hl_control_udp.c
     Core/Src/as5600.c
+    Core/Src/ros2_link.c
 )
 
 # Add include paths

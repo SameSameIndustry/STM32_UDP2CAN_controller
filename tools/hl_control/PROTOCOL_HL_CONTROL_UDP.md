@@ -61,8 +61,8 @@ Python アプリの `ee_ip` と `gim_ip` は同じ IP を指すように設定�
 | `SET_YAW_TARGET` (value=v) | 同じ差動機構の内部「ヨー状態」だけを `v` に更新 (ピッチ状態は保持) し、両モータを再計算して送信する。式・クランプ・定数は `SET_PITCH_TARGET` と共通。 |
 | `SET_PITCH_YAW_TARGET` (pitch, yaw) | 内部のピッチ状態とヨー状態を**同時 (原子的) に**更新して両モータを再計算する。両軸を同時掃引するときに、片方だけ先に反映される過渡を避けたい場合に使う。 |
 | (差動の予算配分) | 片側モータが受ける角度は `\|Kp·pitch\| + \|Ky·yaw\|` まで振れる (差動機構は両成分の和)。STM32側はまずピッチを `HLCONTROL_WAVE_MOTOR_LIMIT_DEG` 内に収め、残り予算をヨーに割り当てる (**ピッチ優先**)。到達可能領域は `(pitch, yaw)` 空間のひし形 `\|Kp·pitch\| + \|Ky·yaw\| ≤ HLCONTROL_WAVE_MOTOR_LIMIT_DEG`。フルピッチとフルヨーは同時には出せない。 |
-| `TTL_OPEN` | 0x21 の開閉状態を「開 (`-25.0°`)」に更新する。**0x21 は 0x11/0x12 のヨー軸と機械的に連動している**ため、実際に送るオフセットは `TTL_YAW_FOLLOW_GAIN·yaw_est + 開閉オフセット` (`CAN_PROTOCOL_TTL-SERVO.md` 準拠の `SET_TARGET`)。ボタンを押した瞬間は現在の `yaw_est` で即時1発送信する。 |
-| `TTL_CLOSE` | 同じく 0x21 の開閉状態を「閉 (`+50.0°`)」に更新して即時1発送信する。 |
+| `TTL_OPEN` | 0x21 の開閉状態を「開 (`+50.0°`)」に更新する。**0x21 は 0x11/0x12 のヨー軸と機械的に連動している**ため、実際に送るオフセットは `TTL_YAW_FOLLOW_GAIN·yaw_est + 開閉オフセット` (`CAN_PROTOCOL_TTL-SERVO.md` 準拠の `SET_TARGET`)。ボタンを押した瞬間は現在の `yaw_est` で即時1発送信する。<br>★2026-09-11: 実機確認の結果、開閉の向きが逆だったため `HLCONTROL_TTL_OPEN_DEG`/`HLCONTROL_TTL_CLOSE_DEG` (`hl_control_udp.h`) の値を入れ替えて補正した (以前は open=-25°/close=+50° だった)。 |
+| `TTL_CLOSE` | 同じく 0x21 の開閉状態を「閉 (`-25.0°`)」に更新して即時1発送信する。 |
 | (0x21 のヨー追従) | 0x11/0x12 の差動ヨー軸は遅い (実機 ~10°/s) が 0x21 は速いので、0x21 へ一気に最終目標を送ると実ヨー軸より先行して機構がねじれる。STM32側は **一度でも open/close を受けたら**、`HLCONTROL_TTL_FOLLOW_PERIOD_MS` (=500ms) ごとに `yaw_est` を最大 `HLCONTROL_TTL_YAW_RAMP_RATE_DPS` (=10°/s) ずつ差動機構の実効ヨー角へ寄せながら `0x21` へ `SET_TARGET` を再送し続ける。実効ヨーに追いついたら送信停止 (定常時バス負荷ゼロ)。ゲイン/レート/周期は `hl_control_udp.h` のコンパイル時定数。0x08/0x09 でヨーを先に動かしておけば、open/close の瞬間には `yaw_est` が既にヨー軸へ同期している。 |
 | `SET_GIM6010_PITCH_TARGET_DEG` (value=deg) | `deg` を `-100.0 〜 +100.0` の範囲にクランプしてから、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM6010_GEAR_RATIO`) を計算する。CAN ID `0x06`・`0x07` の両方へ、ODrive CAN Simpleの `Set_Input_Pos` (絶対位置、ネイティブturns) で `(各軸の初期位置) + delta` を送信する(**0x06と0x07は全く同じ目標値**、符号反転はしない)。例: 初期位置がどちらも0のとき、90°を送ると `delta = 90/360*8 = 2.0` となり、0x06・0x07ともに目標値は+2.0になる。 |
 | `SET_GIM8018_PITCH_TARGET_DEG` (value=deg) | **クランプせず**、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM8018_GEAR_RATIO_NOMINAL`) を計算する。CAN ID `0x04` へ `(0x04の初期位置) + delta` を、CAN ID `0x05` へ `(0x05の初期位置) - delta` (**符号反転・同じ大きさ**、GIM6010とは逆に互い違い) を、それぞれ`Set_Input_Pos`で送信する。例: 初期位置がどちらも0のとき、90°を送ると `delta = 2.0` となり、0x04の目標値は+2.0、0x05の目標値は-2.0になる。 |
@@ -140,3 +140,34 @@ sock.sendto(struct.pack("<Bf", CMD_SET_C610_TARGET_DEG, 0.0), (EE_IP, HLCONTROL_
 STM32 → PC の位置制御テレメトリは AS5600 ブロードキャスト行 (UDP `5004`) の末尾に付く:
 `... c610_en=<0|1> c610_act=<0|1> c610_org_mdeg=<±int> c610_off_mdeg=<±int> c610_tgt_mdeg=<±int> c610_meas_mdeg=<int> c610_err_mdeg=<±int> c610_vsp_mdps=<±int> c610_vel_mdps=<±int> c610_i_ma=<±int>`
 (`mdeg` = 1/1000 度、`mdps` = 1/1000 度/秒、`ma` = 1/1000 A。`org`=原点、`off`=受信した原点からの差分、`tgt`=実目標角、`vsp`=位置ループが出した速度指令、`vel`=ローパス後の計測速度、`en`=コントローラ有効 (最初の0x07で1になる)、`act`=2秒ガードを過ぎて送信中)。
+
+## ROS2 (sharmech) 連携との関係
+
+本プロトコル (5003番) とは別に、この基板 (θ/エンドエフェクタ基板) は ROS2 (sharmech) スタック
+との通信も実装している (`ros2_link.c/.h` + `ros2_protocol.h`、r/z 基板 `ip_100_section` の
+同名モジュールと対)。仕様の正本は `sharmech/docs/mcu_spec.md` §3 (protocol_version=2)。
+**この基板は theta・gripper・control_flags bit1 (縦にする) のみ使う** (r,z は r/z 基板 192.168.1.100 の担当)。
+
+| 項目 | 値 |
+|---|---|
+| 受信 (ROS2 → MCU) | UDP **8888** 番、`packet_type=0x01` polar packet (60byte)。r/z 基板と同じ理由で**10Hzまで間引く運用** |
+| 送信 (MCU → ROS2) | UDP **8889** 番 (フィードバック宛先 = `main.c` の `dest_ip`)、`packet_type=0x81` feedback packet (64byte)、**マイコン起動直後から自発送信 (既定10Hz、`ROS2_LINK_FB_PERIOD_MS`)** |
+| STM32側ソケット番号 | `5` (`ROS2_LINK_SN`。0=Hello 1=CAN橋 2=HB 3=HLCONTROL 4=AS5600 が使用中) |
+| 0x01 → theta の扱い | `theta` は payload 上の単位どおり **[rad] のまま `-π 〜 +π` にクランプ**してから (ユーザー指示)、[deg] へ変換して `HLControlUDP_SetC610TargetOffsetDeg()` へ渡す (5003番の 0x07 と同じ経路。C610Position 側の入力単位が deg のためクランプ後にのみ変換)。クランプは **STM32側 (`ros2_link.c` の `ROS2_THETA_MIN_RAD`/`MAX_RAD`)** で行う。Python側は範囲チェック不要 (スライダの deg 表示・範囲は操作性のためだけで、実際の安全装置ではない)。`control_flags` bit0=0 またはbit2=1 の間はホールド (目標を更新しない) |
+| 0x01 → gripper の扱い | `gripper` (0=開,1=閉) を `HLControlUDP_SetGripperClosed()` へ (0x02/0x03 と同じ経路)。bit0/bit2 の状態に関わらず反映する (mcu_spec §3.2)。値が変化したときだけ CAN 送信 |
+| 0x01 → control_flags bit1 の扱い | 「縦にする」指示を `HLControlUDP_SetWristPitchYawDeg()` へ (0x09 と同じ経路)。同じく bit0/bit2 に関わらず反映、値が変化したときだけ送信 |
+| 0x81 → 埋めるもの | `theta` (C610 の `meas_deg` からの順運動学)、`joint_positions[turntable]` = 同じ値、`pitch` = bit1 の現在状態のエコー (縦=π/2、横=0)、`gripper_state` = 直近の open/close 指令のエコー、`status_flags` (bit1 AS5600途絶/磁石未検出, bit2 ウォッチドッグ, bit3 未初期化, bit4 直近破棄)。`r`,`z`,`joint_positions[shoulder/knee]` は 0 (r/z 基板の担当) |
+
+**初版でやっていないこと** (`ros2_link.h` のコメント参照。r/z 基板と同じ方針):
+mcu_spec §4.2 の速度補間・§4.4 のスルーレート制限、`0x02`(関節指令、黙って破棄)、
+§4.6 の初期位置移動 (`control_flags` bit2 は暫定的に「ホールド」扱い、`status_flags` bit5 は立てない)。
+
+**TTL サーボの開閉方向修正 (2026-09-11):** 実機で開閉が逆だったため、`HLCONTROL_TTL_OPEN_DEG`/
+`HLCONTROL_TTL_CLOSE_DEG` (`hl_control_udp.h`) を入れ替えた (上の§挙動 も参照)。
+`HLControlUDP_SetGripperClosed()` もこの定数を経由するので、ROS2 経由でも 5003番経由でも
+正しい向きで開閉する。
+
+試験用 GUI (ROS2 役のスタブ。r/z 基板と2基板同時に叩ける):
+[`tools/hl_control/ros2_arm_control.py`](ros2_arm_control.py)
+(r/z 基板 `192.168.1.100` 向けの単体版は `ip_100_section` ブランチの
+[`tools/hl_control/ros2_rz_control.py`](ros2_rz_control.py) を参照)
