@@ -29,7 +29,7 @@ extern "C" {
  *   HLCONTROL_CMD_TTL_OPEN  (0x02): payloadなし。0x21 へ HLCONTROL_TTL_OPEN_DEG。
  *   HLCONTROL_CMD_TTL_CLOSE (0x03): payloadなし。0x21 へ HLCONTROL_TTL_CLOSE_DEG。
  *   HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG (0x04): payload = float32 LE、角度[deg]。
- *     入力値を 0〜60deg にクランプ → 符号反転 → 偏差 (deg/360*GIM6010_GEAR_RATIO)。
+ *     入力値を 0〜70deg にクランプ → 符号反転 → 偏差 (deg/360*GIM6010_GEAR_RATIO)。
  *     0x06・0x07 とも「各軸の初期位置 + 偏差」を Set_Input_Pos で 1 発送信 (A → 5ms → B)。
  *     初期位置は main.c の GIM6010_A/B_INITIAL_NATIVE_TURNS。
  *   HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG (0x05): payload = float32 LE、角度[deg]。
@@ -63,10 +63,10 @@ extern "C" {
  * watchdog_timeout の半分以下にすること (デフォルトが分からなければ 300ms が安全)。 */
 #define HLCONTROL_RESEND_MS 300U
 
-/* GIM6010 ピッチ角目標値のクランプ範囲。GIM6010は実機の出力角可動範囲が -60〜0deg の
- * ため、符号反転する前の「入力値」としては 0〜60deg でクランプする。 */
+/* GIM6010 ピッチ角目標値のクランプ範囲。GIM6010は実機の出力角可動範囲が -70〜0deg の
+ * ため、符号反転する前の「入力値」としては 0〜70deg でクランプする。 */
 #define HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG (0.0f)
-#define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (60.0f)
+#define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (70.0f)
 /* GIM8018(GIM8108-8)は角度クランプを行わない(入力値をそのまま使う)。 */
 
 /* 初期化。ttl/gim6010_a/gim6010_b/gim8018_c/gim8018_d はいずれも NULL 可。
