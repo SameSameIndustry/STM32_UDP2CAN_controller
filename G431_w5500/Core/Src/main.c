@@ -87,8 +87,8 @@
 // を Set_Input_Pos で送る(両軸同じ向き)。旧コードの offset_ax4+1.3 / offset_ax5-1.3
 // の +1.3 / -1.3 に相当(offset_ax は0扱い)。負値 + circular_setpoints でずれる
 // 疑いの切り分けのため、現状は node5 も +1.3(node4と同じ)にしてある。
-#define GIM8018_C_INITIAL_NATIVE_TURNS  0.2f
-#define GIM8018_D_INITIAL_NATIVE_TURNS  0.2f
+#define GIM8018_C_INITIAL_NATIVE_TURNS  0.0f
+#define GIM8018_D_INITIAL_NATIVE_TURNS  0.35f
 
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U

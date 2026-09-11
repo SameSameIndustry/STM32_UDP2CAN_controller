@@ -34,6 +34,8 @@ STM32のIPアドレスは他の通信 (CAN-UDPブリッジ等) と共通 (`main.
 | `TTL_CLOSE`         | `0x03` | なし | `03` (計1byte) |
 | `SET_GIM6010_PITCH_TARGET_DEG` | `0x04` | `float32` LE、角度 `[deg]` | `04 <4byte float>` (計5byte) |
 | `SET_GIM8018_PITCH_TARGET_DEG` | `0x05` | `float32` LE、角度 `[deg]` | `05 <4byte float>` (計5byte) |
+| `SET_R_TARGET_M` | `0x06` | `float32` LE、r 座標 `[m]` | `06 <4byte float>` (計5byte) |
+| `SET_Z_TARGET_M` | `0x07` | `float32` LE、z 座標 `[m]` | `07 <4byte float>` (計5byte) |
 
 未知のコマンド・不正な長さのパケットは無視される。
 
@@ -46,6 +48,8 @@ STM32のIPアドレスは他の通信 (CAN-UDPブリッジ等) と共通 (`main.
 | `TTL_CLOSE` | 同じくCAN ID `0x21` へ、オフセット `+50.0°` を送信する。 |
 | `SET_GIM6010_PITCH_TARGET_DEG` (value=deg) | `deg` を `0.0 〜 +70.0` の範囲にクランプしてから、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM6010_GEAR_RATIO`) を計算する。CAN ID `0x06`・`0x07` の両方へ、ODrive CAN Simpleの `Set_Input_Pos` (絶対位置、ネイティブturns) で `(各軸の初期位置) + delta` を送信する(**0x06と0x07は全く同じ目標値**、符号反転はしない)。例: 初期位置がどちらも0のとき、90°を送ると `delta = 90/360*8 = 2.0` となり、0x06・0x07ともに目標値は+2.0になる。 |
 | `SET_GIM8018_PITCH_TARGET_DEG` (value=deg) | **クランプせず**、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM8018_GEAR_RATIO_NOMINAL`) を計算する。CAN ID `0x04` へ `(0x04の初期位置) + delta` を、CAN ID `0x05` へ `(0x05の初期位置) - delta` (**符号反転・同じ大きさ**、GIM6010とは逆に互い違い) を、それぞれ`Set_Input_Pos`で送信する。例: 初期位置がどちらも0のとき、90°を送ると `delta = 2.0` となり、0x04の目標値は+2.0、0x05の目標値は-2.0になる。 |
+| `SET_R_TARGET_M` (value=r [m]) | 簡易キネマティクス `r = 0.33·cos(phi + 60°)` の逆変換で `phi = acos(clamp(r/0.33, -1, 1))·180/π − 60°` を求め、**`phi` を `-50° 〜 0°` にクランプ**してから、`SET_GIM8018_PITCH_TARGET_DEG` と同じ経路 (C=原点+Δ / D=原点−Δ) で送信する。`phi` の可動域は機構由来。係数は `hl_control_udp.h` の `HLCONTROL_RZ_R_AMPLITUDE_M` / `HLCONTROL_RZ_R_PHASE_DEG`。r の有効範囲は約 `0.165 〜 0.325 m`。 |
+| `SET_Z_TARGET_M` (value=z [m]) | 簡易キネマティクス `z = 0.12·sin(theta + 10°)` の逆変換で `theta = asin(clamp(z/0.12, -1, 1))·180/π − 10°` を求め、`SET_GIM6010_PITCH_TARGET_DEG` と**同じ `0° 〜 70°` クランプ**を通してから、同じ経路 (0x06・0x07 とも 初期位置+Δ) で送信する。係数は `hl_control_udp.h` の `HLCONTROL_RZ_Z_AMPLITUDE_M` / `HLCONTROL_RZ_Z_PHASE_DEG`。z の有効範囲は約 `0.021 〜 0.118 m`。 |
 
 0x06・0x07 / 0x04・0x05それぞれの「初期位置」(ネイティブturns) は本プロトコルでは
 設定できない。STM32側 [`main.c`](../../G431_w5500/Core/Src/main.c) の
@@ -79,6 +83,8 @@ CMD_TTL_OPEN = 0x02
 CMD_TTL_CLOSE = 0x03
 CMD_SET_GIM6010_PITCH_TARGET_DEG = 0x04
 CMD_SET_GIM8018_PITCH_TARGET_DEG = 0x05
+CMD_SET_R_TARGET_M = 0x06
+CMD_SET_Z_TARGET_M = 0x07
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -96,4 +102,12 @@ sock.sendto(struct.pack("<Bf", CMD_SET_GIM6010_PITCH_TARGET_DEG, 90.0), (STM32_I
 
 # GIM8018のピッチ角目標値を90degに設定 (0x04は初期位置+2.0、0x05は初期位置-2.0が送られる)
 sock.sendto(struct.pack("<Bf", CMD_SET_GIM8018_PITCH_TARGET_DEG, 90.0), (STM32_IP, HLCONTROL_PORT))
+
+# r 座標 0.30m を指令 (STM32側で phi = acos(0.30/0.33) - 60° ≈ -34.5° を逆算し -50〜0° にクランプ)
+sock.sendto(struct.pack("<Bf", CMD_SET_R_TARGET_M, 0.30), (STM32_IP, HLCONTROL_PORT))
+
+# z 座標 0.08m を指令 (STM32側で theta = asin(0.08/0.12) - 10° ≈ 31.8° を逆算し 0〜70° にクランプ)
+sock.sendto(struct.pack("<Bf", CMD_SET_Z_TARGET_M, 0.08), (STM32_IP, HLCONTROL_PORT))
 ```
+
+r,z 用の対話 GUI: [`tools/hl_control/rz_control.py`](rz_control.py)

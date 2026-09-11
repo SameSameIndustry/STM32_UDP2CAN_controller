@@ -1,8 +1,11 @@
 #include "hl_control_udp.h"
 #include "socket.h"
 #include <string.h>
+#include <math.h>
 
 #define HLCONTROL_MAX_PACKET_LEN 5U   /* 1(コマンド) + 4(float32) が最大 */
+
+#define HLCONTROL_RAD2DEG (57.29577951308232f)
 
 static uint8_t s_sn;
 static TTLServoCAN_t   *s_ttl      = NULL;
@@ -45,6 +48,26 @@ static float HLControl_ClampGim6010PitchDeg(float deg)
     return deg;
 }
 
+/* 0x06 (r 座標指令) で逆算した GIM8018 ピッチ角 [deg] を機構可動域にクランプする。
+ * 0x05 (ピッチ生指令) はこのクランプを通さない (従来どおりクランプなし)。 */
+static float HLControl_ClampGim8018PitchDeg(float deg)
+{
+    if (deg < HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG) {
+        return HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG;
+    }
+    if (deg > HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG) {
+        return HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG;
+    }
+    return deg;
+}
+
+static float HLControl_ClampUnit(float v)
+{
+    if (v > 1.0f)  { return 1.0f; }
+    if (v < -1.0f) { return -1.0f; }
+    return v;
+}
+
 /* 電源投入(HAL_GetTick()=0)から HLCONTROL_MOTOR_CAN_START_MS 経過したら1。
  * それまでは GIM への CAN 送信を一切行わない(電源電圧が安定しないため)。 */
 static uint8_t HLControl_MotorCanReady(void)
@@ -63,6 +86,60 @@ static void HLControl_Command(ODriveCAN_Axis_t *odrv, float target,
     *stored = target;
     *armed = 1U;
     (void)ODriveCAN_SetInputPos(odrv, target, 0.0f, 0.0f);
+}
+
+/* GIM6010 (0x06/0x07) を「ピッチ角 [deg]」で指令する共通処理。
+ * 0x04 ハンドラと全く同じ換算・順序 (クランプ → 符号反転 → 偏差、node7(B) → 5ms → node6(A))。
+ * 0x07 (z 座標指令) の逆変換結果もここを通す。 */
+static void HLControl_CommandGim6010PitchDeg(float pitch_deg)
+{
+    float native_delta;
+
+    pitch_deg = HLControl_ClampGim6010PitchDeg(pitch_deg);
+    pitch_deg = -pitch_deg;
+    native_delta = (pitch_deg / 360.0f) * GIM6010_GEAR_RATIO;  /* 減速比8 */
+
+    if (s_gim6010_b != NULL) {
+        HLControl_Command(&s_gim6010_b->odrv, s_gim6010_b_initial_native + native_delta,
+                          &s_gim6010_b_target, &s_gim6010_b_armed);
+    }
+    if ((s_gim6010_a != NULL) && (s_gim6010_b != NULL)) {
+        HAL_Delay(HLCONTROL_GIM_CMD_GAP_MS);
+    }
+    if (s_gim6010_a != NULL) {
+        HLControl_Command(&s_gim6010_a->odrv, s_gim6010_a_initial_native + native_delta,
+                          &s_gim6010_a_target, &s_gim6010_a_armed);
+    }
+}
+
+/* GIM8018 (0x04/0x05) を「ピッチ角 [deg]」で指令する共通処理。
+ * 0x05 ハンドラと全く同じ換算・順序 (偏差、C=原点+Δ / D=原点-Δ、node5(D) → 5ms → node4(C))。
+ * do_clamp=1 のとき phi を -50〜0deg にクランプする (0x06 = r 座標指令の経路)。
+ * 正規化未完了なら何もしない (0x05 と同じガード)。 */
+static void HLControl_CommandGim8018PitchDeg(float pitch_deg, uint8_t do_clamp)
+{
+    float native_delta;
+
+    if (((s_gim8018_c != NULL) && !GIM8018_IsStartupNormalized(s_gim8018_c)) ||
+        ((s_gim8018_d != NULL) && !GIM8018_IsStartupNormalized(s_gim8018_d))) {
+        return;
+    }
+    if (do_clamp) {
+        pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);
+    }
+    native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
+
+    if (s_gim8018_d != NULL) {
+        HLControl_Command(&s_gim8018_d->odrv, s_gim8018_d_initial_native - native_delta,
+                          &s_gim8018_d_target, &s_gim8018_d_armed);
+    }
+    if ((s_gim8018_c != NULL) && (s_gim8018_d != NULL)) {
+        HAL_Delay(HLCONTROL_GIM_CMD_GAP_MS);
+    }
+    if (s_gim8018_c != NULL) {
+        HLControl_Command(&s_gim8018_c->odrv, s_gim8018_c_initial_native + native_delta,
+                          &s_gim8018_c_target, &s_gim8018_c_armed);
+    }
 }
 
 void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
@@ -130,7 +207,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&pitch_deg, &buf[1], sizeof(float));
-        /* 入力値を 0〜60deg にクランプ → 符号反転 → 偏差計算 (要求仕様通り)。 */
+        /* 入力値を 0〜70deg にクランプ → 符号反転 → 偏差計算 (要求仕様通り)。 */
         pitch_deg = HLControl_ClampGim6010PitchDeg(pitch_deg);
         pitch_deg = -pitch_deg;
         native_delta = (pitch_deg / 360.0f) * GIM6010_GEAR_RATIO;  /* 減速比8 */
@@ -178,6 +255,38 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             HLControl_Command(&s_gim8018_c->odrv, s_gim8018_c_initial_native + native_delta,
                               &s_gim8018_c_target, &s_gim8018_c_armed);
         }
+    } else if (cmd == HLCONTROL_CMD_SET_R_TARGET_M) {
+        float r_m;
+        float phi_deg;
+
+        if (len < (int32_t)(1U + sizeof(float))) {
+            return;
+        }
+        if (!HLControl_MotorCanReady()) {
+            return;
+        }
+        memcpy(&r_m, &buf[1], sizeof(float));
+        /* r = A*cos(phi + phase)  =>  phi = acos(r/A) - phase。acos の定義域は [-1,1]。
+         * phi は GIM8018 経路で -50〜0deg にクランプされる。 */
+        phi_deg = (acosf(HLControl_ClampUnit(r_m / HLCONTROL_RZ_R_AMPLITUDE_M)) * HLCONTROL_RAD2DEG)
+                  - HLCONTROL_RZ_R_PHASE_DEG;
+        HLControl_CommandGim8018PitchDeg(phi_deg, 1U);
+    } else if (cmd == HLCONTROL_CMD_SET_Z_TARGET_M) {
+        float z_m;
+        float theta_deg;
+
+        if (len < (int32_t)(1U + sizeof(float))) {
+            return;
+        }
+        if (!HLControl_MotorCanReady()) {
+            return;
+        }
+        memcpy(&z_m, &buf[1], sizeof(float));
+        /* z = A*sin(theta + phase)  =>  theta = asin(z/A) - phase。asin の定義域は [-1,1]。
+         * theta は 0x04 と同じ 0〜70deg クランプを通る。 */
+        theta_deg = (asinf(HLControl_ClampUnit(z_m / HLCONTROL_RZ_Z_AMPLITUDE_M)) * HLCONTROL_RAD2DEG)
+                    - HLCONTROL_RZ_Z_PHASE_DEG;
+        HLControl_CommandGim6010PitchDeg(theta_deg);
     }
     /* 未知のコマンドは無視する */
 }

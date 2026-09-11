@@ -38,15 +38,27 @@ extern "C" {
  *     原点は起動時 GIM8018_NormalizeMultiturnStartup が確定し HLControlUDP_SetGim8018Origin()
  *     で渡される。正規化未完了の間は 0x05 を無視する (古い種で暴走するため)。
  *
+ *   HLCONTROL_CMD_SET_R_TARGET_M (0x06): payload = float32 LE、r 座標[m]。
+ *     r = HLCONTROL_RZ_R_AMPLITUDE_M * cos(phi + HLCONTROL_RZ_R_PHASE_DEG) の逆変換で
+ *     phi = acos(r / A) - phase を求め、-50〜0deg にクランプ → 0x05 と同じ経路
+ *     (GIM8018 C=原点+偏差 / D=原点-偏差) で送信する。
+ *   HLCONTROL_CMD_SET_Z_TARGET_M (0x07): payload = float32 LE、z 座標[m]。
+ *     z = HLCONTROL_RZ_Z_AMPLITUDE_M * sin(theta + HLCONTROL_RZ_Z_PHASE_DEG) の逆変換で
+ *     theta = asin(z / A) - phase を求め、0x04 と同じクランプ(0〜70deg)・同じ経路
+ *     (GIM6010 A/B とも 初期位置+偏差) で送信する。
+ *
  *   (0x01 = wave motor ピッチ指令はこの基板では未使用のため削除した。)
  *
- * 角度のクランプは STM32 側で行う。Python 側は範囲チェック不要。GIM8018 はクランプなし。
+ * 角度のクランプは STM32 側で行う。Python 側は範囲チェック不要。
+ * (0x05 = GIM8018 ピッチ生指令はクランプなしのまま。0x06 = r 指令のみ -50〜0deg クランプ。)
  */
 
 #define HLCONTROL_CMD_TTL_OPEN                       0x02U
 #define HLCONTROL_CMD_TTL_CLOSE                      0x03U
 #define HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG   0x04U
 #define HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG   0x05U
+#define HLCONTROL_CMD_SET_R_TARGET_M                 0x06U
+#define HLCONTROL_CMD_SET_Z_TARGET_M                 0x07U
 
 /* open/closeボタンで送るTTLサーボのオフセット値 (仕様通り: open=-25deg, close=+50deg) */
 #define HLCONTROL_TTL_OPEN_DEG   (-25.0f)
@@ -67,7 +79,22 @@ extern "C" {
  * ため、符号反転する前の「入力値」としては 0〜70deg でクランプする。 */
 #define HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG (0.0f)
 #define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (70.0f)
-/* GIM8018(GIM8108-8)は角度クランプを行わない(入力値をそのまま使う)。 */
+/* GIM8018(GIM8108-8) ピッチ角のクランプ範囲。0x05 (ピッチ生指令) はクランプせず
+ * 従来どおり入力値をそのまま使う。0x06 (r 座標指令) の逆変換で得た phi のみ
+ * この範囲にクランプする (機構の可動範囲 -50〜0deg)。 */
+#define HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG (-50.0f)
+#define HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG  (0.0f)
+
+/* r / z 座標指令 (0x06 / 0x07) の簡易キネマティクス係数。
+ *   z [m] = HLCONTROL_RZ_Z_AMPLITUDE_M * sin(theta_deg + HLCONTROL_RZ_Z_PHASE_DEG)
+ *   r [m] = HLCONTROL_RZ_R_AMPLITUDE_M * cos(phi_deg   + HLCONTROL_RZ_R_PHASE_DEG)
+ * theta_deg は GIM6010 ピッチ角 (0x04 の入力値と同じ意味、0〜70deg)。
+ * phi_deg   は GIM8018 ピッチ角 (0x05 の入力値と同じ意味、r 経路では -50〜0deg)。
+ * STM32 側で asinf / acosf により phi_deg / theta_deg を逆算し、既存経路へ流す。 */
+#define HLCONTROL_RZ_Z_AMPLITUDE_M (0.12f)
+#define HLCONTROL_RZ_Z_PHASE_DEG   (10.0f)
+#define HLCONTROL_RZ_R_AMPLITUDE_M (0.33f)
+#define HLCONTROL_RZ_R_PHASE_DEG   (60.0f)
 
 /* 初期化。ttl/gim6010_a/gim6010_b/gim8018_c/gim8018_d はいずれも NULL 可。
  * gim6010_a/b_initial_native は GIM6010 の初期位置 (ネイティブturns、プログラム側定数)。
