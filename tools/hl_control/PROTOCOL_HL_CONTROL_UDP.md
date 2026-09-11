@@ -151,9 +151,10 @@ STM32 → PC の位置制御テレメトリは AS5600 ブロードキャスト�
 | 項目 | 値 |
 |---|---|
 | 受信 (ROS2 → MCU) | UDP **8888** 番、`packet_type=0x01` polar packet (60byte)。r/z 基板と同じ理由で**10Hzまで間引く運用** |
-| 送信 (MCU → ROS2) | UDP **8889** 番 (フィードバック宛先 = `main.c` の `dest_ip`)、`packet_type=0x81` feedback packet (64byte)、**マイコン起動直後から自発送信 (既定10Hz、`ROS2_LINK_FB_PERIOD_MS`)** |
+| 送信 (MCU → ROS2) | UDP **8889** 番 (フィードバック宛先 = `main.c` の `dest_ip`)、`packet_type=0x81` feedback packet (64byte)、**電源投入 `ROS2_LINK_INIT_DELAY_MS` (既定5秒) 後の自動初期化完了後から自発送信 (既定10Hz、`ROS2_LINK_FB_PERIOD_MS`)**。初期化前は送信しない (下記) |
 | STM32側ソケット番号 | `5` (`ROS2_LINK_SN`。0=Hello 1=CAN橋 2=HB 3=HLCONTROL 4=AS5600 が使用中) |
-| 0x01 → theta の扱い | `theta` は payload 上の単位どおり **[rad] のまま `-π 〜 +π` にクランプ**してから (ユーザー指示)、[deg] へ変換して `HLControlUDP_SetC610TargetOffsetDeg()` へ渡す (5003番の 0x07 と同じ経路。C610Position 側の入力単位が deg のためクランプ後にのみ変換)。クランプは **STM32側 (`ros2_link.c` の `ROS2_THETA_MIN_RAD`/`MAX_RAD`)** で行う。Python側は範囲チェック不要 (スライダの deg 表示・範囲は操作性のためだけで、実際の安全装置ではない)。`control_flags` bit0=0 またはbit2=1 の間はホールド (目標を更新しない) |
+| 0x01 → theta の扱い | `theta` は payload 上の単位どおり **[rad] のまま `-2π/3 〜 +2π/3` にクランプ**してから (ユーザー指示)、[deg] へ変換して `HLControlUDP_SetC610TargetOffsetDeg()` へ渡す (5003番の 0x07 と同じ経路。C610Position 側の入力単位が deg のためクランプ後にのみ変換)。クランプは **STM32側 (`ros2_link.c` の `ROS2_THETA_MIN_RAD`/`MAX_RAD`)** で行う。Python側は範囲チェック不要 (GUIのスライダ範囲・rad表示は操作性のためだけで、実際の安全装置ではない)。`control_flags` bit0=0 またはbit2=1 の間はホールド (目標を更新しない) |
+| 電源投入時の自動初期化 | **`ROS2_LINK_INIT_DELAY_MS` (既定5秒) 経過後に1回だけ**、theta を `ROS2_THETA_INIT_RAD` (既定 `0.0f`、変更する場合は `ros2_link.h` を編集) へ、グリッパを開へ自動で動かす (mcu_spec §4.6 の電源投入時初期位置移動に相当。ROS2/GUIの接続有無に関わらず実行、0x02/0x07 と同じ経路)。**この自動初期化が終わるまで 0x81 feedback は一切送信しない** (ROS2側はFBが来るまでこの基板の存在を知らないので、初期化前に誤って制御を始めることもない)。0x01 の受信自体 (`ROS2Link_Poll`) は電源投入直後から動作する |
 | 0x01 → gripper の扱い | `gripper` (0=開,1=閉) を `HLControlUDP_SetGripperClosed()` へ (0x02/0x03 と同じ経路)。bit0/bit2 の状態に関わらず反映する (mcu_spec §3.2)。値が変化したときだけ CAN 送信 |
 | 0x01 → control_flags bit1 の扱い | 「縦にする」指示を `HLControlUDP_SetWristPitchYawDeg()` へ (0x09 と同じ経路)。同じく bit0/bit2 に関わらず反映、値が変化したときだけ送信 |
 | 0x81 → 埋めるもの | `theta` (C610 の `meas_deg` からの順運動学)、`joint_positions[turntable]` = 同じ値、`pitch` = bit1 の現在状態のエコー (縦=π/2、横=0)、`gripper_state` = 直近の open/close 指令のエコー、`status_flags` (bit1 AS5600途絶/磁石未検出, bit2 ウォッチドッグ, bit3 未初期化, bit4 直近破棄)。`r`,`z`,`joint_positions[shoulder/knee]` は 0 (r/z 基板の担当) |

@@ -24,15 +24,21 @@ extern "C" {
  *    TTL_OPEN/CLOSE_DEG の実機物理向きは hl_control_udp.h で補正済み)。
  *  - control_flags bit1 (縦にする) を HLControlUDP_SetWristPitchYawDeg() へ
  *    (0x09 と同じ経路。値が変化したときだけ呼ぶ)。
- *  - 起動直後から ROS2_LINK_FB_PERIOD_MS 周期 (既定10Hz) で 0x81 feedback を自発送信。
+ *  - 起動 (電源投入) から ROS2_LINK_INIT_DELAY_MS (既定5秒) 経過したら 1 回だけ、
+ *    theta を ROS2_THETA_INIT_RAD (既定0rad) へ、グリッパを開へ自動で動かす
+ *    (mcu_spec §4.6 の電源投入時の初期位置移動に相当。ROS2 の接続有無に関わらず実行する)。
+ *    この初期化が終わるまでは 0x81 feedback を送信しない。
+ *  - 初期化後は ROS2_LINK_FB_PERIOD_MS 周期 (既定10Hz) で 0x81 feedback を自発送信。
  *
- * ★既存の CAN 通信層・初期化・5003 番プロトコルには一切触れない。
- *   ROS2 から 0x01 を一度も受信しなければ、この基板の挙動は従来と完全に同一。
+ * ★既存の CAN 通信層・初期化・5003 番プロトコルには一切触れない (電源投入5秒後の自動初期化は
+ *   ros2_link 内で完結し、既存ハンドラと同じ公開 setter 経由でしか CAN を触らない)。
+ *   theta/gripper の ROS2 経由の指令は電源投入直後から受け付ける (0x01 の Poll は常時動作)。
  *
  * 初版で「やらないこと」(mcu_spec §10.1、r/z基板と同じ方針):
  *  - §4.2 補間 / §4.4 スルーレート制限 (受信値をそのまま目標にする)
  *  - 0x02 関節指令 (黙って破棄)
- *  - §4.6 の初期位置移動 (bit2)。bit2 受信中はホールド扱い、bit5 は立てない
+ *  - §4.6 の「bit2 (初期位置要求) での復帰」。bit2 受信中はホールド扱い、bit5 は立てない。
+ *    ★電源投入時 (起動5秒後) の自動初期化のみユーザー指示で実装済み (上記)。
  */
 
 /* W5500 ソケット番号。0=Hello 1=CAN橋 2=HB 3=HLCONTROL 4=AS5600 が使用中なので 5。 */
@@ -54,10 +60,16 @@ extern "C" {
 #define ROS2_PI  (3.14159265358979323846f)
 
 /* theta 入力値 [rad] のクランプ範囲 (ユーザー指示。payload の theta は [rad] なので
- * rad のまま扱う)。AS5600 は単回転(0〜360°)なので、1回転未満に収める安全策として
- * ±π (= ±180°) に制限する。 */
-#define ROS2_THETA_MIN_RAD  (-ROS2_PI)
-#define ROS2_THETA_MAX_RAD   (ROS2_PI)
+ * rad のまま扱う)。±2π/3 (= ±120°)。 */
+#define ROS2_THETA_MIN_RAD  (-2.0f / 3.0f * ROS2_PI)
+#define ROS2_THETA_MAX_RAD   (2.0f / 3.0f * ROS2_PI)
+
+/* 電源投入から自動初期化 (theta→INIT、グリッパ→開) を実行するまでの遅延 [ms]。
+ * C610_CURRENT_STARTUP_DELAY_MS (2秒) より後であること。 */
+#define ROS2_LINK_INIT_DELAY_MS  5000U
+
+/* 電源投入時の自動初期化で使う theta の初期値 [rad] (ユーザー指示。変更したい場合はここを直す)。 */
+#define ROS2_THETA_INIT_RAD  (0.0f)
 
 /* theta[deg] (クランプ後に rad→deg 変換した値) → C610 の「原点からの差分角」への符号。
  * ★実機で theta の増加方向 (+X→+Y) と AS5600/ターンテーブルの回転方向が一致するか要確認。

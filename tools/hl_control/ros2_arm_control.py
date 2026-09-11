@@ -15,8 +15,11 @@ sharmech/docs/mcu_spec.md §3 のワイヤフォーマットをそのまま使�
 セクションを追加したもの。
 
   ・r/z 基板: r,z [m] をそのまま polar packet に載せる (逆変換・クランプはマイコン側)。
-  ・θ基板  : theta [deg] をスライダで指定 → 送信時に [rad] へ変換 (マイコン側で
-             -180〜180degにクランプ)。gripper (開/閉)、bit1 (縦にする) も送れる。
+  ・θ基板  : theta [rad] (wire 上の単位のまま) をスライダで指定して送る。クランプは
+             マイコン側 (ros2_link.c、±2π/3) が正で、このGUIのスライダ範囲は表示・
+             操作性のための目安にすぎない。gripper (開/閉)、bit1 (縦にする) も送れる。
+             電源投入5秒後にマイコン側で theta=ROS2_THETA_INIT_RAD・グリッパ開へ自動初期化
+             されるまでは 0x81 feedback が届かない (ros2_link.c 参照)。
 
 実行:
     python ros2_arm_control.py
@@ -60,11 +63,13 @@ R_AMPLITUDE_M, R_PHASE_DEG, R_OFFSET_M = 2.0 * 0.33, 60.0, 0.2
 GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 70.0
 GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 0.0
 
-# --- θ基板のクランプ。theta は wire 上 [rad] (STM32側 ros2_link.h の
-# ROS2_THETA_MIN_RAD/MAX_RAD = ±π と一致させること)。スライダは deg のほうが操作しやすいので
-# 表示・入力だけ deg にし、範囲は rad から換算する。 ---
-THETA_MIN_RAD, THETA_MAX_RAD = -math.pi, math.pi
-THETA_MIN_DEG, THETA_MAX_DEG = math.degrees(THETA_MIN_RAD), math.degrees(THETA_MAX_RAD)
+# --- θ基板のクランプ。theta は wire 上 [rad]。STM32側 ros2_link.h の
+# ROS2_THETA_MIN_RAD/MAX_RAD (= ±2π/3) と一致させること。実際のクランプはマイコン側が行う
+# ので、ここはスライダ範囲の目安 (表示も rad のまま、deg には変換しない)。 ---
+THETA_MIN_RAD, THETA_MAX_RAD = -2.0 / 3.0 * math.pi, 2.0 / 3.0 * math.pi
+# 電源投入5秒後にマイコン側で自動初期化される theta の初期値。STM32側 ros2_link.h の
+# ROS2_THETA_INIT_RAD と一致させること (表示用)。
+THETA_INIT_RAD = 0.0
 
 
 def clamp(v, lo, hi):
@@ -112,7 +117,7 @@ def format_feedback(fb):
     bits = [name for bit, name in STATUS_BIT_NAMES.items() if fb["status_flags"] & (1 << bit)]
     return (
         f"seq={fb['seq']:>6}  seq_echo={fb['seq_echo']:>6}\n"
-        f"r={fb['r']:.4f} m   theta={math.degrees(fb['theta']):+7.2f} deg   z={fb['z']:.4f} m\n"
+        f"r={fb['r']:.4f} m   theta={fb['theta']:+.4f} rad   z={fb['z']:.4f} m\n"
         f"gripper_state={'閉' if fb['gripper_state'] else '開'}   "
         f"status_flags=0x{fb['status_flags']:04x}  [{', '.join(bits) or 'OK'}]\n"
         f"joints[shL,shR,tt,knL,knR] (rad) = "
@@ -197,15 +202,15 @@ class RZSection(BoardSection):
 class ThetaGripperSection(BoardSection):
     def __init__(self, parent, ip, port, tx_sock):
         super().__init__(parent, f"■ θ/エンドエフェクタ基板  ({ip})", ip, port, tx_sock)
-        self.theta_var = tk.DoubleVar(value=0.0)
+        self.theta_var = tk.DoubleVar(value=THETA_INIT_RAD)
         self.gripper_var = tk.BooleanVar(value=False)   # True = 閉
         self.orient_var = tk.BooleanVar(value=False)    # True = 縦にする (bit1)
         self.enable_var = tk.BooleanVar(value=True)
         self._build()
 
     def _build(self):
-        ttk.Label(self, text="theta [deg]", width=10).grid(row=0, column=0, sticky="w")
-        ttk.Scale(self, from_=THETA_MIN_DEG, to=THETA_MAX_DEG, orient="horizontal", length=320,
+        ttk.Label(self, text="theta [rad]", width=10).grid(row=0, column=0, sticky="w")
+        ttk.Scale(self, from_=THETA_MIN_RAD, to=THETA_MAX_RAD, orient="horizontal", length=320,
                   variable=self.theta_var).grid(row=0, column=1, padx=6)
         ttk.Entry(self, width=8, textvariable=self.theta_var, justify="right").grid(row=0, column=2)
 
@@ -231,13 +236,13 @@ class ThetaGripperSection(BoardSection):
         if not self.streaming_var.get():
             return
         try:
-            theta_deg = clamp(float(self.theta_var.get()), THETA_MIN_DEG, THETA_MAX_DEG)
+            theta_rad = clamp(float(self.theta_var.get()), THETA_MIN_RAD, THETA_MAX_RAD)
         except (tk.TclError, ValueError):
-            theta_deg = 0.0
+            theta_rad = 0.0
         flags = CTRL_ENABLE_BIT if self.enable_var.get() else 0
         if self.orient_var.get():
             flags |= CTRL_ORIENT_BIT
-        self.send(pack_polar(self.next_seq(), theta_rad=math.radians(theta_deg),
+        self.send(pack_polar(self.next_seq(), theta_rad=theta_rad,
                               gripper=self.gripper_var.get(), control_flags=flags))
         self.schedule(self, self._send_tick)
 

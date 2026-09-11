@@ -28,6 +28,10 @@ static uint8_t  s_last_gripper  = 0U;
 static uint8_t  s_orient_valid  = 0U;
 static uint8_t  s_last_orient   = 0U;
 
+/* 電源投入 ROS2_LINK_INIT_DELAY_MS 後の自動初期化 (theta→INIT, グリッパ→開) が
+ * 済んだか。済むまでは 0x81 を送らない。 */
+static uint8_t  s_boot_init_done = 0U;
+
 static float ROS2Link_ClampF(float v, float lo, float hi)
 {
     if (v < lo) { return lo; }
@@ -233,6 +237,24 @@ static void ROS2Link_SendFeedback(void)
     (void)sendto(ROS2_LINK_SN, (uint8_t *)&fb, (uint16_t)sizeof(fb), s_pc_ip, ROS2_PC_FB_PORT);
 }
 
+/* 電源投入 ROS2_LINK_INIT_DELAY_MS 後に 1 回だけ実行する自動初期化。
+ * theta を ROS2_THETA_INIT_RAD へ、グリッパを開へ (既存の公開 setter 経由、0x07 / 0x02
+ * と同じ経路)。ROS2 が一度も繋がっていなくても実行する (mcu_spec §4.6)。 */
+static void ROS2Link_RunBootInit(void)
+{
+    float theta_deg = ROS2_THETA_INIT_RAD * ROS2_RAD2DEG;
+
+    HLControlUDP_SetC610TargetOffsetDeg(ROS2_THETA_DEG_SIGN * theta_deg);
+    HLControlUDP_SetGripperClosed(0U);   /* 開 */
+
+    /* 0x01 側の「変化したときだけ送る」判定の基準をここで同期し、直後に同じ内容の
+     * 0x01 が来ても無駄な再送をしないようにする。 */
+    s_last_gripper  = 0U;
+    s_gripper_valid = 1U;
+
+    s_boot_init_done = 1U;
+}
+
 void ROS2Link_Tick(void)
 {
     uint32_t now;
@@ -241,10 +263,22 @@ void ROS2Link_Tick(void)
         return;
     }
 
+    now = HAL_GetTick();
+
+    /* 電源投入から ROS2_LINK_INIT_DELAY_MS 経つまでは自動初期化を待つ。
+     * この間は 0x01 の受信・反映 (ROS2Link_Poll) 自体は止めないが、0x81 は送らない
+     * (ROS2 側は 0x81 が来るまでこの基板の存在を知らないので、自動初期化前に
+     * ROS2 が制御を開始することはない)。 */
+    if (!s_boot_init_done) {
+        if (now < ROS2_LINK_INIT_DELAY_MS) {
+            return;
+        }
+        ROS2Link_RunBootInit();
+    }
+
     /* 0x81 feedback を ROS2_LINK_FB_PERIOD_MS 周期で自発送信 (§3.4。初版は10Hzまで間引く)。
      * この基板の CAN 送信は WaveTick/TtlYawFollowTick/C610Current_Tick が既存の周期で
      * 一元管理しているので、r/z 基板の FlushOneAxis に相当するペーシング処理は不要。 */
-    now = HAL_GetTick();
     if ((now - s_last_fb_tick) >= ROS2_LINK_FB_PERIOD_MS) {
         s_last_fb_tick = now;
         ROS2Link_SendFeedback();
