@@ -2,6 +2,7 @@
 #define ROS2_LINK_H
 
 #include "stm32g4xx_hal.h"
+#include "c610_position.h"   /* C610_POS_TARGET_LIMIT_DEG (theta クランプの単一の元ネタ) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,12 @@ extern "C" {
  *    (mcu_spec §3.2: theta は float32 [rad])、そのあと [deg] へ変換して既存の C610
  *    カスケード位置制御へ渡す (HLControlUDP_SetC610TargetOffsetDeg、5003番の 0x07 と同じ経路。
  *    C610Position 側の入力単位が deg のため、クランプ後にのみ変換する)。
+ *    ★2026-09-12: このクランプ幅は C610_POS_TARGET_LIMIT_DEG (c610_position.h) から直接
+ *    導出するよう変更した。以前は ±2π/3 を独立に定義していたため、5003番 0x07 の角度
+ *    クランプ (C610Position_SetTargetOffsetDeg 内、当時 ±150°) を広げても ROS2 (8888) 経由
+ *    はこの独立クランプ (±120°) の方が先に効いてしまい、150°まで指令できなかった
+ *    (ユーザー報告により発覚)。単一の定数を参照する形にして、今後この2つが再び
+ *    ズレることがないようにした。
  *  - gripper (0=開,1=閉) を HLControlUDP_SetGripperClosed() へ (0x02/0x03 と同じ経路。
  *    TTL_OPEN/CLOSE_DEG の実機物理向きは hl_control_udp.h で補正済み)。
  *  - control_flags bit1 (縦にする) を HLControlUDP_SetWristPitchYawDeg() へ
@@ -59,10 +66,13 @@ extern "C" {
 /* 円周率 (math.h の M_PI はビルド設定によって定義されないことがあるため自前で持つ)。 */
 #define ROS2_PI  (3.14159265358979323846f)
 
-/* theta 入力値 [rad] のクランプ範囲 (ユーザー指示。payload の theta は [rad] なので
- * rad のまま扱う)。±2π/3 (= ±120°)。 */
-#define ROS2_THETA_MIN_RAD  (-2.0f / 3.0f * ROS2_PI)
-#define ROS2_THETA_MAX_RAD   (2.0f / 3.0f * ROS2_PI)
+/* theta 入力値 [rad] のクランプ範囲。payload の theta は [rad] なので rad のまま扱うが、
+ * 範囲の実体は C610_POS_TARGET_LIMIT_DEG (c610_position.h、既定 ±150°) をそのまま rad に
+ * 換算したもの —— 5003番 0x07 の角度クランプと同じ定数を参照することで、2つの経路の
+ * クランプ幅が再びズレないようにしてある (2026-09-12、ユーザー報告で発覚したズレを修正)。
+ * C610_POS_TARGET_LIMIT_DEG を変えれば両方の経路に反映される。 */
+#define ROS2_THETA_MIN_RAD  (-C610_POS_TARGET_LIMIT_DEG * ROS2_PI / 180.0f)
+#define ROS2_THETA_MAX_RAD   (C610_POS_TARGET_LIMIT_DEG * ROS2_PI / 180.0f)
 
 /* 電源投入から自動初期化 (theta→INIT、グリッパ→開) を実行するまでの遅延 [ms]。
  * C610_CURRENT_STARTUP_DELAY_MS (2秒) より後であること。 */

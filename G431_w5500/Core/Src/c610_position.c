@@ -70,6 +70,10 @@ void C610Position_SetTargetOffsetDeg(C610Position_t *pc, float offset_deg)
     if (pc == NULL) {
         return;
     }
+    /* 原点からの差分角を -150〜+150deg にクランプ (C610_POS_TARGET_LIMIT_DEG、ユーザー指示)。
+     * ここで一括クランプするので、呼び出し元 (0x07 ハンドラ / ROS2 SetC610TargetOffsetDeg)
+     * を問わず適用される。 */
+    offset_deg = C610Pos_Clamp(offset_deg, C610_POS_TARGET_LIMIT_DEG);
     pc->input_offset_deg = offset_deg;
     pc->target_deg = C610Pos_Norm360(pc->origin_deg + offset_deg);
     pc->enabled    = 1U;

@@ -45,6 +45,12 @@ extern "C" {
 /* 電流指令のクランプ [A] (要求仕様: -0.5〜0.5A) */
 #define C610_POS_OUTPUT_LIMIT_A     1.6f
 
+/* SetTargetOffsetDeg() が受け付ける「原点からの差分角」の入力クランプ範囲 [deg] (対称)。
+ * ケーブルの巻き込み防止等の安全策。5003番 0x07 / ROS2 (theta 経由) 双方に適用される
+ * (C610Position_SetTargetOffsetDeg() 内でクランプするため、呼び出し元によらず効く)。
+ * ★2026-09-12: ユーザー指示で追加 (-150〜+150deg)。 */
+#define C610_POS_TARGET_LIMIT_DEG    150.0f
+
 /* --- 外側: 位置ループ (P制御) --- */
 /* vel_sp[deg/s] = POS_KP * 角度誤差[deg]。0.1 なら 30deg 誤差 → 3deg/s 指令。
  * ★2026-09-12: ユーザー指示で 10.0 → 40.0 (4倍) に変更。 */
