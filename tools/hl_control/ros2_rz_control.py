@@ -50,8 +50,9 @@ STATUS_BIT_NAMES = {
 }
 
 # --- 簡易キネマティクス (STM32側 hl_control_udp.h の HLCONTROL_RZ_* と一致させること。表示専用) ---
+# ★2026-09-11: r 側のオフセット項 (+0.2m) はユーザー指示で削除した。
 Z_AMPLITUDE_M, Z_PHASE_DEG = 0.12, 10.0
-R_AMPLITUDE_M, R_PHASE_DEG, R_OFFSET_M = 2.0 * 0.33, 60.0, 0.2
+R_AMPLITUDE_M, R_PHASE_DEG = 2.0 * 0.33, 60.0
 GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 70.0
 GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 0.0
 
@@ -60,8 +61,8 @@ def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
-R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG)) + R_OFFSET_M
-R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG)) + R_OFFSET_M
+R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))
+R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG))
 Z_MIN_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MIN_DEG + Z_PHASE_DEG))
 Z_MAX_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MAX_DEG + Z_PHASE_DEG))
 

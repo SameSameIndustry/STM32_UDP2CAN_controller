@@ -82,10 +82,11 @@ static float HLControl_ThetaDegFromZ(float z_m)
     return HLControl_ClampGim6010PitchDeg(theta);
 }
 
-/* r [m] → GIM8018 ピッチ角 [deg] (-50〜0 にクランプ済み)。 r = A*cos(phi + phase) + offset の逆。 */
+/* r [m] → GIM8018 ピッチ角 [deg] (-50〜0 にクランプ済み)。 r = A*cos(phi + phase) の逆。
+ * ★2026-09-11: オフセット項は削除済み (ユーザー指示)。 */
 static float HLControl_PhiDegFromR(float r_m)
 {
-    float ratio = HLControl_ClampUnit((r_m - HLCONTROL_RZ_R_OFFSET_M) / HLCONTROL_RZ_R_AMPLITUDE_M);
+    float ratio = HLControl_ClampUnit(r_m / HLCONTROL_RZ_R_AMPLITUDE_M);
     float phi = (acosf(ratio) * HLCONTROL_RAD2DEG) - HLCONTROL_RZ_R_PHASE_DEG;
     return HLControl_ClampGim8018PitchDeg(phi);
 }
@@ -99,9 +100,8 @@ static float HLControl_ZFromThetaDeg(float theta_deg)
 
 static float HLControl_RFromPhiDeg(float phi_deg)
 {
-    return (HLCONTROL_RZ_R_AMPLITUDE_M
-            * cosf((phi_deg + HLCONTROL_RZ_R_PHASE_DEG) / HLCONTROL_RAD2DEG))
-           + HLCONTROL_RZ_R_OFFSET_M;
+    return HLCONTROL_RZ_R_AMPLITUDE_M
+           * cosf((phi_deg + HLCONTROL_RZ_R_PHASE_DEG) / HLCONTROL_RAD2DEG);
 }
 
 /* 電源投入(HAL_GetTick()=0)から HLCONTROL_MOTOR_CAN_START_MS 経過したら1。

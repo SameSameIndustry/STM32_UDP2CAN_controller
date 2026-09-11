@@ -87,15 +87,15 @@ extern "C" {
 
 /* r / z 座標指令 (0x06 / 0x07 / ROS2 0x01) の簡易キネマティクス係数。
  *   z [m] = Z_AMPLITUDE * sin(theta_deg + Z_PHASE)
- *   r [m] = R_AMPLITUDE * cos(phi_deg   + R_PHASE) + R_OFFSET
+ *   r [m] = R_AMPLITUDE * cos(phi_deg   + R_PHASE)
  * theta_deg は GIM6010 ピッチ角 (0x04 の入力値と同じ意味、0〜70deg)。
  * phi_deg   は GIM8018 ピッチ角 (0x05 の入力値と同じ意味、-50〜0deg)。
- * STM32 側で asinf / acosf により phi_deg / theta_deg を逆算し、既存経路へ流す。 */
+ * STM32 側で asinf / acosf により phi_deg / theta_deg を逆算し、既存経路へ流す。
+ * ★2026-09-11: r 側のオフセット項 (+0.2m) はユーザー指示で削除した。 */
 #define HLCONTROL_RZ_Z_AMPLITUDE_M (0.12f)
 #define HLCONTROL_RZ_Z_PHASE_DEG   (10.0f)
 #define HLCONTROL_RZ_R_AMPLITUDE_M (2.0f * 0.33f)   /* = 0.66 */
 #define HLCONTROL_RZ_R_PHASE_DEG   (60.0f)
-#define HLCONTROL_RZ_R_OFFSET_M    (0.2f)
 
 /* 初期化。ttl/gim6010_a/gim6010_b/gim8018_c/gim8018_d はいずれも NULL 可。
  * gim6010_a/b_initial_native は GIM6010 の初期位置 (ネイティブturns、プログラム側定数)。

@@ -3,6 +3,9 @@
 #include "hl_control_udp.h"
 #include "socket.h"
 #include <string.h>
+#include <math.h>
+
+#define ROS2_DEG2RAD (3.14159265358979323846f / 180.0f)
 
 /* フィードバック宛先 (ROS2 側 PC)。ROS2Link_Init で設定。既定は main.c の dest_ip と同じ。 */
 static uint8_t s_pc_ip[4] = { 192U, 168U, 1U, 2U };
@@ -10,6 +13,9 @@ static uint8_t s_pc_ip[4] = { 192U, 168U, 1U, 2U };
 static uint8_t  s_started      = 0U;   /* socket を開いたか */
 static uint8_t  s_ever_rx      = 0U;   /* 0x01 を一度でも受信したか */
 static uint8_t  s_ever_discard = 0U;   /* 破棄を一度でも起こしたか */
+
+/* 電源投入 ROS2_LINK_INIT_DELAY_MS 後の自動初期化 (z,r → INIT角) が済んだか。 */
+static uint8_t  s_boot_init_done = 0U;
 
 static uint32_t s_last_valid_rx_tick = 0U;  /* 最後に構造的に有効な 0x01 を受けた時刻 */
 static uint32_t s_last_discard_tick  = 0U;  /* 最後に破棄した時刻 */
@@ -178,6 +184,22 @@ static void ROS2Link_SendFeedback(void)
     (void)sendto(ROS2_LINK_SN, (uint8_t *)&fb, (uint16_t)sizeof(fb), s_pc_ip, ROS2_PC_FB_PORT);
 }
 
+/* 電源投入 ROS2_LINK_INIT_DELAY_MS 後に1回だけ実行する自動初期化。
+ * z軸(GIM6010)を ROS2_INIT_THETA_DEG、r軸(GIM8018)を ROS2_INIT_PHI_DEG へ。
+ * 既存の r,z [m] ベースの公開 API (HLControlUDP_Ros2SetTargetsMeters) をそのまま使うため、
+ * 「モータ角 0deg」に対応する r,z [m] を、既存のキネマティクス係数から逆算する
+ * (hl_control_udp.h の HLCONTROL_RZ_* と同じ式。オフセット項は削除済み)。 */
+static void ROS2Link_RunBootInit(void)
+{
+    float z_init = HLCONTROL_RZ_Z_AMPLITUDE_M
+                   * sinf((ROS2_INIT_THETA_DEG + HLCONTROL_RZ_Z_PHASE_DEG) * ROS2_DEG2RAD);
+    float r_init = HLCONTROL_RZ_R_AMPLITUDE_M
+                   * cosf((ROS2_INIT_PHI_DEG + HLCONTROL_RZ_R_PHASE_DEG) * ROS2_DEG2RAD);
+
+    HLControlUDP_Ros2SetTargetsMeters(r_init, z_init);
+    s_boot_init_done = 1U;
+}
+
 void ROS2Link_Tick(void)
 {
     uint32_t now;
@@ -186,11 +208,22 @@ void ROS2Link_Tick(void)
         return;
     }
 
-    /* CAN 送信のペーシング: 1 tick に 1 軸だけ (HAL_Delay なし)。ROS2 未接続なら no-op。 */
+    now = HAL_GetTick();
+
+    /* 電源投入 ROS2_LINK_INIT_DELAY_MS 後に1回だけ、z,r を初期角へ (ROS2 未接続でも実行)。 */
+    if (!s_boot_init_done && (now >= ROS2_LINK_INIT_DELAY_MS)) {
+        ROS2Link_RunBootInit();
+    }
+
+    /* CAN 送信のペーシング: 1 tick に 1 軸だけ (HAL_Delay なし)。目標未設定なら no-op。 */
     HLControlUDP_FlushOneAxis();
 
-    /* 0x81 feedback を ROS2_LINK_FB_PERIOD_MS 周期で自発送信 (§3.4。初版は10Hzまで間引く)。 */
-    now = HAL_GetTick();
+    /* 0x81 feedback は電源投入 ROS2_LINK_FB_START_DELAY_MS 経過後から送信開始
+     * (それまでは自動初期化の指令が CAN に流れ切るのを待つだけで、何も送らない)。
+     * 以後は ROS2_LINK_FB_PERIOD_MS 周期で自発送信 (§3.4。初版は10Hzまで間引く)。 */
+    if (now < ROS2_LINK_FB_START_DELAY_MS) {
+        return;
+    }
     if ((now - s_last_fb_tick) >= ROS2_LINK_FB_PERIOD_MS) {
         s_last_fb_tick = now;
         ROS2Link_SendFeedback();

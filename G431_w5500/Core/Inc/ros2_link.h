@@ -14,14 +14,18 @@ extern "C" {
  *  - r,z [m] を取り出し、簡易キネマティクスの逆変換で GIM 目標角を決めて
  *    hl_control_udp.c へ記憶させる (HLControlUDP_Ros2SetTargetsMeters)。
  *    実際の CAN 送信は HLControlUDP_FlushOneAxis() が 1 tick 1 軸で行う。
- *  - 起動直後から ROS2_LINK_FB_PERIOD_MS 周期 (既定10Hz) で 0x81 feedback を
- *    ROS2 側 PC (ROS2_PC_IP:8889) へ自発送信する (mcu_spec は100Hzを想定しているが、
- *    W5500 ソケットバッファ・CANバス負荷に余裕を持たせるため初版は10Hzまで間引く。
- *    2026-09-11 ユーザー指示)。
+ *  - 起動 (電源投入) から ROS2_LINK_INIT_DELAY_MS (既定3秒) 経過したら 1 回だけ、
+ *    z 軸 (GIM6010) を ROS2_INIT_THETA_DEG、r 軸 (GIM8018) を ROS2_INIT_PHI_DEG
+ *    (いずれも既定0deg = モータのピッチ角入力値、0x04/0x05 と同じ意味) へ自動で動かす
+ *    (mcu_spec §4.6 の電源投入時の初期位置移動に相当。ROS2 の接続有無に関わらず実行する)。
+ *  - 起動から ROS2_LINK_FB_START_DELAY_MS (既定5秒、INIT_DELAY より後) 経過するまでは
+ *    0x81 feedback を送信しない。それ以降は ROS2_LINK_FB_PERIOD_MS 周期 (既定10Hz) で
+ *    自発送信する (mcu_spec は100Hzを想定しているが、W5500 ソケットバッファ・CANバス負荷に
+ *    余裕を持たせるため初版は10Hzまで間引く。2026-09-11 ユーザー指示)。
  *
- * ★既存の CAN 通信層・初期化・5003 番プロトコルには一切触れない。
- *   ROS2 から 0x01 を一度も受信しなければ、この基板の挙動は従来と完全に同一
- *   (HLControlUDP_FlushOneAxis / 目標更新は s_ros2_active が立つまで no-op)。
+ * ★既存の CAN 通信層・初期化・5003 番プロトコルには一切触れない (電源投入後の自動初期化は
+ *   ros2_link 内で完結し、既存の公開 API (HLControlUDP_Ros2SetTargetsMeters) 経由でしか
+ *   CAN を触らない)。ROS2 からの 0x01 受信 (Poll) は電源投入直後から動作する。
  *
  * 初版で「やらないこと」(mcu_spec §10.1):
  *  - §4.2 補間 / §4.4 スルーレート制限 (受信位置をそのまま目標にする)
@@ -49,6 +53,17 @@ extern "C" {
  * 10Hz運用での複数回分の間隔を見込む。 */
 #define ROS2_LINK_SEQ_RESET_MS  500U
 
+/* 電源投入から自動初期化 (z→INIT, r→INIT) を実行するまでの遅延 [ms] (ユーザー指示)。 */
+#define ROS2_LINK_INIT_DELAY_MS      3000U
+/* 電源投入から 0x81 feedback の送信を開始するまでの遅延 [ms] (ユーザー指示。
+ * INIT_DELAY より後にすること — 初期化の指令が実際に CAN へ流れ切る猶予を見込む)。 */
+#define ROS2_LINK_FB_START_DELAY_MS  5000U
+
+/* 電源投入時の自動初期化で使うモータのピッチ角 [deg] (0x04/0x05 の入力値と同じ意味。
+ * ユーザー指示で「0deg」= GIM6010(z軸)/GIM8018(r軸) とも 0deg。変更したい場合はここを直す)。 */
+#define ROS2_INIT_THETA_DEG  (0.0f)   /* GIM6010 (z軸) */
+#define ROS2_INIT_PHI_DEG    (0.0f)   /* GIM8018 (r軸) */
+
 /* 初期化。ros2_pc_ip はフィードバック宛先 (ROS2 側 PC) の IPv4。listen ソケットを開く。
  * HLControlUDP_Init() の後に 1 回だけ呼ぶ。 */
 void ROS2Link_Init(const uint8_t ros2_pc_ip[4]);
@@ -57,8 +72,10 @@ void ROS2Link_Init(const uint8_t ros2_pc_ip[4]);
 void ROS2Link_Poll(void);
 
 /* 周期処理。メインループ / Delay_WithCANPoll から毎回呼ぶ:
+ *   - 電源投入 ROS2_LINK_INIT_DELAY_MS 後に1回だけ自動初期化 (z,r → INIT角)
  *   - HLControlUDP_FlushOneAxis() を 1 回呼ぶ (CAN 送信のペーシング)
- *   - ROS2_LINK_FB_PERIOD_MS ごとに 0x81 feedback を送信
+ *   - 電源投入 ROS2_LINK_FB_START_DELAY_MS 後から ROS2_LINK_FB_PERIOD_MS ごとに
+ *     0x81 feedback を送信
  *   - ウォッチドッグ判定 */
 void ROS2Link_Tick(void);
 
