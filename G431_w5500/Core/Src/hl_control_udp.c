@@ -52,7 +52,7 @@ static float HLControl_ClampGim6010PitchDeg(float deg)
     return deg;
 }
 
-/* GIM8018 ピッチ角 [deg] を機構可動域 -50〜0deg にクランプする。
+/* GIM8018 ピッチ角 [deg] を機構可動域 -50〜15deg にクランプする。
  * 0x05 (ピッチ生指令) / 0x06 (r 座標指令) / ROS2 の全経路で通す。 */
 static float HLControl_ClampGim8018PitchDeg(float deg)
 {
@@ -74,15 +74,20 @@ static float HLControl_ClampUnit(float v)
 
 /* ===== 簡易キネマティクス (0x06 / 0x07 / ROS2 0x01 共用)。係数は hl_control_udp.h ===== */
 
-/* z [m] → GIM6010 ピッチ角 [deg] (0〜70 にクランプ済み)。 z = A*sin(theta + phase) の逆。 */
+/* z [m] → GIM6010 ピッチ角 [deg] (0〜110 にクランプ済み)。
+ * 2026-09-12: 二等辺三角形の弦長の式 (辺長 A の等辺二本、挟角 theta+phase) に変更 (ユーザー指示):
+ *   z^2 = 2*A^2 - 2*A^2*cos(theta+phase)  ==(半角公式 1-cosX=2sin^2(X/2))==>  z = 2*A*sin((theta+phase)/2)
+ * この式は theta+phase が 0〜180° の間ずっと単調増加なので (旧式の sin(theta+phase) と違って
+ * theta=80°で頭打ちにならない)、クランプ全域 (0〜110deg) で asinf の主値だけで一意に逆算でき、
+ * 旧式にあった「振幅以上は直接クランプ上限を返す」特例は不要になった。 */
 static float HLControl_ThetaDegFromZ(float z_m)
 {
-    float ratio = HLControl_ClampUnit(z_m / HLCONTROL_RZ_Z_AMPLITUDE_M);
-    float theta = (asinf(ratio) * HLCONTROL_RAD2DEG) - HLCONTROL_RZ_Z_PHASE_DEG;
+    float ratio = HLControl_ClampUnit(z_m / (2.0f * HLCONTROL_RZ_Z_AMPLITUDE_M));
+    float theta = (2.0f * asinf(ratio) * HLCONTROL_RAD2DEG) - HLCONTROL_RZ_Z_PHASE_DEG;
     return HLControl_ClampGim6010PitchDeg(theta);
 }
 
-/* r [m] → GIM8018 ピッチ角 [deg] (-50〜0 にクランプ済み)。 r = A*cos(phi + phase) の逆。
+/* r [m] → GIM8018 ピッチ角 [deg] (-50〜15 にクランプ済み)。 r = A*cos(phi + phase) の逆。
  * ★2026-09-11: オフセット項は削除済み (ユーザー指示)。 */
 static float HLControl_PhiDegFromR(float r_m)
 {
@@ -94,8 +99,9 @@ static float HLControl_PhiDegFromR(float r_m)
 /* 順変換 (0x81 feedback 用)。 */
 static float HLControl_ZFromThetaDeg(float theta_deg)
 {
-    return HLCONTROL_RZ_Z_AMPLITUDE_M
-           * sinf((theta_deg + HLCONTROL_RZ_Z_PHASE_DEG) / HLCONTROL_RAD2DEG);
+    /* z = 2*A*sin((theta+phase)/2)。HLControl_ThetaDegFromZ() のコメント参照。 */
+    return 2.0f * HLCONTROL_RZ_Z_AMPLITUDE_M
+           * sinf(((theta_deg + HLCONTROL_RZ_Z_PHASE_DEG) / 2.0f) / HLCONTROL_RAD2DEG);
 }
 
 static float HLControl_RFromPhiDeg(float phi_deg)
@@ -150,7 +156,7 @@ static void HLControl_CommandGim6010PitchDeg(float pitch_deg)
 
 /* GIM8018 (0x04/0x05) を「ピッチ角 [deg]」で指令する共通処理。
  * 0x05 ハンドラと全く同じ換算・順序 (偏差、C=原点+Δ / D=原点-Δ、node5(D) → 5ms → node4(C))。
- * phi は常に -50〜0deg にクランプする。正規化未完了なら何もしない (0x05 と同じガード)。 */
+ * phi は常に -50〜15deg にクランプする。正規化未完了なら何もしない (0x05 と同じガード)。 */
 static void HLControl_CommandGim8018PitchDeg(float pitch_deg)
 {
     float native_delta;
@@ -189,8 +195,8 @@ void HLControlUDP_Ros2SetTargetsMeters(float r_m, float z_m)
     }
     s_ros2_active = 1U;
 
-    theta_deg = HLControl_ThetaDegFromZ(z_m);   /* 0〜70deg クランプ済み */
-    phi_deg   = HLControl_PhiDegFromR(r_m);     /* -50〜0deg クランプ済み */
+    theta_deg = HLControl_ThetaDegFromZ(z_m);   /* 0〜110deg クランプ済み */
+    phi_deg   = HLControl_PhiDegFromR(r_m);     /* -50〜15deg クランプ済み */
     d6 = (-theta_deg / 360.0f) * GIM6010_GEAR_RATIO;
     d8 = ( phi_deg   / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
@@ -353,7 +359,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&pitch_deg, &buf[1], sizeof(float));
-        /* 入力値を 0〜70deg にクランプ → 符号反転 → 偏差計算 (要求仕様通り)。 */
+        /* 入力値を 0〜110deg にクランプ → 符号反転 → 偏差計算 (要求仕様通り)。 */
         pitch_deg = HLControl_ClampGim6010PitchDeg(pitch_deg);
         pitch_deg = -pitch_deg;
         native_delta = (pitch_deg / 360.0f) * GIM6010_GEAR_RATIO;  /* 減速比8 */
@@ -387,7 +393,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&pitch_deg, &buf[1], sizeof(float));
-        pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);  /* -50〜0deg にクランプ */
+        pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);  /* -50〜15deg にクランプ */
         native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
         /* C(0x04) = 原点 + 偏差、D(0x05) = 原点 - 偏差。★node5(D) → 5ms → node4(C) の順。 */
@@ -412,7 +418,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&r_m, &buf[1], sizeof(float));
-        /* r [m] → phi [deg] (acos で逆変換、-50〜0deg クランプ) → 0x05 と同じ経路。 */
+        /* r [m] → phi [deg] (acos で逆変換、-50〜15deg クランプ) → 0x05 と同じ経路。 */
         HLControl_CommandGim8018PitchDeg(HLControl_PhiDegFromR(r_m));
     } else if (cmd == HLCONTROL_CMD_SET_Z_TARGET_M) {
         float z_m;
@@ -424,7 +430,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&z_m, &buf[1], sizeof(float));
-        /* z [m] → theta [deg] (asin で逆変換、0〜70deg クランプ) → 0x04 と同じ経路。 */
+        /* z [m] → theta [deg] (asin で逆変換、0〜110deg クランプ) → 0x04 と同じ経路。 */
         HLControl_CommandGim6010PitchDeg(HLControl_ThetaDegFromZ(z_m));
     }
     /* 未知のコマンドは無視する */

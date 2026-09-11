@@ -53,8 +53,8 @@ STATUS_BIT_NAMES = {
 # ★2026-09-11: r 側のオフセット項 (+0.2m) はユーザー指示で削除した。
 Z_AMPLITUDE_M, Z_PHASE_DEG = 0.12, 10.0
 R_AMPLITUDE_M, R_PHASE_DEG = 2.0 * 0.33, 60.0
-GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 70.0
-GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 0.0
+GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 110.0
+GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 15.0
 
 
 def clamp(v, lo, hi):
@@ -63,8 +63,10 @@ def clamp(v, lo, hi):
 
 R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))
 R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG))
-Z_MIN_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MIN_DEG + Z_PHASE_DEG))
-Z_MAX_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MAX_DEG + Z_PHASE_DEG))
+# ★2026-09-12: z = 2*A*sin((theta+phase)/2) (弦長の式)。(theta+phase)/2 が 0〜90° の間
+#   ずっと単調増加なので、境界 (theta の最小/最大) がそのまま真の最小/最大になる。
+Z_MIN_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MIN_DEG + Z_PHASE_DEG) / 2.0))
+Z_MAX_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MAX_DEG + Z_PHASE_DEG) / 2.0))
 
 
 def pack_polar(seq, r_m, z_m, control_flags):

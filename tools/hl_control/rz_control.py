@@ -5,8 +5,9 @@ r/z 座標コントローラ GUI (192.168.1.100 の r/z 基板専用)。
 STM32 側が簡易キネマティクスの逆変換とクランプを行うので、この GUI は座標 [m] を
 そのまま送るだけ (fire-and-forget、STM32 からの応答は無い)。
 
-  z [m] = 0.12 * sin(theta + 10deg)          theta = GIM6010 ピッチ角 [deg]、STM32側で 0〜70deg クランプ
-  r [m] = 2*0.33 * cos(phi + 60deg)          phi   = GIM8018 ピッチ角 [deg]、STM32側で -50〜0deg クランプ
+  z [m] = 2*0.12 * sin((theta + 10deg)/2)    theta = GIM6010 ピッチ角 [deg]、STM32側で 0〜110deg クランプ
+                                              (辺長0.12の二等辺三角形の弦長の式。2026-09-12〜)
+  r [m] = 2*0.33 * cos(phi + 60deg)          phi   = GIM8018 ピッチ角 [deg]、STM32側で -50〜15deg クランプ
 
 係数の正本は STM32 側 hl_control_udp.h (HLCONTROL_RZ_*)。ここの値は表示・スライダ範囲用の複製。
 仕様: tools/hl_control/PROTOCOL_HL_CONTROL_UDP.md
@@ -34,8 +35,8 @@ R_AMPLITUDE_M = 2.0 * 0.33   # = 0.66
 R_PHASE_DEG = 60.0
 
 # STM32 側のクランプ範囲 (deg)
-GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 70.0
-GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 0.0
+GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 110.0
+GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 15.0
 
 CONTINUOUS_INTERVAL_MS = 200
 
@@ -45,24 +46,27 @@ def clamp(v, lo, hi):
 
 
 def r_to_phi_deg(r_m):
-    """STM32 と同じ逆変換: phi = acos(clamp(r/A, -1, 1)) - phase、その後 -50〜0deg クランプ。"""
+    """STM32 と同じ逆変換: phi = acos(clamp(r/A, -1, 1)) - phase、その後 -50〜15deg クランプ。"""
     ratio = clamp(r_m / R_AMPLITUDE_M, -1.0, 1.0)
     phi = math.degrees(math.acos(ratio)) - R_PHASE_DEG
     return clamp(phi, GIM8018_MIN_DEG, GIM8018_MAX_DEG)
 
 
 def z_to_theta_deg(z_m):
-    """STM32 と同じ逆変換: theta = asin(clamp(z/A, -1, 1)) - phase、その後 0〜70deg クランプ。"""
-    ratio = clamp(z_m / Z_AMPLITUDE_M, -1.0, 1.0)
-    theta = math.degrees(math.asin(ratio)) - Z_PHASE_DEG
+    """STM32 と同じ逆変換: theta = 2*asin(clamp(z/(2A), -1, 1)) - phase、その後 0〜110deg クランプ。"""
+    ratio = clamp(z_m / (2.0 * Z_AMPLITUDE_M), -1.0, 1.0)
+    theta = 2.0 * math.degrees(math.asin(ratio)) - Z_PHASE_DEG
     return clamp(theta, GIM6010_MIN_DEG, GIM6010_MAX_DEG)
 
 
-# スライダの端 = クランプ後の角度が端に一致する座標 (端の外を出しても STM32 が弾く)
-R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))  # phi=0   -> 0.33
+# スライダの端 = クランプ後の角度が端に一致する座標 (端の外を出しても STM32 が弾く)。
+# ★2026-09-12: z = 2*A*sin((theta+phase)/2) は (theta+phase)/2 が 0〜90° の間ずっと
+#   単調増加なので (0〜110deg の全域で該当)、旧式のような頂点での特別扱いは不要。
+#   境界 (theta の最小/最大) をそのまま評価すれば真の最小/最大になる。
+R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))  # phi=15  -> 0.17
 R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG))  # phi=-50 -> 0.65
-Z_MIN_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MIN_DEG + Z_PHASE_DEG))  # theta=0  -> 0.021
-Z_MAX_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MAX_DEG + Z_PHASE_DEG))  # theta=70 -> 0.118
+Z_MIN_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MIN_DEG + Z_PHASE_DEG) / 2.0))  # theta=0   -> 0.021
+Z_MAX_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MAX_DEG + Z_PHASE_DEG) / 2.0))  # theta=110 -> 0.208
 
 
 class RZController(tk.Tk):

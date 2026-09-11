@@ -29,7 +29,7 @@ extern "C" {
  *   HLCONTROL_CMD_TTL_OPEN  (0x02): payloadなし。0x21 へ HLCONTROL_TTL_OPEN_DEG。
  *   HLCONTROL_CMD_TTL_CLOSE (0x03): payloadなし。0x21 へ HLCONTROL_TTL_CLOSE_DEG。
  *   HLCONTROL_CMD_SET_GIM6010_PITCH_TARGET_DEG (0x04): payload = float32 LE、角度[deg]。
- *     入力値を 0〜70deg にクランプ → 符号反転 → 偏差 (deg/360*GIM6010_GEAR_RATIO)。
+ *     入力値を 0〜110deg にクランプ → 符号反転 → 偏差 (deg/360*GIM6010_GEAR_RATIO)。
  *     0x06・0x07 とも「各軸の初期位置 + 偏差」を Set_Input_Pos で 1 発送信 (A → 5ms → B)。
  *     初期位置は main.c の GIM6010_A/B_INITIAL_NATIVE_TURNS。
  *   HLCONTROL_CMD_SET_GIM8018_PITCH_TARGET_DEG (0x05): payload = float32 LE、角度[deg]。
@@ -39,16 +39,17 @@ extern "C" {
  *     で渡される。正規化未完了の間は 0x05 を無視する (古い種で暴走するため)。
  *
  *   HLCONTROL_CMD_SET_R_TARGET_M (0x06): payload = float32 LE、r 座標[m]。
- *     r = A*cos(phi + phase) + offset の逆変換で phi = acos((r-offset)/A) - phase を求め、
- *     -50〜0deg にクランプ → 0x05 と同じ経路 (GIM8018 C=原点+偏差 / D=原点-偏差) で送信する。
+ *     r = A*cos(phi + phase) の逆変換で phi = acos(r/A) - phase を求め、
+ *     -50〜15deg にクランプ → 0x05 と同じ経路 (GIM8018 C=原点+偏差 / D=原点-偏差) で送信する。
  *   HLCONTROL_CMD_SET_Z_TARGET_M (0x07): payload = float32 LE、z 座標[m]。
- *     z = A*sin(theta + phase) の逆変換で theta = asin(z/A) - phase を求め、
- *     0x04 と同じクランプ(0〜70deg)・同じ経路 (GIM6010 A/B とも 初期位置+偏差) で送信する。
+ *     z = 2*A*sin((theta+phase)/2) (二等辺三角形の弦長の式) の逆変換で
+ *     theta = 2*asin(z/(2*A)) - phase を求め、0x04 と同じクランプ(0〜110deg)・
+ *     同じ経路 (GIM6010 A/B とも 初期位置+偏差) で送信する。
  *
  *   (0x01 = wave motor ピッチ指令はこの基板では未使用のため削除した。)
  *
  * 角度のクランプは STM32 側で行う。Python 側は範囲チェック不要。
- * GIM6010 は全経路 0〜70deg、GIM8018 は全経路 -50〜0deg にクランプされる。
+ * GIM6010 は全経路 0〜110deg、GIM8018 は全経路 -50〜15deg にクランプされる。
  *
  * ROS2 連携 (docs/mcu_spec.md 準拠、port 8888 受信 / 8889 送信、0x01 polar / 0x81 feedback)
  * は別モジュール ros2_link.c/.h が担当する。5003 番の本プロトコルは並存する。
@@ -76,20 +77,26 @@ extern "C" {
  * watchdog_timeout の半分以下にすること (デフォルトが分からなければ 300ms が安全)。 */
 #define HLCONTROL_RESEND_MS 300U
 
-/* GIM6010 ピッチ角のクランプ範囲。実機の出力角可動範囲が -70〜0deg のため、
- * 符号反転する前の「入力値」としては 0〜70deg。0x04 / 0x07 / ROS2 の全経路に適用する。 */
+/* GIM6010 ピッチ角のクランプ範囲。実機の出力角可動範囲が -110〜0deg のため (2026-09-12〜。
+ * 以前は -70〜0deg → -90〜0deg → 現在 -110〜0deg (随時更新)。符号反転する前の「入力値」としては 0〜110deg。
+ * 0x04 / 0x07 / ROS2 の全経路に適用する。
+ * ★2026-09-12: z 座標経路 (0x07 / ROS2) の式を旧 z=A*sin(theta+10°) から
+ *   z=2*A*sin((theta+10°)/2) (弦長の式) に変更した (ユーザー指示)。旧式は θ=80°で
+ *   頭打ちになり asinf の主値だけでは θ>80° に逆算で届かなかったが、新式は
+ *   0〜110deg の全域で単調増加なので特例なしで一意に逆算できる。 */
 #define HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG (0.0f)
-#define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (70.0f)
-/* GIM8018(GIM8108-8) ピッチ角のクランプ範囲。機構可動範囲 -50〜0deg。
- * 0x05 / 0x06 / ROS2 の全経路に適用する (以前は 0x05 のみクランプなしだった)。 */
+#define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (110.0f)
+/* GIM8018(GIM8108-8) ピッチ角のクランプ範囲。機構可動範囲 -50〜15deg (2026-09-12〜。
+ * 以前は -50〜0deg だった)。0x05 / 0x06 / ROS2 の全経路に適用する。 */
 #define HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG (-50.0f)
-#define HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG  (0.0f)
+#define HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG  (15.0f)
 
 /* r / z 座標指令 (0x06 / 0x07 / ROS2 0x01) の簡易キネマティクス係数。
- *   z [m] = Z_AMPLITUDE * sin(theta_deg + Z_PHASE)
+ *   z [m] = 2*Z_AMPLITUDE * sin((theta_deg + Z_PHASE)/2)   (2026-09-12〜。辺長 Z_AMPLITUDE の
+ *           等辺二本・挟角(theta_deg+Z_PHASE)の二等辺三角形の弦長 = 半角公式で導出)
  *   r [m] = R_AMPLITUDE * cos(phi_deg   + R_PHASE)
- * theta_deg は GIM6010 ピッチ角 (0x04 の入力値と同じ意味、0〜70deg)。
- * phi_deg   は GIM8018 ピッチ角 (0x05 の入力値と同じ意味、-50〜0deg)。
+ * theta_deg は GIM6010 ピッチ角 (0x04 の入力値と同じ意味、0〜110deg)。
+ * phi_deg   は GIM8018 ピッチ角 (0x05 の入力値と同じ意味、-50〜15deg)。
  * STM32 側で asinf / acosf により phi_deg / theta_deg を逆算し、既存経路へ流す。
  * ★2026-09-11: r 側のオフセット項 (+0.2m) はユーザー指示で削除した。 */
 #define HLCONTROL_RZ_Z_AMPLITUDE_M (0.12f)

@@ -46,12 +46,12 @@ STM32のIPアドレスは他の通信 (CAN-UDPブリッジ等) と共通 (`main.
 | `SET_PITCH_TARGET` (value=v) | `v` を `-100.0 〜 +100.0` の範囲にクランプしてから、CAN ID `0x11` (wave motor 1台目) へ **符号反転した値 (`-v`)** を、CAN ID `0x12` (2台目) へ **そのままの値 (`v`)** を、それぞれ `SET_TARGET` (絶対原点180°からのオフセット、`CAN_PROTOCOL_wave_motor.md` 準拠) として送信する。範囲チェック・クランプは全てSTM32側で行うため、Python側は範囲外の値をそのまま送ってよい。 |
 | `TTL_OPEN` | CAN ID `0x21` (TTLサーボ) へ、`SET_TARGET` (絶対原点180°固定からのオフセット、`CAN_PROTOCOL_TTL-SERVO.md` 準拠) でオフセット `-25.0°` を送信する。 |
 | `TTL_CLOSE` | 同じくCAN ID `0x21` へ、オフセット `+50.0°` を送信する。 |
-| `SET_GIM6010_PITCH_TARGET_DEG` (value=deg) | `deg` を `0.0 〜 +70.0` の範囲にクランプしてから、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM6010_GEAR_RATIO`) を計算する。CAN ID `0x06`・`0x07` の両方へ、ODrive CAN Simpleの `Set_Input_Pos` (絶対位置、ネイティブturns) で `(各軸の初期位置) + delta` を送信する(**0x06と0x07は全く同じ目標値**、符号反転はしない)。例: 初期位置がどちらも0のとき、90°を送ると `delta = 90/360*8 = 2.0` となり、0x06・0x07ともに目標値は+2.0になる。 |
-| `SET_GIM8018_PITCH_TARGET_DEG` (value=deg) | `deg` を **`-50.0 〜 0.0` の範囲にクランプ**してから (2026-09-11〜。以前はクランプなしだった)、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM8018_GEAR_RATIO_NOMINAL`) を計算する。CAN ID `0x04` へ `(0x04の初期位置) + delta` を、CAN ID `0x05` へ `(0x05の初期位置) - delta` (**符号反転・同じ大きさ**、GIM6010とは逆に互い違い) を、それぞれ`Set_Input_Pos`で送信する。例: 初期位置がどちらも0のとき、-30°を送ると `delta = -30/360*8 ≈ -0.667` となり、0x04の目標値は約-0.667、0x05の目標値は約+0.667になる。 |
-| `SET_R_TARGET_M` (value=r [m]) | 簡易キネマティクス `r = 2·0.33·cos(phi + 60°)` の逆変換で `phi = acos(clamp(r/0.66, -1, 1))·180/π − 60°` を求め、**`phi` を `-50° 〜 0°` にクランプ**してから、`SET_GIM8018_PITCH_TARGET_DEG` と同じ経路 (C=原点+Δ / D=原点−Δ) で送信する。`phi` の可動域は機構由来。係数は `hl_control_udp.h` の `HLCONTROL_RZ_R_AMPLITUDE_M` / `HLCONTROL_RZ_R_PHASE_DEG`。r の有効範囲は約 `0.33 〜 0.65 m`。★2026-09-11: 以前あったオフセット項 (`+0.2m`) はユーザー指示で削除した。 |
-| `SET_Z_TARGET_M` (value=z [m]) | 簡易キネマティクス `z = 0.12·sin(theta + 10°)` の逆変換で `theta = asin(clamp(z/0.12, -1, 1))·180/π − 10°` を求め、`SET_GIM6010_PITCH_TARGET_DEG` と**同じ `0° 〜 70°` クランプ**を通してから、同じ経路 (0x06・0x07 とも 初期位置+Δ) で送信する。係数は `hl_control_udp.h` の `HLCONTROL_RZ_Z_AMPLITUDE_M` / `HLCONTROL_RZ_Z_PHASE_DEG`。z の有効範囲は約 `0.021 〜 0.118 m`。 |
+| `SET_GIM6010_PITCH_TARGET_DEG` (value=deg) | `deg` を `0.0 〜 +110.0` の範囲にクランプしてから (2026-09-12〜。0〜70度 → 0〜90度 → 現在0〜110度、随時ユーザー指示で更新)、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM6010_GEAR_RATIO`) を計算する。CAN ID `0x06`・`0x07` の両方へ、ODrive CAN Simpleの `Set_Input_Pos` (絶対位置、ネイティブturns) で `(各軸の初期位置) + delta` を送信する(**0x06と0x07は全く同じ目標値**、符号反転はしない)。例: 初期位置がどちらも0のとき、90°を送ると `delta = 90/360*8 = 2.0` となり、0x06・0x07ともに目標値は+2.0になる。 |
+| `SET_GIM8018_PITCH_TARGET_DEG` (value=deg) | `deg` を **`-50.0 〜 15.0` の範囲にクランプ**してから (2026-09-11〜。以前はクランプなしだった。2026-09-12: 上限を0→15degに拡張)、ネイティブ換算の偏差 `delta = deg / 360 * 8` (減速比8、`GIM8018_GEAR_RATIO_NOMINAL`) を計算する。CAN ID `0x04` へ `(0x04の初期位置) + delta` を、CAN ID `0x05` へ `(0x05の初期位置) - delta` (**符号反転・同じ大きさ**、GIM6010とは逆に互い違い) を、それぞれ`Set_Input_Pos`で送信する。例: 初期位置がどちらも0のとき、-30°を送ると `delta = -30/360*8 ≈ -0.667` となり、0x04の目標値は約-0.667、0x05の目標値は約+0.667になる。 |
+| `SET_R_TARGET_M` (value=r [m]) | 簡易キネマティクス `r = 2·0.33·cos(phi + 60°)` の逆変換で `phi = acos(clamp(r/0.66, -1, 1))·180/π − 60°` を求め、**`phi` を `-50° 〜 15°` にクランプ**してから、`SET_GIM8018_PITCH_TARGET_DEG` と同じ経路 (C=原点+Δ / D=原点−Δ) で送信する。`phi` の可動域は機構由来。係数は `hl_control_udp.h` の `HLCONTROL_RZ_R_AMPLITUDE_M` / `HLCONTROL_RZ_R_PHASE_DEG`。r の有効範囲は約 `0.17 〜 0.65 m`。★2026-09-11: オフセット項 (`+0.2m`) は削除、★2026-09-12: `phi` 上限を `0°→15°` に拡張 (いずれもユーザー指示)。 |
+| `SET_Z_TARGET_M` (value=z [m]) | 簡易キネマティクス `z = 2·0.12·sin((theta + 10°)/2)`（辺長0.12の等辺二本・挟角`theta+10°`の二等辺三角形の弦長の式。2026-09-12〜、旧式 `z=0.12·sin(theta+10°)` から変更）の逆変換で `theta = 2·asin(clamp(z/0.24, -1, 1))·180/π − 10°` を求め、`SET_GIM6010_PITCH_TARGET_DEG` と**同じ `0° 〜 110°` クランプ**を通してから、同じ経路 (0x06・0x07 とも 初期位置+Δ) で送信する。この式は `(theta+10°)/2` が 0〜90° の間ずっと単調増加なので、旧式にあった「θ=80°で頭打ちになり asin だけでは θ>80° に届かない」問題が解消され、クランプ全域を特例なしで一意に逆算できる。係数は `hl_control_udp.h` の `HLCONTROL_RZ_Z_AMPLITUDE_M` / `HLCONTROL_RZ_Z_PHASE_DEG`。z の有効範囲は約 `0.021 〜 0.208 m`。 |
 
-**GIM6010 は全経路 `0° 〜 70°`、GIM8018 は全経路 `-50° 〜 0°` にクランプされる** (0x04/0x05/0x06/0x07、および後述の ROS2 0x01 も共通)。
+**GIM6010 は全経路 `0° 〜 110°`、GIM8018 は全経路 `-50° 〜 15°` にクランプされる** (0x04/0x05/0x06/0x07、および後述の ROS2 0x01 も共通)。
 
 0x06・0x07 / 0x04・0x05それぞれの「初期位置」(ネイティブturns) は本プロトコルでは
 設定できない。STM32側 [`main.c`](../../G431_w5500/Core/Src/main.c) の
@@ -102,13 +102,14 @@ sock.sendto(struct.pack("<B", CMD_TTL_CLOSE), (STM32_IP, HLCONTROL_PORT))
 # GIM6010のピッチ角目標値を90degに設定 (0x06・0x07とも同じ値 = 初期位置+2.0が送られる)
 sock.sendto(struct.pack("<Bf", CMD_SET_GIM6010_PITCH_TARGET_DEG, 90.0), (STM32_IP, HLCONTROL_PORT))
 
-# GIM8018のピッチ角目標値を90degに設定 (0x04は初期位置+2.0、0x05は初期位置-2.0が送られる)
-sock.sendto(struct.pack("<Bf", CMD_SET_GIM8018_PITCH_TARGET_DEG, 90.0), (STM32_IP, HLCONTROL_PORT))
+# GIM8018のピッチ角目標値を10degに設定 (0x04は初期位置+0.222、0x05は初期位置-0.222が送られる)
+# ★90degのような -50〜15度の範囲外の値を送ると15度にクランプされる (2026-09-11〜)
+sock.sendto(struct.pack("<Bf", CMD_SET_GIM8018_PITCH_TARGET_DEG, 10.0), (STM32_IP, HLCONTROL_PORT))
 
-# r 座標 0.50m を指令 (STM32側で phi = acos(0.50/0.66) - 60° ≈ -21.9° を逆算し -50〜0° にクランプ)
+# r 座標 0.50m を指令 (STM32側で phi = acos(0.50/0.66) - 60° ≈ -21.9° を逆算し -50〜15° にクランプ)
 sock.sendto(struct.pack("<Bf", CMD_SET_R_TARGET_M, 0.50), (STM32_IP, HLCONTROL_PORT))
 
-# z 座標 0.08m を指令 (STM32側で theta = asin(0.08/0.12) - 10° ≈ 31.8° を逆算し 0〜70° にクランプ)
+# z 座標 0.08m を指令 (STM32側で theta = 2*asin(0.08/0.24) - 10° ≈ 28.9° を逆算し 0〜110° にクランプ)
 sock.sendto(struct.pack("<Bf", CMD_SET_Z_TARGET_M, 0.08), (STM32_IP, HLCONTROL_PORT))
 ```
 
