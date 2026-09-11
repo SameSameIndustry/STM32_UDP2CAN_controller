@@ -43,18 +43,21 @@ extern "C" {
  */
 
 /* 電流指令のクランプ [A] (要求仕様: -0.5〜0.5A) */
-#define C610_POS_OUTPUT_LIMIT_A       0.8f
+#define C610_POS_OUTPUT_LIMIT_A     1.6f
 
 /* --- 外側: 位置ループ (P制御) --- */
-/* vel_sp[deg/s] = POS_KP * 角度誤差[deg]。0.1 なら 30deg 誤差 → 3deg/s 指令。 */
-#define C610_POS_POS_KP               10.0f
-/* 位置ループが出す速度指令の上限 [deg/s] (安全用)。 */
-#define C610_POS_VEL_SP_LIMIT_DPS     60.0f
+/* vel_sp[deg/s] = POS_KP * 角度誤差[deg]。0.1 なら 30deg 誤差 → 3deg/s 指令。
+ * ★2026-09-12: ユーザー指示で 10.0 → 40.0 (4倍) に変更。 */
+#define C610_POS_POS_KP               20.0f
+/* 位置ループが出す速度指令の上限 [deg/s] (安全用)。
+ * ★2026-09-12: ユーザー指示で 2turn/s (=720deg/s) に変更 (以前は 60deg/s)。
+ * POS_KP を4倍にしたのでこの上限も緩めないと大誤差時に頭打ちしてしまう。 */
+#define C610_POS_VEL_SP_LIMIT_DPS     120.0f
 
 /* --- 内側: 速度ループ (PI制御) --- */
 /* u[A] = VEL_KP * 速度誤差[deg/s] + VEL_KI * ∫速度誤差 dt。 */
-#define C610_POS_VEL_KP               0.02f
-#define C610_POS_VEL_KI               0.005f
+#define C610_POS_VEL_KP               0.01f
+#define C610_POS_VEL_KI               0.001f
 
 /* 速度計測のローパス係数 (0<α≤1、大きいほど追従が速くノイズも通す)。
  * filtered += α * (raw - filtered)。 */

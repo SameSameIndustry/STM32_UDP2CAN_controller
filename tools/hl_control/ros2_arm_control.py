@@ -10,16 +10,22 @@ sharmech/docs/mcu_spec.md §3 のワイヤフォーマットをそのまま使�
   送信元IPで r/z 基板とθ基板の feedback を振り分けて表示する (ROS2側の実装と同じ考え方)。
 
 この GUI は ROS2 スタックの代わりに 0x01 を送り、0x81 を受けて表示する「ROS2役のスタブ」。
-実際の ROS2 が動いていないときの単体試験用。r/z 基板向けの元ツール ros2_rz_control.py
-(ip_100_section ブランチ) に、このブランチ (enndeffector_UDP) で θ/gripper 基板向けの
-セクションを追加したもの。
+実際の ROS2 が動いていないときの単体試験用。r/z 基板 (ip_100_section) と θ/gripper 基板
+(enndeffector_UDP) 双方のブランチで共通に使うため、両方の tools/hl_control/ に置いてある。
 
-  ・r/z 基板: r,z [m] をそのまま polar packet に載せる (逆変換・クランプはマイコン側)。
+  ・r/z 基板: r,z [m] をそのまま polar packet に載せる (逆変換・クランプはマイコン側。
+             r = 2*0.33*cos(phi+60°) にオフセット項は無い)。電源投入3秒後にマイコン側で
+             z,r とも「モータ角0deg」相当の位置へ自動初期化され、5秒後から 0x81 feedback
+             が届き始める (ros2_link.c 参照)。
   ・θ基板  : theta [rad] (wire 上の単位のまま) をスライダで指定して送る。クランプは
              マイコン側 (ros2_link.c、±2π/3) が正で、このGUIのスライダ範囲は表示・
              操作性のための目安にすぎない。gripper (開/閉)、bit1 (縦にする) も送れる。
              電源投入5秒後にマイコン側で theta=ROS2_THETA_INIT_RAD・グリッパ開へ自動初期化
              されるまでは 0x81 feedback が届かない (ros2_link.c 参照)。
+
+  どちらのセクションも、直近 FEEDBACK_TIMEOUT_S (既定0.5秒) 以内に 0x81 を受けていない間は
+  0x01 の実送信を止める (スライダ操作やストリーミングON自体は止めない)。マイコンから応答が
+  無い基板へ指令を送り続けないための安全策 (ユーザー指示)。
 
 実行:
     python ros2_arm_control.py
@@ -43,6 +49,8 @@ POLAR_PAYLOAD_LEN = 44
 # 10Hz。mcu_spec は100Hzを想定するが、W5500ソケットバッファ・CANバス負荷に余裕を持たせるため
 # 初版は送受信とも10Hzまで間引く運用とする (STM32側 ROS2_LINK_FB_PERIOD_MS/WATCHDOG_MS と対)。
 SEND_INTERVAL_S = 0.1
+# 直近この秒数以内に 0x81 feedback を受けていなければ 0x01 を送らない (ユーザー指示)。
+FEEDBACK_TIMEOUT_S = 0.5
 
 CTRL_ENABLE_BIT = 0x01
 CTRL_ORIENT_BIT = 0x02
@@ -58,10 +66,11 @@ STATUS_BIT_NAMES = {
 }
 
 # --- r/z 基板の簡易キネマティクス (STM32側 hl_control_udp.h の HLCONTROL_RZ_* と一致させること。表示専用) ---
+# ★2026-09-11: r 側のオフセット項 (+0.2m) はユーザー指示で削除した。
 Z_AMPLITUDE_M, Z_PHASE_DEG = 0.12, 10.0
-R_AMPLITUDE_M, R_PHASE_DEG, R_OFFSET_M = 2.0 * 0.33, 60.0, 0.2
-GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 70.0
-GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 0.0
+R_AMPLITUDE_M, R_PHASE_DEG = 2.0 * 0.33, 60.0
+GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 110.0
+GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 15.0
 
 # --- θ基板のクランプ。theta は wire 上 [rad]。STM32側 ros2_link.h の
 # ROS2_THETA_MIN_RAD/MAX_RAD (= ±2π/3) と一致させること。実際のクランプはマイコン側が行う
@@ -76,10 +85,12 @@ def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
-R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG)) + R_OFFSET_M
-R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG)) + R_OFFSET_M
-Z_MIN_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MIN_DEG + Z_PHASE_DEG))
-Z_MAX_M = Z_AMPLITUDE_M * math.sin(math.radians(GIM6010_MAX_DEG + Z_PHASE_DEG))
+R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))
+R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG))
+# ★2026-09-12: z = 2*A*sin((theta+phase)/2) (弦長の式)。(theta+phase)/2 が 0〜90° の間
+#   ずっと単調増加なので、境界 (theta の最小/最大) がそのまま真の最小/最大になる。
+Z_MIN_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MIN_DEG + Z_PHASE_DEG) / 2.0))
+Z_MAX_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MAX_DEG + Z_PHASE_DEG) / 2.0))
 
 
 def pack_polar(seq, r_m=0.0, theta_rad=0.0, z_m=0.0, gripper=0, control_flags=0):
@@ -136,24 +147,40 @@ class BoardSection(ttk.LabelFrame):
         self._seq = 0
         self.streaming_var = tk.BooleanVar(value=False)
         self.fb_text = tk.StringVar(value="feedback 未受信")
+        self.tx_status_var = tk.StringVar(value="")
         self._after_id = None
+        self.last_fb_time = None   # None = まだ 0x81 を一度も受けていない
 
     def next_seq(self):
         self._seq += 1
         return self._seq
 
-    def send(self, packet):
+    def feedback_fresh(self):
+        """直近 FEEDBACK_TIMEOUT_S 以内に 0x81 を受けていれば True。"""
+        return (self.last_fb_time is not None) and ((time.time() - self.last_fb_time) < FEEDBACK_TIMEOUT_S)
+
+    def guarded_send(self, packet):
+        """0x81 が新しいときだけ実際に送る (ユーザー指示: 8889 からFBが無い間は送信しない)。
+        streaming ループ自体は止めず、FB が復帰したら自動的に送信が再開する。"""
+        if not self.feedback_fresh():
+            self.tx_status_var.set(f"⏸ 0x81 が{int(FEEDBACK_TIMEOUT_S*1000)}ms以内に届いていないため送信休止中")
+            return False
+        self.tx_status_var.set("")
         try:
             self.tx_sock.sendto(packet, (self.ip, self.port))
         except OSError:
             pass
+        return True
 
     def on_feedback(self, fb):
+        self.last_fb_time = time.time()
         self.fb_text.set(format_feedback(fb))
 
     def toggle_stream(self, send_tick_fn):
         if self.streaming_var.get():
             send_tick_fn()
+        else:
+            self.tx_status_var.set("")
 
     def schedule(self, widget, fn):
         self._after_id = widget.after(int(SEND_INTERVAL_S * 1000), fn)
@@ -183,8 +210,10 @@ class RZSection(BoardSection):
                         variable=self.streaming_var,
                         command=lambda: self.toggle_stream(self._send_tick)).pack(side="left", padx=10)
 
+        ttk.Label(self, textvariable=self.tx_status_var, foreground="#b30",
+                  font=("Consolas", 9)).grid(row=3, column=0, columnspan=3, sticky="w")
         ttk.Label(self, textvariable=self.fb_text, justify="left",
-                  font=("Consolas", 9)).grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+                  font=("Consolas", 9)).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
     def _send_tick(self):
         if not self.streaming_var.get():
@@ -195,7 +224,7 @@ class RZSection(BoardSection):
         except (tk.TclError, ValueError):
             r, z = 0.0, 0.0
         flags = CTRL_ENABLE_BIT if self.enable_var.get() else 0
-        self.send(pack_polar(self.next_seq(), r_m=r, z_m=z, control_flags=flags))
+        self.guarded_send(pack_polar(self.next_seq(), r_m=r, z_m=z, control_flags=flags))
         self.schedule(self, self._send_tick)
 
 
@@ -229,8 +258,10 @@ class ThetaGripperSection(BoardSection):
                         variable=self.streaming_var,
                         command=lambda: self.toggle_stream(self._send_tick)).pack(side="left")
 
+        ttk.Label(self, textvariable=self.tx_status_var, foreground="#b30",
+                  font=("Consolas", 9)).grid(row=3, column=0, columnspan=3, sticky="w")
         ttk.Label(self, textvariable=self.fb_text, justify="left",
-                  font=("Consolas", 9)).grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+                  font=("Consolas", 9)).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
     def _send_tick(self):
         if not self.streaming_var.get():
@@ -242,8 +273,8 @@ class ThetaGripperSection(BoardSection):
         flags = CTRL_ENABLE_BIT if self.enable_var.get() else 0
         if self.orient_var.get():
             flags |= CTRL_ORIENT_BIT
-        self.send(pack_polar(self.next_seq(), theta_rad=theta_rad,
-                              gripper=self.gripper_var.get(), control_flags=flags))
+        self.guarded_send(pack_polar(self.next_seq(), theta_rad=theta_rad,
+                                      gripper=self.gripper_var.get(), control_flags=flags))
         self.schedule(self, self._send_tick)
 
 
