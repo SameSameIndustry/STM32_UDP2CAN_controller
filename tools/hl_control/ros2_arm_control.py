@@ -76,9 +76,10 @@ GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 15.0
 # ROS2_THETA_MIN_RAD/MAX_RAD (= ±2π/3) と一致させること。実際のクランプはマイコン側が行う
 # ので、ここはスライダ範囲の目安 (表示も rad のまま、deg には変換しない)。 ---
 THETA_MIN_RAD, THETA_MAX_RAD = -2.0 / 3.0 * math.pi, 2.0 / 3.0 * math.pi
-# 電源投入5秒後にマイコン側で自動初期化される theta の初期値。STM32側 ros2_link.h の
+# 電源投入5秒後にマイコン側で自動初期化される theta (C610) の初期値。STM32側 ros2_link.h の
 # ROS2_THETA_INIT_RAD と一致させること (表示用)。
-THETA_INIT_RAD = 0.0
+# ★2026-09-12: 0rad → 135deg 相当に変更 (ユーザー指示)。
+THETA_INIT_RAD = math.radians(135.0)
 
 
 def clamp(v, lo, hi):
