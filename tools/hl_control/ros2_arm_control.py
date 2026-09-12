@@ -14,7 +14,7 @@ sharmech/docs/mcu_spec.md §3 のワイヤフォーマットをそのまま使�
 (enndeffector_UDP) 双方のブランチで共通に使うため、両方の tools/hl_control/ に置いてある。
 
   ・r/z 基板: r,z [m] をそのまま polar packet に載せる (逆変換・クランプはマイコン側。
-             r = -0.744 + 1.387*cos(phi+46.646°)、機構の厳密式への近似式)。電源投入3秒後に
+             r = -0.541 + 1.204*cos(phi+41.327°)、機構の厳密式(位相45°版)への近似式)。電源投入3秒後に
              マイコン側で z=「モータ角0deg」、r=「モータ角10deg」相当の位置へ自動初期化され、5秒後から
              0x81 feedback が届き始める (ros2_link.c 参照)。
   ・θ基板  : theta [rad] (wire 上の単位のまま) をスライダで指定して送る。クランプは
@@ -68,7 +68,7 @@ STATUS_BIT_NAMES = {
 # --- r/z 基板の簡易キネマティクス (STM32側 hl_control_udp.h の HLCONTROL_RZ_* と一致させること。表示専用) ---
 # ★2026-09-12: r の式は機構の厳密式への近似式 (cos一項近似、係数は小数点以下3桁に丸め)。
 Z_AMPLITUDE_M, Z_PHASE_DEG = 0.12, 10.0
-R_AMPLITUDE_M, R_PHASE_DEG, R_OFFSET_M = 1.387, 46.646, -0.744
+R_AMPLITUDE_M, R_PHASE_DEG, R_OFFSET_M = 1.204, 41.327, -0.541
 GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 110.0
 GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 10.0
 
@@ -85,13 +85,11 @@ def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
-# ★2026-09-12: r = offset + A*cos(phi+phase) は phi=-phase(=-46.646) で極大になり、
-#   -50〜+10deg の域内にその極大点が含まれるため境界だけでなくこの点も評価する。
-#   ★近似式は phi∈[-50,+5] でのみフィットしたものなので、+5〜+10degは外挿域だが r は正のまま
-#   (phi=+10で約0.019m。+15degまで試した際に確認された「rがマイナスになる」問題は+10deg
-#   の範囲内では発生しない)。
-R_MIN_M = R_OFFSET_M + R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))  # phi=10 -> 0.019
-R_MAX_M = R_OFFSET_M + R_AMPLITUDE_M  # phi=-46.646 (極大点, cos=1) -> 0.643
+# ★2026-09-12: r = offset + A*cos(phi+phase) は phi=-phase(=-41.327) で極大になり、
+#   -50〜+10deg の域内にその極大点が含まれるため境界だけでなくこの点も評価する
+#   (最小値は境界 phi=+10 側)。
+R_MIN_M = R_OFFSET_M + R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))  # phi=10 -> 0.211
+R_MAX_M = R_OFFSET_M + R_AMPLITUDE_M  # phi=-41.327 (極大点, cos=1) -> 0.663
 # ★2026-09-12: z = 2*A*sin((theta+phase)/2) (弦長の式)。(theta+phase)/2 が 0〜90° の間
 #   ずっと単調増加なので、境界 (theta の最小/最大) がそのまま真の最小/最大になる。
 Z_MIN_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MIN_DEG + Z_PHASE_DEG) / 2.0))

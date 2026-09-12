@@ -104,23 +104,19 @@ extern "C" {
  * theta_deg は GIM6010 ピッチ角 (0x04 の入力値と同じ意味、0〜110deg)。
  * phi_deg   は GIM8018 ピッチ角 (0x05 の入力値と同じ意味、-50〜+10deg)。
  * STM32 側で asinf / acosf により phi_deg / theta_deg を逆算し、既存経路へ流す。
- * ★2026-09-12: r 式を「機構の実際の幾何 r=sqrt(0.34^2-(0.34*sin(phi+55°)+0.065)^2)
- *   +0.34*cos(phi+55°)」に対する近似式へ変更 (ユーザー指示)。この厳密式は phi>約-1.02°
- *   で不定解になる (クランプ域の過半が不定解) ため、計算量は現行と同じ
- *   (cosf/acosf 1回ずつ) まま、フィット区間 [-50,+5] で最大誤差 約0.026m に収まる
- *   R_OFFSET+R_AMPLITUDE*cos(phi+R_PHASE) の形へフィッティングして採用した
- *   (最小二乗→ミニマックス微調整。定数は要求によりすべて小数点以下3桁に丸め)。
- *   ★フィット区間の左端 phi∈[-50,-46.6°] のみ極小さな非単調区間 (振れ幅 約2mm) が残るが
- *   実用上は無視できる規模 (詳細はチャット履歴参照)。
- *   ★クランプ上限は2026-09-12に+5°→+15°→+10°と調整したが、この近似式は phi∈[-50,+5]
- *   でのみフィットしたもの。+5〜+10degは外挿域だが r は正のまま (phi=+10で約0.019m。
- *   +15degまで拡大した際に確認された「phi≈+11.5°付近からrがマイナスになる」問題は
- *   +10degの範囲内では発生しない)。 */
+ * ★2026-09-12: r 式は「機構の実際の幾何 r=sqrt(0.34^2-(0.34*sin(phi+phase)+0.065)^2)
+ *   +0.34*cos(phi+phase)」(厳密式) への近似式 (ユーザー指示)。厳密式の位相を当初 55° で
+ *   検討したが、55° では phi>約-1.02° で不定解になり現在のクランプ域 (-50〜+10) の
+ *   大半が不定解になってしまうため、45° に変更した (この時 phi>約+8.98° でのみ不定解、
+ *   クランプ域のほぼ全域 [-50,+8.98] が実数解でカバーされる)。この 45° 版厳密式に対して
+ *   最小二乗→ミニマックス微調整でフィットした R_OFFSET+R_AMPLITUDE*cos(phi+R_PHASE) を
+ *   採用 (計算量は cosf/acosf 1回ずつのまま。フィット区間 [-50,+8.98] での最大誤差は
+ *   約0.028m、定数は要求によりすべて小数点以下3桁に丸め)。 */
 #define HLCONTROL_RZ_Z_AMPLITUDE_M (0.12f)
 #define HLCONTROL_RZ_Z_PHASE_DEG   (10.0f)
-#define HLCONTROL_RZ_R_AMPLITUDE_M (1.387f)
-#define HLCONTROL_RZ_R_PHASE_DEG   (46.646f)
-#define HLCONTROL_RZ_R_OFFSET_M    (-0.744f)
+#define HLCONTROL_RZ_R_AMPLITUDE_M (1.204f)
+#define HLCONTROL_RZ_R_PHASE_DEG   (41.327f)
+#define HLCONTROL_RZ_R_OFFSET_M    (-0.541f)
 
 /* 初期化。ttl/gim6010_a/gim6010_b/gim8018_c/gim8018_d はいずれも NULL 可。
  * gim6010_a/b_initial_native は GIM6010 の初期位置 (ネイティブturns、プログラム側定数)。
