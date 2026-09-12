@@ -50,19 +50,24 @@ STATUS_BIT_NAMES = {
 }
 
 # --- 簡易キネマティクス (STM32側 hl_control_udp.h の HLCONTROL_RZ_* と一致させること。表示専用) ---
-# ★2026-09-11: r 側のオフセット項 (+0.2m) はユーザー指示で削除した。
+# ★2026-09-12: r の式は機構の厳密式への近似式 (cos一項近似、係数は小数点以下3桁に丸め)。
 Z_AMPLITUDE_M, Z_PHASE_DEG = 0.12, 10.0
-R_AMPLITUDE_M, R_PHASE_DEG = 2.0 * 0.33, 60.0
+R_AMPLITUDE_M, R_PHASE_DEG, R_OFFSET_M = 1.387, 46.646, -0.744
 GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 110.0
-GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 15.0
+GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 10.0
 
 
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
-R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))
-R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG))
+# ★2026-09-12: r = offset + A*cos(phi+phase) は phi=-phase(=-46.646) で極大になり、
+#   -50〜+10deg の域内にその極大点が含まれるため境界だけでなくこの点も評価する。
+#   ★近似式は phi∈[-50,+5] でのみフィットしたものなので、+5〜+10degは外挿域だが r は正のまま
+#   (phi=+10で約0.019m。+15degまで試した際に確認された「rがマイナスになる」問題は+10deg
+#   の範囲内では発生しない)。
+R_MIN_M = R_OFFSET_M + R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))  # phi=10 -> 0.019
+R_MAX_M = R_OFFSET_M + R_AMPLITUDE_M  # phi=-46.646 (極大点, cos=1) -> 0.643
 # ★2026-09-12: z = 2*A*sin((theta+phase)/2) (弦長の式)。(theta+phase)/2 が 0〜90° の間
 #   ずっと単調増加なので、境界 (theta の最小/最大) がそのまま真の最小/最大になる。
 Z_MIN_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MIN_DEG + Z_PHASE_DEG) / 2.0))

@@ -187,14 +187,15 @@ static void ROS2Link_SendFeedback(void)
 /* 電源投入 ROS2_LINK_INIT_DELAY_MS 後に1回だけ実行する自動初期化。
  * z軸(GIM6010)を ROS2_INIT_THETA_DEG、r軸(GIM8018)を ROS2_INIT_PHI_DEG へ。
  * 既存の r,z [m] ベースの公開 API (HLControlUDP_Ros2SetTargetsMeters) をそのまま使うため、
- * 「モータ角 0deg」に対応する r,z [m] を、既存のキネマティクス係数から逆算する
- * (hl_control_udp.h の HLCONTROL_RZ_* と同じ式。オフセット項は削除済み)。 */
+ * 「モータ角 ROS2_INIT_THETA_DEG / ROS2_INIT_PHI_DEG」に対応する r,z [m] を、
+ * hl_control_udp.c の順運動学 (HLControlUDP_ZFromThetaDeg / HLControlUDP_RFromPhiDeg、
+ * 0x06/0x07/ROS2 と共通の「単一の情報源」) で逆算する。
+ * ★2026-09-12: ここで式を複製すると係数変更 (r 式へのオフセット再導入など) のたびに
+ * 追従漏れが起きるため、複製をやめて共通関数を呼ぶように修正。 */
 static void ROS2Link_RunBootInit(void)
 {
-    float z_init = HLCONTROL_RZ_Z_AMPLITUDE_M
-                   * sinf((ROS2_INIT_THETA_DEG + HLCONTROL_RZ_Z_PHASE_DEG) * ROS2_DEG2RAD);
-    float r_init = HLCONTROL_RZ_R_AMPLITUDE_M
-                   * cosf((ROS2_INIT_PHI_DEG + HLCONTROL_RZ_R_PHASE_DEG) * ROS2_DEG2RAD);
+    float z_init = HLControlUDP_ZFromThetaDeg(ROS2_INIT_THETA_DEG);
+    float r_init = HLControlUDP_RFromPhiDeg(ROS2_INIT_PHI_DEG);
 
     HLControlUDP_Ros2SetTargetsMeters(r_init, z_init);
     s_boot_init_done = 1U;

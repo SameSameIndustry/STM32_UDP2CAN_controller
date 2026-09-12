@@ -39,8 +39,8 @@ extern "C" {
  *     で渡される。正規化未完了の間は 0x05 を無視する (古い種で暴走するため)。
  *
  *   HLCONTROL_CMD_SET_R_TARGET_M (0x06): payload = float32 LE、r 座標[m]。
- *     r = A*cos(phi + phase) の逆変換で phi = acos(r/A) - phase を求め、
- *     -50〜15deg にクランプ → 0x05 と同じ経路 (GIM8018 C=原点+偏差 / D=原点-偏差) で送信する。
+ *     r = offset + A*cos(phi + phase) の逆変換で phi = acos((r-offset)/A) - phase を求め、
+ *     -50〜+10deg にクランプ → 0x05 と同じ経路 (GIM8018 C=原点+偏差 / D=原点-偏差) で送信する。
  *   HLCONTROL_CMD_SET_Z_TARGET_M (0x07): payload = float32 LE、z 座標[m]。
  *     z = 2*A*sin((theta+phase)/2) (二等辺三角形の弦長の式) の逆変換で
  *     theta = 2*asin(z/(2*A)) - phase を求め、0x04 と同じクランプ(0〜110deg)・
@@ -49,7 +49,7 @@ extern "C" {
  *   (0x01 = wave motor ピッチ指令はこの基板では未使用のため削除した。)
  *
  * 角度のクランプは STM32 側で行う。Python 側は範囲チェック不要。
- * GIM6010 は全経路 0〜110deg、GIM8018 は全経路 -50〜15deg にクランプされる。
+ * GIM6010 は全経路 0〜110deg、GIM8018 は全経路 -50〜+10deg にクランプされる。
  *
  * ROS2 連携 (docs/mcu_spec.md 準拠、port 8888 受信 / 8889 送信、0x01 polar / 0x81 feedback)
  * は別モジュール ros2_link.c/.h が担当する。5003 番の本プロトコルは並存する。
@@ -86,23 +86,41 @@ extern "C" {
  *   0〜110deg の全域で単調増加なので特例なしで一意に逆算できる。 */
 #define HLCONTROL_GIM6010_PITCH_TARGET_MIN_DEG (0.0f)
 #define HLCONTROL_GIM6010_PITCH_TARGET_MAX_DEG  (110.0f)
-/* GIM8018(GIM8108-8) ピッチ角のクランプ範囲。機構可動範囲 -50〜15deg (2026-09-12〜。
- * 以前は -50〜0deg だった)。0x05 / 0x06 / ROS2 の全経路に適用する。 */
+/* GIM8018(GIM8108-8) ピッチ角のクランプ範囲。-50〜+10deg (2026-09-12〜。-50〜0 → -50〜15 →
+ * -60〜0 → -50〜+5 → -50〜+15 → 現在 -50〜+10、随時ユーザー指示で更新)。0x05 / 0x06 / ROS2 の
+ * 全経路に適用する (HLControl_ClampGim8018PitchDeg() 1箇所でのみ定義・使用するので、5003番
+ * 0x06 経由でも ROS2 (8888、HLControlUDP_Ros2SetTargetsMeters → HLControl_PhiDegFromR 経由)
+ * でも必ず同じ範囲がかかる — 経路ごとに別々のクランプを持たない設計)。
+ * ★2026-09-12: 下記 r 近似式は phi∈[-50,+5] でのみフィットしたものなので、+5〜+10deg では
+ *   フィット区間外の外挿になる。ただしこの区間でも r は正のまま (phi=+10 で約0.019m、
+ *   phi≈+11.5° 付近で初めて 0 を切る) なので、+15deg のときのような負値の問題は無い。 */
 #define HLCONTROL_GIM8018_PITCH_TARGET_MIN_DEG (-50.0f)
-#define HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG  (15.0f)
+#define HLCONTROL_GIM8018_PITCH_TARGET_MAX_DEG  (10.0f)
 
 /* r / z 座標指令 (0x06 / 0x07 / ROS2 0x01) の簡易キネマティクス係数。
  *   z [m] = 2*Z_AMPLITUDE * sin((theta_deg + Z_PHASE)/2)   (2026-09-12〜。辺長 Z_AMPLITUDE の
  *           等辺二本・挟角(theta_deg+Z_PHASE)の二等辺三角形の弦長 = 半角公式で導出)
- *   r [m] = R_AMPLITUDE * cos(phi_deg   + R_PHASE)
+ *   r [m] = R_OFFSET + R_AMPLITUDE * cos(phi_deg + R_PHASE)
  * theta_deg は GIM6010 ピッチ角 (0x04 の入力値と同じ意味、0〜110deg)。
- * phi_deg   は GIM8018 ピッチ角 (0x05 の入力値と同じ意味、-50〜15deg)。
+ * phi_deg   は GIM8018 ピッチ角 (0x05 の入力値と同じ意味、-50〜+10deg)。
  * STM32 側で asinf / acosf により phi_deg / theta_deg を逆算し、既存経路へ流す。
- * ★2026-09-11: r 側のオフセット項 (+0.2m) はユーザー指示で削除した。 */
+ * ★2026-09-12: r 式を「機構の実際の幾何 r=sqrt(0.34^2-(0.34*sin(phi+55°)+0.065)^2)
+ *   +0.34*cos(phi+55°)」に対する近似式へ変更 (ユーザー指示)。この厳密式は phi>約-1.02°
+ *   で不定解になる (クランプ域の過半が不定解) ため、計算量は現行と同じ
+ *   (cosf/acosf 1回ずつ) まま、フィット区間 [-50,+5] で最大誤差 約0.026m に収まる
+ *   R_OFFSET+R_AMPLITUDE*cos(phi+R_PHASE) の形へフィッティングして採用した
+ *   (最小二乗→ミニマックス微調整。定数は要求によりすべて小数点以下3桁に丸め)。
+ *   ★フィット区間の左端 phi∈[-50,-46.6°] のみ極小さな非単調区間 (振れ幅 約2mm) が残るが
+ *   実用上は無視できる規模 (詳細はチャット履歴参照)。
+ *   ★クランプ上限は2026-09-12に+5°→+15°→+10°と調整したが、この近似式は phi∈[-50,+5]
+ *   でのみフィットしたもの。+5〜+10degは外挿域だが r は正のまま (phi=+10で約0.019m。
+ *   +15degまで拡大した際に確認された「phi≈+11.5°付近からrがマイナスになる」問題は
+ *   +10degの範囲内では発生しない)。 */
 #define HLCONTROL_RZ_Z_AMPLITUDE_M (0.12f)
 #define HLCONTROL_RZ_Z_PHASE_DEG   (10.0f)
-#define HLCONTROL_RZ_R_AMPLITUDE_M (2.0f * 0.33f)   /* = 0.66 */
-#define HLCONTROL_RZ_R_PHASE_DEG   (60.0f)
+#define HLCONTROL_RZ_R_AMPLITUDE_M (1.387f)
+#define HLCONTROL_RZ_R_PHASE_DEG   (46.646f)
+#define HLCONTROL_RZ_R_OFFSET_M    (-0.744f)
 
 /* 初期化。ttl/gim6010_a/gim6010_b/gim8018_c/gim8018_d はいずれも NULL 可。
  * gim6010_a/b_initial_native は GIM6010 の初期位置 (ネイティブturns、プログラム側定数)。
@@ -151,6 +169,11 @@ void HLControlUDP_FlushOneAxis(void);
 void HLControlUDP_Ros2GetFeedback(float *r_m, float *z_m,
                                   float *shoulder_rad, float *knee_rad,
                                   uint8_t *ready, uint8_t *driver_error);
+
+/* 順運動学の単軸版 (ros2_link.c の起動時初期化用)。0x06/0x07/ROS2 と同じ係数・同じ式を使う
+ * 「単一の情報源」を保つため、呼び出し側で式を複製しないこと。 */
+float HLControlUDP_ZFromThetaDeg(float theta_deg);
+float HLControlUDP_RFromPhiDeg(float phi_deg);
 
 #ifdef __cplusplus
 }

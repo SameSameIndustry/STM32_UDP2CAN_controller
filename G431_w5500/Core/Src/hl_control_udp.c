@@ -52,7 +52,7 @@ static float HLControl_ClampGim6010PitchDeg(float deg)
     return deg;
 }
 
-/* GIM8018 ピッチ角 [deg] を機構可動域 -50〜15deg にクランプする。
+/* GIM8018 ピッチ角 [deg] を機構可動域 -50〜+10deg にクランプする。
  * 0x05 (ピッチ生指令) / 0x06 (r 座標指令) / ROS2 の全経路で通す。 */
 static float HLControl_ClampGim8018PitchDeg(float deg)
 {
@@ -87,11 +87,14 @@ static float HLControl_ThetaDegFromZ(float z_m)
     return HLControl_ClampGim6010PitchDeg(theta);
 }
 
-/* r [m] → GIM8018 ピッチ角 [deg] (-50〜15 にクランプ済み)。 r = A*cos(phi + phase) の逆。
- * ★2026-09-11: オフセット項は削除済み (ユーザー指示)。 */
+/* r [m] → GIM8018 ピッチ角 [deg] (-50〜+10 にクランプ済み)。
+ * r = offset + A*cos(phi + phase) の逆: phi = acos((r-offset)/A) - phase。
+ * ★2026-09-12: 機構の厳密式への近似式 (係数は小数点以下3桁に丸め、ユーザー指示。
+ * hl_control_udp.h のコメント参照)。オフセット項が復活している点に注意
+ * (2026-09-11 に一度削除したが、今回は別の式・別の値として必要)。 */
 static float HLControl_PhiDegFromR(float r_m)
 {
-    float ratio = HLControl_ClampUnit(r_m / HLCONTROL_RZ_R_AMPLITUDE_M);
+    float ratio = HLControl_ClampUnit((r_m - HLCONTROL_RZ_R_OFFSET_M) / HLCONTROL_RZ_R_AMPLITUDE_M);
     float phi = (acosf(ratio) * HLCONTROL_RAD2DEG) - HLCONTROL_RZ_R_PHASE_DEG;
     return HLControl_ClampGim8018PitchDeg(phi);
 }
@@ -106,8 +109,9 @@ static float HLControl_ZFromThetaDeg(float theta_deg)
 
 static float HLControl_RFromPhiDeg(float phi_deg)
 {
-    return HLCONTROL_RZ_R_AMPLITUDE_M
-           * cosf((phi_deg + HLCONTROL_RZ_R_PHASE_DEG) / HLCONTROL_RAD2DEG);
+    return HLCONTROL_RZ_R_OFFSET_M
+           + (HLCONTROL_RZ_R_AMPLITUDE_M
+              * cosf((phi_deg + HLCONTROL_RZ_R_PHASE_DEG) / HLCONTROL_RAD2DEG));
 }
 
 /* 電源投入(HAL_GetTick()=0)から HLCONTROL_MOTOR_CAN_START_MS 経過したら1。
@@ -156,7 +160,7 @@ static void HLControl_CommandGim6010PitchDeg(float pitch_deg)
 
 /* GIM8018 (0x04/0x05) を「ピッチ角 [deg]」で指令する共通処理。
  * 0x05 ハンドラと全く同じ換算・順序 (偏差、C=原点+Δ / D=原点-Δ、node5(D) → 5ms → node4(C))。
- * phi は常に -50〜15deg にクランプする。正規化未完了なら何もしない (0x05 と同じガード)。 */
+ * phi は常に -50〜+10deg にクランプする。正規化未完了なら何もしない (0x05 と同じガード)。 */
 static void HLControl_CommandGim8018PitchDeg(float pitch_deg)
 {
     float native_delta;
@@ -196,7 +200,7 @@ void HLControlUDP_Ros2SetTargetsMeters(float r_m, float z_m)
     s_ros2_active = 1U;
 
     theta_deg = HLControl_ThetaDegFromZ(z_m);   /* 0〜110deg クランプ済み */
-    phi_deg   = HLControl_PhiDegFromR(r_m);     /* -50〜15deg クランプ済み */
+    phi_deg   = HLControl_PhiDegFromR(r_m);     /* -50〜+10deg クランプ済み */
     d6 = (-theta_deg / 360.0f) * GIM6010_GEAR_RATIO;
     d8 = ( phi_deg   / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
@@ -292,6 +296,16 @@ void HLControlUDP_Ros2GetFeedback(float *r_m, float *z_m,
     if (knee_rad != NULL)     { *knee_rad = theta_deg / HLCONTROL_RAD2DEG; }
     if (ready != NULL)        { *ready = rdy; }
     if (driver_error != NULL) { *driver_error = derr; }
+}
+
+float HLControlUDP_ZFromThetaDeg(float theta_deg)
+{
+    return HLControl_ZFromThetaDeg(theta_deg);
+}
+
+float HLControlUDP_RFromPhiDeg(float phi_deg)
+{
+    return HLControl_RFromPhiDeg(phi_deg);
 }
 
 void HLControlUDP_Init(uint8_t sn, uint16_t listen_port,
@@ -393,7 +407,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&pitch_deg, &buf[1], sizeof(float));
-        pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);  /* -50〜15deg にクランプ */
+        pitch_deg = HLControl_ClampGim8018PitchDeg(pitch_deg);  /* -50〜+10deg にクランプ */
         native_delta = (pitch_deg / 360.0f) * GIM8018_GEAR_RATIO_NOMINAL;
 
         /* C(0x04) = 原点 + 偏差、D(0x05) = 原点 - 偏差。★node5(D) → 5ms → node4(C) の順。 */
@@ -418,7 +432,7 @@ static void HLControl_HandlePacket(const uint8_t *buf, int32_t len)
             return;
         }
         memcpy(&r_m, &buf[1], sizeof(float));
-        /* r [m] → phi [deg] (acos で逆変換、-50〜15deg クランプ) → 0x05 と同じ経路。 */
+        /* r [m] → phi [deg] (acos で逆変換、-50〜+10deg クランプ) → 0x05 と同じ経路。 */
         HLControl_CommandGim8018PitchDeg(HLControl_PhiDegFromR(r_m));
     } else if (cmd == HLCONTROL_CMD_SET_Z_TARGET_M) {
         float z_m;

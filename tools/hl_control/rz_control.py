@@ -5,9 +5,14 @@ r/z 座標コントローラ GUI (192.168.1.100 の r/z 基板専用)。
 STM32 側が簡易キネマティクスの逆変換とクランプを行うので、この GUI は座標 [m] を
 そのまま送るだけ (fire-and-forget、STM32 からの応答は無い)。
 
-  z [m] = 2*0.12 * sin((theta + 10deg)/2)    theta = GIM6010 ピッチ角 [deg]、STM32側で 0〜110deg クランプ
-                                              (辺長0.12の二等辺三角形の弦長の式。2026-09-12〜)
-  r [m] = 2*0.33 * cos(phi + 60deg)          phi   = GIM8018 ピッチ角 [deg]、STM32側で -50〜15deg クランプ
+  z [m] = 2*0.12 * sin((theta + 10deg)/2)          theta = GIM6010 ピッチ角 [deg]、STM32側で 0〜110deg クランプ
+                                                    (辺長0.12の二等辺三角形の弦長の式。2026-09-12〜)
+  r [m] = -0.744 + 1.387 * cos(phi + 46.646deg)    phi   = GIM8018 ピッチ角 [deg]、STM32側で -50〜+10deg クランプ
+                                                    (機構の厳密式 (sqrt含む) への近似式。係数は最小二乗+
+                                                     ミニマックス最適化で決定し小数点以下3桁に丸め。
+                                                     フィット区間 [-50,+5] での厳密式との誤差は最大約0.025m。
+                                                     +5〜+10degは外挿域だが r は正のまま (phi=+10で約0.019m)。
+                                                     2026-09-12〜)
 
 係数の正本は STM32 側 hl_control_udp.h (HLCONTROL_RZ_*)。ここの値は表示・スライダ範囲用の複製。
 仕様: tools/hl_control/PROTOCOL_HL_CONTROL_UDP.md
@@ -28,15 +33,16 @@ CMD_SET_R_TARGET_M = 0x06
 CMD_SET_Z_TARGET_M = 0x07
 
 # --- 簡易キネマティクス係数 (STM32側 hl_control_udp.h の HLCONTROL_RZ_* と一致させること) ---
-# ★2026-09-11: r 側のオフセット項 (+0.2m) はユーザー指示で削除した。
+# ★2026-09-12: r の式は機構の厳密式への近似式 (cos一項近似、係数は小数点以下3桁に丸め)。
 Z_AMPLITUDE_M = 0.12
 Z_PHASE_DEG = 10.0
-R_AMPLITUDE_M = 2.0 * 0.33   # = 0.66
-R_PHASE_DEG = 60.0
+R_AMPLITUDE_M = 1.387
+R_PHASE_DEG = 46.646
+R_OFFSET_M = -0.744
 
 # STM32 側のクランプ範囲 (deg)
 GIM6010_MIN_DEG, GIM6010_MAX_DEG = 0.0, 110.0
-GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 15.0
+GIM8018_MIN_DEG, GIM8018_MAX_DEG = -50.0, 10.0
 
 CONTINUOUS_INTERVAL_MS = 200
 
@@ -46,8 +52,8 @@ def clamp(v, lo, hi):
 
 
 def r_to_phi_deg(r_m):
-    """STM32 と同じ逆変換: phi = acos(clamp(r/A, -1, 1)) - phase、その後 -50〜15deg クランプ。"""
-    ratio = clamp(r_m / R_AMPLITUDE_M, -1.0, 1.0)
+    """STM32 と同じ逆変換: phi = acos(clamp((r-offset)/A, -1, 1)) - phase、その後 -50〜+10deg クランプ。"""
+    ratio = clamp((r_m - R_OFFSET_M) / R_AMPLITUDE_M, -1.0, 1.0)
     phi = math.degrees(math.acos(ratio)) - R_PHASE_DEG
     return clamp(phi, GIM8018_MIN_DEG, GIM8018_MAX_DEG)
 
@@ -63,8 +69,14 @@ def z_to_theta_deg(z_m):
 # ★2026-09-12: z = 2*A*sin((theta+phase)/2) は (theta+phase)/2 が 0〜90° の間ずっと
 #   単調増加なので (0〜110deg の全域で該当)、旧式のような頂点での特別扱いは不要。
 #   境界 (theta の最小/最大) をそのまま評価すれば真の最小/最大になる。
-R_MIN_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))  # phi=15  -> 0.17
-R_MAX_M = R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MIN_DEG + R_PHASE_DEG))  # phi=-50 -> 0.65
+# ★2026-09-12: r = offset + A*cos(phi+phase) は phi=-phase(=-46.646) の位置で極大 (cos引数が0を
+#   跨ぐ) になり、-50〜+10deg の域内にその極大点が含まれるため厳密には単調ではない
+#   (境界 -50deg 付近との差はごく僅か、約1.8mm)。そのため最大値は境界ではなくこの極大点で評価する。
+#   ★近似式は phi∈[-50,+5] でのみフィットしたものなので、+5〜+10degは外挿域だが r は正のまま
+#   (phi=+10で約0.019m。+15degまで試した際に確認された「rがマイナスになる」問題は+10deg
+#   の範囲内では発生しない)。
+R_MIN_M = R_OFFSET_M + R_AMPLITUDE_M * math.cos(math.radians(GIM8018_MAX_DEG + R_PHASE_DEG))  # phi=10      -> 0.019
+R_MAX_M = R_OFFSET_M + R_AMPLITUDE_M  # phi=-46.646 (極大点, cos=1)                                          -> 0.643
 Z_MIN_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MIN_DEG + Z_PHASE_DEG) / 2.0))  # theta=0   -> 0.021
 Z_MAX_M = 2.0 * Z_AMPLITUDE_M * math.sin(math.radians((GIM6010_MAX_DEG + Z_PHASE_DEG) / 2.0))  # theta=110 -> 0.208
 
