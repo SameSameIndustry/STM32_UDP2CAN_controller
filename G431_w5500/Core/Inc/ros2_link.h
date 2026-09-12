@@ -32,7 +32,7 @@ extern "C" {
  *  - control_flags bit1 (縦にする) を HLControlUDP_SetWristPitchYawDeg() へ
  *    (0x09 と同じ経路。値が変化したときだけ呼ぶ)。
  *  - 起動 (電源投入) から ROS2_LINK_INIT_DELAY_MS (既定5秒) 経過したら 1 回だけ、
- *    theta を ROS2_THETA_INIT_RAD (既定135deg相当) へ、グリッパを開へ自動で動かす
+ *    theta を ROS2_THETA_INIT_RAD (既定-135deg相当) へ、グリッパを開へ自動で動かす
  *    (mcu_spec §4.6 の電源投入時の初期位置移動に相当。ROS2 の接続有無に関わらず実行する)。
  *    この初期化が終わるまでは 0x81 feedback を送信しない。
  *  - 初期化後は ROS2_LINK_FB_PERIOD_MS 周期 (既定10Hz) で 0x81 feedback を自発送信。
@@ -79,9 +79,9 @@ extern "C" {
 #define ROS2_LINK_INIT_DELAY_MS  5000U
 
 /* 電源投入時の自動初期化で使う theta (C610) の初期値 [rad] (ユーザー指示。変更したい場合は
- * ここを直す)。★2026-09-12: 0rad → 135deg (=135*pi/180 rad) に変更。0x07 と同じ「原点
- * C610_POS_ORIGIN_DEG からの差分角」の意味 (ROS2Link_RunBootInit 参照)。 */
-#define ROS2_THETA_INIT_RAD  (135.0f * ROS2_PI / 180.0f)
+ * ここを直す)。★2026-09-12: 0rad → 135deg → 現在 -135deg (=-135*pi/180 rad) に変更。
+ * 0x07 と同じ「原点 C610_POS_ORIGIN_DEG からの差分角」の意味 (ROS2Link_RunBootInit 参照)。 */
+#define ROS2_THETA_INIT_RAD  (-135.0f * ROS2_PI / 180.0f)
 
 /* theta[deg] (クランプ後に rad→deg 変換した値) → C610 の「原点からの差分角」への符号。
  * ★実機で theta の増加方向 (+X→+Y) と AS5600/ターンテーブルの回転方向が一致するか要確認。
