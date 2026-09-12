@@ -60,9 +60,12 @@ extern "C" {
 #define ROS2_LINK_FB_START_DELAY_MS  5000U
 
 /* 電源投入時の自動初期化で使うモータのピッチ角 [deg] (0x04/0x05 の入力値と同じ意味。
- * ユーザー指示で「0deg」= GIM6010(z軸)/GIM8018(r軸) とも 0deg。変更したい場合はここを直す)。 */
+ * 変更したい場合はここを直す)。
+ * ★2026-09-12: GIM8018(r軸)の初期値をユーザー指示で 0deg → 10deg に変更。
+ *   ROS2Link_RunBootInit() が HLControlUDP_RFromPhiDeg(10.0f) で r_init を逆算するので、
+ *   ここを直すだけで自動的に反映される (式の複製はしていない)。 */
 #define ROS2_INIT_THETA_DEG  (0.0f)   /* GIM6010 (z軸) */
-#define ROS2_INIT_PHI_DEG    (0.0f)   /* GIM8018 (r軸) */
+#define ROS2_INIT_PHI_DEG    (10.0f)  /* GIM8018 (r軸) */
 
 /* 初期化。ros2_pc_ip はフィードバック宛先 (ROS2 側 PC) の IPv4。listen ソケットを開く。
  * HLControlUDP_Init() の後に 1 回だけ呼ぶ。 */

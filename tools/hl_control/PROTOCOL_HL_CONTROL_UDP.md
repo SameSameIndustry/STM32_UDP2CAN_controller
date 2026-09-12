@@ -125,7 +125,7 @@ r,z 用の対話 GUI (5003番、本プロトコル): [`tools/hl_control/rz_contr
 |---|---|
 | 受信 (ROS2 → MCU) | UDP **8888** 番、`packet_type=0x01` polar packet (60byte)。mcu_spec は100Hzを想定するが、W5500ソケットバッファ・CANバス負荷に余裕を持たせるため**初版は10Hzまで間引く運用** (ROS2側の送信周期をこれに合わせる) |
 | 送信 (MCU → ROS2) | UDP **8889** 番 (フィードバック宛先 = `main.c` の `dest_ip`)、`packet_type=0x81` feedback packet (64byte)。**電源投入 `ROS2_LINK_FB_START_DELAY_MS` (既定5秒) 経過後から自発送信** (既定10Hz、`ROS2_LINK_FB_PERIOD_MS`)。それより前は一切送信しない (下記) |
-| 電源投入時の自動初期化 | **`ROS2_LINK_INIT_DELAY_MS` (既定3秒) 経過後に1回だけ**、z軸(GIM6010)を `ROS2_INIT_THETA_DEG`、r軸(GIM8018)を `ROS2_INIT_PHI_DEG` (いずれも既定 `0.0f` = モータのピッチ角入力値。変更する場合は `ros2_link.h` を編集) へ自動で動かす (mcu_spec §4.6 の電源投入時初期位置移動に相当。ROS2/GUIの接続有無に関わらず実行、5003番の 0x04/0x05 と同じ経路)。この時点では `0x81` はまだ送っていない (`FB_START_DELAY_MS` はさらに後) |
+| 電源投入時の自動初期化 | **`ROS2_LINK_INIT_DELAY_MS` (既定3秒) 経過後に1回だけ**、z軸(GIM6010)を `ROS2_INIT_THETA_DEG` (既定 `0.0f`)、r軸(GIM8018)を `ROS2_INIT_PHI_DEG` (既定 `10.0f`。2026-09-12〜、旧値 `0.0f`。いずれもモータのピッチ角入力値。変更する場合は `ros2_link.h` を編集) へ自動で動かす (mcu_spec §4.6 の電源投入時初期位置移動に相当。ROS2/GUIの接続有無に関わらず実行、5003番の 0x04/0x05 と同じ経路)。この時点では `0x81` はまだ送っていない (`FB_START_DELAY_MS` はさらに後) |
 | STM32側ソケット番号 | `4` (`ROS2_LINK_SN`) |
 | 0x01 → r,z の扱い | `control_flags` bit0=0 またはビット2=1 の間はホールド (目標を更新しない)。bit0=1・bit2=0 のときだけ `payload.r`,`payload.z` を [m] のまま `HLControlUDP_Ros2SetTargetsMeters()` に渡す (5003番の 0x06/0x07 と同じ逆変換・クランプ) |
 | CAN 送信 | ラウンドロビンで 1 tick (~5ms) に 1 軸だけ送信 (`HLControlUDP_FlushOneAxis()`)。5003番のような HAL_Delay を挟んだ一括送信はしない |
