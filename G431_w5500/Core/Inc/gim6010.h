@@ -85,6 +85,7 @@ HAL_StatusTypeDef GIM6010_SetLimits(GIM6010_t *g, float vel_limit_turns_s, float
 
 /* ---- 制御モード遷移 (いずれも最後に CLOSED_LOOP_CONTROL に入る) ---- */
 HAL_StatusTypeDef GIM6010_EnterPositionControl(GIM6010_t *g);            /* Position + POS_FILTER */
+HAL_StatusTypeDef GIM6010_EnterPositionControlHold(GIM6010_t *g);       /* 上と同じ+移行前に現在位置を目標化(飛び出し防止) */
 HAL_StatusTypeDef GIM6010_EnterPositionControlTrajectory(GIM6010_t *g); /* Position + TRAP_TRAJ */
 HAL_StatusTypeDef GIM6010_EnterVelocityControl(GIM6010_t *g);           /* Velocity + PASSTHROUGH */
 HAL_StatusTypeDef GIM6010_EnterTorqueControl(GIM6010_t *g);             /* Torque + PASSTHROUGH */

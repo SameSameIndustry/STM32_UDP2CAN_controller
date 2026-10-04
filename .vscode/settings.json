@@ -1,5 +1,5 @@
 {
   "cmake.sourceDirectory": "${workspaceFolder}/G431_w5500",
   "cmake.buildDirectory": "${workspaceFolder}/G431_w5500/build/Debug",
-  "cortex-debug.openocdPath": "C:\\Users\\ibuki_ono\\AppData\\Local\\Microsoft\\WinGet\\Packages\\xpack-dev-tools.openocd-xpack_Microsoft.Winget.Source_8wekyb3d8bbwe\\xpack-openocd-0.12.0-7\\bin\\openocd.exe"
+  "cortex-debug.openocdPath": "openocd"
 }

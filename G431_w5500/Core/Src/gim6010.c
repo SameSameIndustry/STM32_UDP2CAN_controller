@@ -45,6 +45,11 @@ HAL_StatusTypeDef GIM6010_EnterPositionControl(GIM6010_t *g)
     return ODriveCAN_EnablePositionControl(&g->odrv);
 }
 
+HAL_StatusTypeDef GIM6010_EnterPositionControlHold(GIM6010_t *g)
+{
+    return ODriveCAN_EnablePositionControlHold(&g->odrv);
+}
+
 HAL_StatusTypeDef GIM6010_EnterPositionControlTrajectory(GIM6010_t *g)
 {
     HAL_StatusTypeDef status = ODriveCAN_SetControllerMode(

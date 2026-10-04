@@ -28,13 +28,13 @@
 #include "can_bus.h"
 #include "can_udp_bridge.h"
 #include "dji_c610.h"
-#include "odrive_can.h"
-#include "vesc_can.h"
+#include "c610_current.h"
+#include "c610_position.h"
 #include "ttl_servo_can.h"
 #include "wave_motor_can.h"
-#include "gim6010.h"
-#include "gim8018.h"
 #include "hl_control_udp.h"
+#include "as5600.h"
+#include "ros2_link.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,60 +44,38 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// GIM8018-8はODrive互換と認識されているとのことなので、まずODrive CAN Simple
-// プロトコルのnode_idとして扱う (ODrive公式デフォルトは0)。
-// tools/can_id_scanner/can_id_scanner.py の「ODrive heartbeat」欄に出てくる
-// node IDを見て、実機に合わせて確認・変更すること。
-#define GIM_NODE_ID 0U
+// ★この基板 (enndeffector_UDP) は GIM6010/GIM8018 を一切制御しない。GIM 関連の
+//   初期化・状態機械・ラウンドロビン・診断はすべて削除済み (別基板 192.168.1.100 の担当)。
 
-// GIM8018-8は減速比1/8 (モータ8回転 = 出力1回転)。
-// SteadyWin公式のGIM6010-8マニュアル(同じ駆動基板ファミリー、tools/odrive_setup/
-// odrive_configure.py 冒頭のコメント参照)によれば、このファームウェアには
-// ODrive Pro(v0.6系)にあるload_encoder/commutation_encoderのような「出力軸専用
-// エンコーダ」概念は存在せず、pos_estimate/Input_Posは常にモーター軸(エンコーダ)
-// 基準のturnsである。よってGIM_GEAR_RATIO=8.0fが妥当なはずだが、GIM8018-8固有の
-// マニュアルそのものは未確認なので、念のため出力軸を手でちょうど1回転させ
-// can_id_scannerのPos[turn]の変化量が8.0になることを確認してから運用すること。
-#define GIM_GEAR_RATIO 8.0f
+// C610本体のダイヤル/DIPで設定するID。実際に使うのは c610_current.h の
+// C610_CURRENT_ESC_ID (現在 3)。★C610本体のダイヤルもそれに合わせること。
+// wave motor(0x11/0x12)と同一バスなので、フィードバックIDが衝突しにくい 3 or 4 を使う。
+#define C610_ESC_ID  3U
 
-// 比較用: 2025年のM5_Lower-Controller(lib/VescCAN)ではController ID 10, 20が
-// 使われていた形跡があるが、GIM8018-8がこちらの可能性も完全には排除できないため
-// 受信のみ監視する(実際のコマンド送信はしない)。tools/can_id_scanner の
-// 「VESC status」欄に何か出てくるようなら、実はこちらが正解ということになる。
-#define VESC_TEST_ID 10U
-
-#define C610_ESC_ID  1U   // C610本体のダイヤル/DIPスイッチで設定したID (1-8)
+// C610 位置制御 (AS5600フィードバック) の2つの基準角 [deg]。GUIからは設定せず、
+// ここを編集して書き込むことで決める。
+//   C610_ZERO_OFFSET_DEG: AS5600 RAW角度[deg](= raw*360/4096) のうち meas_deg=0 とみなす値。
+//                         センサ取り付けのキャリブレーション用 (通常 0 でよい)。
+//   C610_POS_ORIGIN_DEG : meas_deg フレームでの「原点」。アプリ(0x07)の入力値はこの原点
+//                         からの差分。実目標角 = norm360(origin + 入力差分)。
+//                         例: 20 なら、入力 +30 で目標 50deg、入力 0 で 20deg。
+//                         ★起動直後は制御しない(電流0でフリー)。アプリが最初に 0x07 を
+//                           送った時点で初めて動き出す(自動で原点へは戻らない)。
+#define C610_ZERO_OFFSET_DEG  0.0f
+#define C610_POS_ORIGIN_DEG   50.0f
 
 // TTLサーボ基板 (プロジェクトルートの CAN_PROTOCOL_TTL-SERVO.md 参照、受信専用)。
 // この基板の node_id (仕様書の既定値は0x21)。
 #define TTL_SERVO_NODE_ID 0x21U
 
 // wave motor基板 (プロジェクトルートの CAN_PROTOCOL_wave_motor.md 参照、受信専用)。
-// 同じ機種がnode_id 0x11と0x12の2台接続されている。0x11と0x12は常に逆方向に
-// 同じ角度だけ回転させる運用 (HLControlUDP_Poll()参照)。
+// 同じ機種がnode_id 0x11と0x12の2台接続されており、この2台で「差動機構」を駆動する:
+//   ・2台を逆向きに回す(差動成分) → ピッチ軸
+//   ・2台を同じ向きに同じだけ回す(共通成分) → ヨー軸
+// 任意のピッチ角のままヨーを、任意のヨー角のままピッチを動かせる (差動キネマティクスで
+// 2台のオフセット角へ変換)。実装と伝達比/符号の定数は hl_control_udp.h / .c を参照。
 #define WAVE_MOTOR_1_NODE_ID 0x11U
 #define WAVE_MOTOR_2_NODE_ID 0x12U
-
-// GIM6010-8 2台 (node_id 0x06, 0x07)。初期位置(ネイティブturns)からの出力角の偏差を
-// 目標値として送る。目標値は0x06・0x07とも全く同じ値 (HLControlUDP_Poll()参照)。
-#define GIM6010_A_NODE_ID 0x06U
-#define GIM6010_B_NODE_ID 0x07U
-
-// 0x06/0x07の「初期位置」(ネイティブ=モーター軸turns基準)。GUIからは設定できず、
-// ここを編集して書き込むことで変更する。実機の電源投入時の実位置とは無関係
-// (単なる目標値計算の基準点オフセット)。
-#define GIM6010_A_INITIAL_NATIVE_TURNS -0.44f
-#define GIM6010_B_INITIAL_NATIVE_TURNS -0.22f
-
-// GIM8018-8 2台 (node_id 0x04, 0x05)。GIM6010(0x06/0x07)と同じ考え方だが、
-// こちらは目標値が互い違い(符号反転・同じ大きさ)になる (HLControlUDP_Poll()参照)。
-#define GIM8018_C_NODE_ID 0x04U
-#define GIM8018_D_NODE_ID 0x05U
-
-// 0x04/0x05の「初期位置」(ネイティブturns基準)。GIM6010と同様GUIからは設定できず、
-// ここを編集して書き込むことで変更する。
-#define GIM8018_C_INITIAL_NATIVE_TURNS 0.0f
-#define GIM8018_D_INITIAL_NATIVE_TURNS 0.0f
 
 #define HEARTBEAT_SN    2U     // ハートビート専用ソケット (0=Helloデモ, 1=CAN-UDPブリッジと被らないもの)
 #define HEARTBEAT_PORT  5002U
@@ -108,6 +86,14 @@
 // やハートビート(ソケット2, ポート5002)とは別の専用ソケット・ポートを使う。
 #define HLCONTROL_SN    3U
 #define HLCONTROL_PORT  5003U
+
+// AS5600 磁気エンコーダの角度をUDPで垂れ流す専用ソケット・ポート。
+// ハートビート(SN2)と同じくブロードキャスト(255.255.255.255)で送るので、
+// PC側はポート5004をbindするだけでよい (STM32のIPを知らなくても受かる)。
+// Pythonツール: tools/as5600_monitor/as5600_monitor.py
+#define AS5600_SN       4U
+#define AS5600_PORT     5004U
+#define AS5600_PERIOD_MS 50U   // 送信周期 (約20Hz)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -124,15 +110,11 @@ TIM_HandleTypeDef htim1;
 DMA_HandleTypeDef hdma_tim1_ch1;
 
 /* USER CODE BEGIN PV */
-ODriveCAN_Axis_t gim_axis;         // GIM8018-8 (本命: ODrive CAN Simple)
-VescCAN_Motor_t vesc_test_motor;   // 比較用 (受信のみ監視、VESCプロトコルだった場合の保険)
-TTLServoCAN_t ttl_servo;           // TTLサーボ基板 (CAN_PROTOCOL_TTL-SERVO.md, node_id=0x21)
-WaveMotorCAN_t wave_motor;         // wave motor基板 1台目 (CAN_PROTOCOL_wave_motor.md, node_id=0x11)
-WaveMotorCAN_t wave_motor2;        // wave motor基板 2台目 (同一機種, node_id=0x12、逆向きにスイング)
-GIM6010_t gim6010_a;               // GIM6010-8 1台目 (node_id=0x06)
-GIM6010_t gim6010_b;               // GIM6010-8 2台目 (node_id=0x07、Aと全く同じ目標値)
-GIM8018_t gim8018_c;               // GIM8018-8 1台目 (node_id=0x04)
-GIM8018_t gim8018_d;               // GIM8018-8 2台目 (node_id=0x05、Cと符号反転の偏差)
+TTLServoCAN_t ttl_servo;           // TTLサーボ基板 (CAN_PROTOCOL_TTL-SERVO.md, node_id=0x21、開閉+ヨー軸追従。hl_control_udp.c 参照)
+WaveMotorCAN_t wave_motor;         // wave motor基板 1台目 (CAN_PROTOCOL_wave_motor.md, node_id=0x11、差動機構の片側)
+WaveMotorCAN_t wave_motor2;        // wave motor基板 2台目 (同一機種, node_id=0x12、差動機構のもう片側)
+C610Current_t c610_current;        // DJI C610 電流制御ブロック (CAN ID 0x01、起動後2秒は無送信)
+C610Position_t c610_pos;           // DJI C610 位置制御 (AS5600角度フィードバック + PID、電流±0.5A)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -207,6 +189,83 @@ void W5500_WriteByte(uint8_t wb) {
     }
 }
 
+// AS5600 磁気エンコーダを AS5600_PERIOD_MS ごとに読み、角度をUDP(ポート5004)へ
+// ブロードキャストする。ハートビート等と同じく ASCII 1行テキスト。
+//   AS5600 seq=.. tick=.. ok=1 raw=2048 mdeg=180000 angle=2047 status=0x20 agc=128 mag=1234
+//     seq    : 連番
+//     tick   : STM32側 HAL_GetTick() [ms]
+//     ok     : 1 = I2C応答あり かつ 磁石検出(STATUS.MD=1)
+//     raw    : RAW_ANGLE レジスタ 0..4095 (未加工の機械角)
+//     mdeg   : raw を 0.001度単位に換算した整数 (= raw*360000/4096)。
+//              ★nano.specs + 浮動小数printf無効のため firmware では %f を使わず整数で送る。
+//     angle  : ANGLE レジスタ 0..4095 (ZPOS/MPOS/ヒステリシス適用後)
+//     status : STATUS レジスタ (bit5 MH=磁石強すぎ / bit4 ML=磁石弱すぎ / bit3 MD=検出)
+//     agc    : AGC レジスタ (3.3V動作で 0..255、中央付近が理想)
+//     mag    : MAGNITUDE レジスタ 0..4095
+// 角度[deg] への換算は受信側(Python)で raw*360/4096 で行う。
+static void AS5600_StreamTick(void)
+{
+    static uint32_t s_last = 0U;
+    static uint32_t s_seq  = 0U;
+    static uint8_t  s_sock_opened = 0U;
+    static uint16_t s_fail_run = 0U;   // 連続で ok=0 だった回数
+
+    uint32_t now = HAL_GetTick();
+    if ((now - s_last) < AS5600_PERIOD_MS) {
+        return;
+    }
+    s_last = now;
+
+    if (!s_sock_opened || (getSn_SR(AS5600_SN) == SOCK_CLOSED)) {
+        socket(AS5600_SN, Sn_MR_UDP, AS5600_PORT, 0);
+        s_sock_opened = 1U;
+    }
+
+    AS5600_Reading_t r;
+    HAL_StatusTypeDef st = AS5600_ReadAll(&r);
+
+    // AS5600_ReadAll() は失敗時に内部で1回リトライ+バス回復するが、それでも読めない
+    // 状態が続く場合 (電源投入時のモーター突入で I2C バスが wedge したまま等) は、
+    // GPIO 再設定を含む強めの回復を約1秒ごとに試みる。
+    if ((st == HAL_OK) && r.ok) {
+        s_fail_run = 0U;
+    } else if (s_fail_run < 0xFFFFU) {
+        s_fail_run++;
+        if ((s_fail_run % 20U) == 0U) {   // 20 サンプル ≒ 1秒
+            AS5600_Recover();
+        }
+    }
+
+    uint32_t mdeg = ((uint32_t)r.raw_angle * 360000U) / 4096U;
+
+    // AS5600 の生サンプルを C610 位置制御コントローラへ渡す (I2C の二重読み回避)。
+    // ok==0 のサンプルは Update 内で無視される。
+    C610Position_Update(&c610_pos, &r, now);
+
+    // C610 カスケード位置制御のテレメトリ
+    // (nano.specs で %f 不可のため全て整数: mdeg=1/1000度, mdps=1/1000度/秒, ma=1/1000A)
+    char msg[320];
+    int len = snprintf(msg, sizeof(msg),
+                       "AS5600 seq=%lu tick=%lu ok=%d raw=%u mdeg=%lu angle=%u status=0x%02X agc=%u mag=%u "
+                       "c610_en=%d c610_act=%d c610_org_mdeg=%ld c610_off_mdeg=%ld c610_tgt_mdeg=%ld "
+                       "c610_meas_mdeg=%ld c610_err_mdeg=%ld "
+                       "c610_vsp_mdps=%ld c610_vel_mdps=%ld c610_i_ma=%ld\r\n",
+                       (unsigned long)s_seq++, (unsigned long)now,
+                       (int)((st == HAL_OK) && r.ok),
+                       (unsigned)r.raw_angle, (unsigned long)mdeg, (unsigned)r.angle,
+                       (unsigned)r.status, (unsigned)r.agc, (unsigned)r.magnitude,
+                       (int)c610_pos.enabled, (int)C610Current_IsActive(&c610_current),
+                       (long)(c610_pos.origin_deg * 1000.0f), (long)(c610_pos.input_offset_deg * 1000.0f),
+                       (long)(c610_pos.target_deg * 1000.0f), (long)(c610_pos.meas_deg * 1000.0f),
+                       (long)(c610_pos.error_deg * 1000.0f),
+                       (long)(c610_pos.vel_setpoint_dps * 1000.0f), (long)(c610_pos.meas_vel_dps * 1000.0f),
+                       (long)(c610_pos.out_a * 1000.0f));
+    if (len > 0) {
+        uint8_t bcast[4] = {255, 255, 255, 255};
+        sendto(AS5600_SN, (uint8_t*)msg, (uint16_t)len, bcast, AS5600_PORT);
+    }
+}
+
 // HAL_Delay()の代わりに使う。待っている間もCAN<->UDPブリッジのポーリングと
 // CANBus_Poll()(Bus-Off検出・自動復帰)を挟むことで、PCからのCAN送信コマンドへの
 // 応答性と、CAN通信が止まったままにならないことを確保する (数msの粒度)
@@ -217,9 +276,18 @@ static void Delay_WithCANPoll(uint32_t ms)
         CANUDPBridge_Poll();
         CANBus_Poll();
         HLControlUDP_Poll();
+        HLControlUDP_WaveTick();          // 0x11/0x12 ソフトスタート(初回 0 送信→整定→目標)＋目標送出
+        HLControlUDP_TtlYawFollowTick();  // 0x21(TTLサーボ)を 0x11/0x12 ヨー軸へ 500ms周期でランプ追従
+        AS5600_StreamTick();             // AS5600 読み取り + C610 位置制御 Update + UDP(5004) 送信
+        C610Position_Failsafe(&c610_pos, HAL_GetTick()); // AS5600 サンプル停止時は電流を0に
+        C610Current_Tick(&c610_current); // DJI C610(0x01) 電流指令の送出 (起動後2秒間は無送信)。
+                                         // C610はコマンド途絶で停止するため ~5ms 間隔で送り続ける
+        ROS2Link_Poll();                 // ROS2 0x01 受信 (未接続なら no-op)
+        ROS2Link_Tick();                 // ROS2 0x81 送信 (未接続なら no-op)
         HAL_Delay(5);
     }
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -282,8 +350,11 @@ int main(void)
 
   // 1. ネットワーク情報の定義
   wiz_NetInfo gWIZNETINFO = {
-      .mac = {0x00, 0x08, 0xdc, 0x11, 0x22, 0x33}, // 適当な値でOK
-      .ip  = {192, 168, 1, 100},                  // W5500のIP
+      // ★このブランチ(enndeffector_UDP)はエンドエフェクタ基板用。
+      //   GIM基板(192.168.1.100、別ファーム)と同一LANに繋ぐので IP も MAC も別にする
+      //   (MAC 末尾 0x65 = 101)。
+      .mac = {0x00, 0x08, 0xdc, 0x11, 0x22, 0x65}, // GIM基板とは別のMAC
+      .ip  = {192, 168, 1, 101},                  // W5500のIP (エンドエフェクタ基板)
       .sn  = {255, 255, 255, 0},                  // サブネットマスク
       .gw  = {192, 168, 1, 1},                    // ゲートウェイ
       .dns = {8, 8, 8, 8},
@@ -331,19 +402,19 @@ int main(void)
   // CANバスの起動 (フィルタ設定 + HAL_FDCAN_Start + Rx割り込み有効化)
   CANBus_Init(&hfdcan1);
 
-  // DJI C610 (M2006用ESC) の初期化。ESC側のIDは基板のダイヤルATC/DIPで1〜8に設定しておく
-  DJIC610_Init();
+  // DJI C610 (M2006用ESC) 電流制御ブロックの初期化。対象は CAN ID 0x01 (ESC ID 1)。
+  // C610_CURRENT_Init() は内部で DJIC610_Init() も呼ぶ。ここでは CAN 送信しない。
+  // ★C610ドライバは電源投入から起動完了まで時間がかかるため、C610Current_Tick() は
+  //   起動から C610_CURRENT_STARTUP_DELAY_MS(=2秒) 経過するまで C610 へ一切送信しない。
+  C610Current_Init(&c610_current);
+  C610Current_SetCurrentA(&c610_current, 0.0f);   // 初期目標電流 0A (必要に応じて更新する)
 
-  // GIM8018-8の初期化。本命としてODrive CAN Simpleプロトコルで扱う。
-  ODriveCAN_Init(&gim_axis, GIM_NODE_ID, GIM_GEAR_RATIO);
-  // Position Controlに入る (Set_Controller_Mode(POSITION, POS_FILTER) +
-  // Set_Axis_Requested_State(CLOSED_LOOP_CONTROL))。
-  // モーター/エンコーダのキャリブレーションが済んでいない個体だと失敗するが、その場合も
-  // 送信自体は害がなく、失敗はheartbeatのaxis_error/axis_stateから分かる。
-  ODriveCAN_EnablePositionControl(&gim_axis);
-
-  // 比較用: VESCプロトコルだった場合に備え、受信のみ監視する(コマンドは送らない)
-  VescCAN_Init(&vesc_test_motor, VESC_TEST_ID);
+  // AS5600 の角度をフィードバックにした C610 のカスケード位置制御 (位置P→速度PI→電流)。
+  // ★起動直後は無効 (電流0でフリー)。アプリが最初に高レベル制御UDP(0x07)を送った時点で
+  //   初めて制御開始 (自動で原点へは戻らない)。基準角(ZERO_OFFSET/ORIGIN)とゲイン
+  //   (c610_position.h)はコンパイル時定数。0x07 では「原点からの差分角」のみ設定する。
+  // 実際の AS5600 読み取りは AS5600_StreamTick() 内で行い、そこから C610Position_Update() を呼ぶ。
+  C610Position_Init(&c610_pos, &c610_current, C610_ZERO_OFFSET_DEG, C610_POS_ORIGIN_DEG);
 
   // TTLサーボ基板 (受信専用) の初期化。実機へは何も送信しない。
   TTLServoCAN_Init(&ttl_servo, TTL_SERVO_NODE_ID);
@@ -352,39 +423,23 @@ int main(void)
   WaveMotorCAN_Init(&wave_motor, WAVE_MOTOR_1_NODE_ID);
   WaveMotorCAN_Init(&wave_motor2, WAVE_MOTOR_2_NODE_ID);
 
-  // GIM6010-8 2台 (node_id 0x06, 0x07) / GIM8018-8 2台 (node_id 0x04, 0x05)。
-  // ODrive CAN SimpleのPosition Control(POS_FILTER)へ入れる。
-  // ⚠ 4軸分をノーウェイトで連続送信すると、STM32G4のTx FIFO(HW的に3要素しか
-  //   ない、can_bus.cのコメント参照)が溢れ、後方の軸(0x07以降)ほど設定フレームが
-  //   欠落しやすいため、各軸の間にHAL_Delay()を挟む(メインループ開始前で
-  //   CANUDPBridge_Poll等はまだ呼べないため、CANBus_Poll付きのDelay_WithCANPoll()
-  //   ではなく単純なHAL_Delay()を使う。FDCANの送信自体はソフトのポーリングと
-  //   無関係にハードウェアが自動で行うので、ここで待つだけでFIFOは空く)。
-  GIM6010_Init(&gim6010_a, GIM6010_A_NODE_ID);
-  GIM6010_EnterPositionControl(&gim6010_a);
-  HAL_Delay(10);
+  // 高レベル制御UDP (Python GUIのOPEN/CLOSEボタン・ピッチ/ヨー角目標値・C610操作を受け取る)。
+  // ★この基板は GIM を制御しないので GIM 引数は無い。
+  HLControlUDP_Init(HLCONTROL_SN, HLCONTROL_PORT, &ttl_servo, &wave_motor, &wave_motor2);
 
-  GIM6010_Init(&gim6010_b, GIM6010_B_NODE_ID);
-  GIM6010_EnterPositionControl(&gim6010_b);
-  HAL_Delay(10);
+  // Python GUI から C610(0x01) の目標電流[A] / 位置目標を受け取れるようにする
+  // (0x06 = 手動電流、0x07 = 原点からの差分角)。目標値の記憶のみで、実送信は
+  // C610Current_Tick() が担当 (起動後2秒間は無送信)。
+  HLControlUDP_SetC610(&c610_current, &c610_pos);
 
-  GIM8018_Init(&gim8018_c, GIM8018_C_NODE_ID);
-  GIM8018_EnterPositionControl(&gim8018_c);
-  HAL_Delay(10);
+  // AS5600 磁気エンコーダ (ソフトウェアI2C: SCL=PA15, SDA=PB7)。
+  // 角度は AS5600_StreamTick() が UDPポート5004へ周期送信する。
+  AS5600_Init();
 
-  GIM8018_Init(&gim8018_d, GIM8018_D_NODE_ID);
-  GIM8018_EnterPositionControl(&gim8018_d);
-  HAL_Delay(10);
-
-  // 高レベル制御UDP (Python GUIのOPEN/CLOSEボタン・ピッチ角目標値・GIM6010/GIM8018
-  // ピッチ角目標値を受け取る)。GIM6010/GIM8018の初期位置はGUIから設定するのでは
-  // なく、ここでプログラム側の定数(GIM6010_*_INITIAL_NATIVE_TURNS /
-  // GIM8018_*_INITIAL_NATIVE_TURNS)として渡す。
-  HLControlUDP_Init(HLCONTROL_SN, HLCONTROL_PORT, &ttl_servo, &wave_motor, &wave_motor2,
-                     &gim6010_a, &gim6010_b,
-                     GIM6010_A_INITIAL_NATIVE_TURNS, GIM6010_B_INITIAL_NATIVE_TURNS,
-                     &gim8018_c, &gim8018_d,
-                     GIM8018_C_INITIAL_NATIVE_TURNS, GIM8018_D_INITIAL_NATIVE_TURNS);
+  // ROS2 (sharmech) 連携。UDP 8888 で 0x01 polar (theta/gripper/bit1) を受信、
+  // 8889 へ 0x81 feedback を送信。既存の CAN 層・5003 番プロトコルには影響しない
+  // (docs/mcu_spec.md §10.3)。フィードバック宛先は dest_ip (= ROS2 側 PC) と同じにしておく。
+  ROS2Link_Init(dest_ip);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -404,11 +459,25 @@ int main(void)
         // (CANBus_GetTxQueueFailures()参照)。増え続けているなら、どこかのノード宛の
         // 送信が詰まって他ノードの送信も巻き添えで失敗している可能性が高い。
         {
-            char hb_msg[80];
-            int hb_len = snprintf(hb_msg, sizeof(hb_msg), "HB seq=%lu tick=%lu canBusOff=%lu txQFail=%lu\r\n",
+            char hb_msg[128];
+            // FDCAN エラーカウンタ / プロトコル状態。
+            //   TEC/REC  : 送信/受信エラーカウンタ (0付近=健全, 増減する=エラー発生中,
+            //              128以上=error-passive)
+            //   LEC      : Last Error Code (0=NoError, 1=Stuff, 2=Form, 3=Ack, 4=Bit1,
+            //              5=Bit0, 6=CRC, 7=NoChange)。Ack(3) だらけ=誰もACKしていない、
+            //              Bit/Form/Stuff/CRC=信号品質。
+            FDCAN_ErrorCountersTypeDef ec = {0};
+            FDCAN_ProtocolStatusTypeDef ps = {0};
+            (void)HAL_FDCAN_GetErrorCounters(&hfdcan1, &ec);
+            (void)HAL_FDCAN_GetProtocolStatus(&hfdcan1, &ps);
+            int hb_len = snprintf(hb_msg, sizeof(hb_msg),
+                                   "HB seq=%lu tick=%lu canBusOff=%lu txQFail=%lu TEC=%lu REC=%lu LEC=%lu passive=%lu warn=%lu\r\n",
                                    (unsigned long)hb_seq++, (unsigned long)HAL_GetTick(),
                                    (unsigned long)CANBus_GetBusOffRecoveries(),
-                                   (unsigned long)CANBus_GetTxQueueFailures());
+                                   (unsigned long)CANBus_GetTxQueueFailures(),
+                                   (unsigned long)ec.TxErrorCnt, (unsigned long)ec.RxErrorCnt,
+                                   (unsigned long)ps.LastErrorCode,
+                                   (unsigned long)ps.ErrorPassive, (unsigned long)ps.Warning);
             if (hb_len > 0) {
                 sendto(HEARTBEAT_SN, (uint8_t*)hb_msg, (uint16_t)hb_len, hb_broadcast_ip, HEARTBEAT_PORT);
             }
@@ -441,91 +510,22 @@ int main(void)
 		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // 生存確認用LED (LD2)
 //		HAL_Delay(1000); // 1秒おき
 
-        // GIM8018-8 (ODrive CAN Simple) の位置制御テスト。
-        // 出力軸換算で 0 turn ⇔ 0.25 turn (90°) を約6秒(ループ4周)ごとに往復する。
-        // ⚠ GIM_NODE_IDが実機と合っているか、GIM_GEAR_RATIOが実機と合っているか
-        //    (odrive_can.hのコメント参照。誤っていると指令値と実移動量が8倍ズレる)、
-        //    tools/can_id_scanner の「ODrive heartbeat」欄(axis_state=8 =
-        //    CLOSED_LOOP_CONTROLになっているか)で確認してから通電すること。
-        //    負荷を外した状態・電流制限をかけた電源でまず試すこと。
-        //    axis_errorが非0だったり反応がなければ、モーター/エンコーダのキャリブレーションが
-        //    済んでいない可能性がある(ODrive/GIM設定ツール側での作業が必要)。
-        {
-            static uint8_t pos_toggle_count = 0U;
-            static float pos_target_turns = 0.0f;
-
-            pos_toggle_count++;
-            if (pos_toggle_count >= 4U) {
-                pos_toggle_count = 0U;
-                pos_target_turns = (pos_target_turns == 0.0f) ? 0.25f : 0.0f;
-            }
-            ODriveCAN_SetOutputPos(&gim_axis, pos_target_turns, 0.0f, 0.0f);
-        }
-
-        // GIM6010-8 2台 (0x06, 0x07) / GIM8018-8 2台 (0x04, 0x05) を起動時から確実に
-        // クローズドループ(位置制御)で回し続けるため、Set_Controller_Mode +
-        // Set_Axis_Requested_State(CLOSED_LOOP) を定期的に再送する。起動時に1回だけ
-        // 送る実装だと、AutoRetransmission=DISABLE + ACK無し等でその1フレームが
-        // ロストした場合に永久にIDLEのままになってしまうため、GIM8018-8(gim_axis)の
-        // 位置指令と同様に継続的に送り直して確実性を上げる。
-        // ⚠ 4軸分を同じループ周回で一気に送ると、STM32G4のTx FIFOがHW的に3要素しか
-        //   ないため(can_bus.cのコメント参照)、CPU側がノーウェイトで積もうとして
-        //   溢れ、一部のフレームがHAL_FDCAN_AddMessageToTxFifoQ()の失敗で静かに
-        //   消えることがある(実際に0x07だけクローズドループに入らない不具合として
-        //   発現した)。1周回につき1軸だけラウンドロビンで送ることでburstサイズを
-        //   抑える(各軸は約4周回=6秒に1回の再送になるが、通常運用では十分な頻度)。
-        // 同じ番の軸に、HLControlUDP_ResendLastTarget()でSet_Input_Posも併せて
-        // 再送する。GUIから新規コマンドが来ない間もgim_axis(node0)と同様に目標値を
-        // 送り続けることで、GIM8108-8側の入力タイムアウト等により単発コマンドだけ
-        // では目標を見失ってしまう(と疑われる)問題に対応する。
-        {
-            static uint8_t gim_reassert_idx = 0U;
-
-            /* EnterPositionControl()は呼ぶたびに無条件で2フレーム
-             * (Set_Controller_Mode + Set_Axis_Requested_State)を送るため、既に
-             * CLOSED_LOOP_CONTROLに入っている軸に対しても毎回送ってしまうと、
-             * gim_axisの1フレーム+ここの2フレーム+ResendLastTargetの1フレーム=
-             * 4フレームが同一ループでFDCAN TxFIFO(3要素)を溢れさせる。まだ
-             * CLOSED_LOOP_CONTROLでない軸だけ送るようにし、通常運用時は
-             * ResendLastTargetの1フレームのみにする。 */
-            switch (gim_reassert_idx) {
-                case 0U:
-                    if (gim6010_a.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-                        GIM6010_EnterPositionControl(&gim6010_a);
-                    }
-                    break;
-                case 1U:
-                    if (gim6010_b.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-                        GIM6010_EnterPositionControl(&gim6010_b);
-                    }
-                    break;
-                case 2U:
-                    if (gim8018_c.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-                        GIM8018_EnterPositionControl(&gim8018_c);
-                    }
-                    break;
-                default:
-                    if (gim8018_d.odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
-                        GIM8018_EnterPositionControl(&gim8018_d);
-                    }
-                    break;
-            }
-            HLControlUDP_ResendLastTarget(gim_reassert_idx);
-            gim_reassert_idx = (uint8_t)((gim_reassert_idx + 1U) % 4U);
-        }
-
-        // GIM6010 A(0x06)/B(0x07)は常に同じ目標値を送っているが、実機で出力角に
-        // 定常的なズレが残る場合があるため、実測角度差から低速に補正する
-        // (GIM6010_A/B_INITIAL_NATIVE_TURNSのOFFSETは変更しない。詳細は
-        // hl_control_udp.hのコメント参照)。メインループ1周(約1.5秒)に1回で十分。
-        HLControlUDP_UpdateGim6010Sync();
-
-        // 固定の振り付けシーケンス(Sequence_Update()/s_seq_steps[])は無効化し、
-        // 代わりにPython GUIからの高レベル制御UDP(OPEN/CLOSEボタン・ピッチ角目標値)を
+        // Python GUIからの高レベル制御UDP(OPEN/CLOSEボタン・ピッチ/ヨー角目標値・C610操作)を
         // その場で処理する。HLControlUDP_Poll()はDelay_WithCANPoll()内でも呼んでいる
         // (数ms粒度の応答性確保)ので、ここでの呼び出しは無くても実用上問題ないが、
         // Delay_WithCANPoll()を挟まない一瞬の間も取りこぼさないよう念のため呼ぶ。
         HLControlUDP_Poll();
+        HLControlUDP_WaveTick();           // 0x11/0x12 ソフトスタート＋目標送出
+        HLControlUDP_TtlYawFollowTick();   // 0x21 を 0x11/0x12 ヨー軸へ 500ms周期でランプ追従
+        AS5600_StreamTick();   // AS5600 読み取り + C610 位置制御 Update + UDP(5004) 送信
+
+        // DJI C610 (CAN ID 0x01) の電流指令を送る。起動から2秒間はこの関数が
+        // 何もせず即 return する (C610ドライバの起動待ち)。電流値は位置制御
+        // コントローラ(C610Position_Update)または手動コマンド(0x06)が設定する。
+        C610Position_Failsafe(&c610_pos, HAL_GetTick());
+        C610Current_Tick(&c610_current);
+        ROS2Link_Poll();
+        ROS2Link_Tick();
 
   }
   /* USER CODE END 3 */
@@ -597,6 +597,17 @@ static void MX_FDCAN1_Init(void)
   // 返して黙って送信キューに入れなくなる(＝一部のノードだけ動かなくなる)。DISABLEなら
   // 1回失敗した時点でそのフレームを諦めてFIFOを空けるので、この詰まりが起きない。
   // 位置制御コマンドはどうせ毎ループ再送しているので、単発のロストがあっても実害は無い。
+  //
+  // ⚠ ビットレート: FDCAN kernel clock = PCLK1 = 48MHz (SystemClock_Config 参照。
+  //   FDCAN clock source は reset default の PCLK1、ClockDivider=DIV1)。
+  //   bit rate = 48MHz / (NominalPrescaler * (1 + Seg1 + Seg2))
+  //            = 48MHz / (NominalPrescaler * 16)     ← Seg1=13, Seg2=2, sample point 87.5%
+  //     Prescaler  3 -> 1 Mbps   ★現在これ
+  //     Prescaler  6 -> 500 kbps
+  //     Prescaler 12 -> 250 kbps
+  //     Prescaler 24 -> 125 kbps
+  //   ★全 CAN ノード (GIM8108 x2, GIM6010 x2, その他) の can.config.baud_rate を
+  //     STM32 と同じ値に合わせること。1つでも違うとバス全体が停止する。
   /* USER CODE END FDCAN1_Init 1 */
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
@@ -605,7 +616,7 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.AutoRetransmission = DISABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 3;
+  hfdcan1.Init.NominalPrescaler = 3;   /* 48MHz/(3*16) = 1 Mbps (上のコメント参照) */
   hfdcan1.Init.NominalSyncJumpWidth = 1;
   hfdcan1.Init.NominalTimeSeg1 = 13;
   hfdcan1.Init.NominalTimeSeg2 = 2;
@@ -813,14 +824,19 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+// 常時消灯にする NeoPixel のインデックス (1番=0, 2番=1)。led_data に何が入っていても
+// この2個だけは黒で出力する。
+#define WS2812_FORCE_OFF_MASK  ((1U << 0) | (1U << 1))
+
 void ws2812_fill_buffer(void)
 {
     int idx = 0;
 
     for (int i = 0; i < LED_NUM; i++) {
-        uint8_t g = led_data[i][0];
-        uint8_t r = led_data[i][1];
-        uint8_t b = led_data[i][2];
+        uint8_t force_off = ((WS2812_FORCE_OFF_MASK >> i) & 1U) != 0U;
+        uint8_t g = force_off ? 0U : led_data[i][0];
+        uint8_t r = force_off ? 0U : led_data[i][1];
+        uint8_t b = force_off ? 0U : led_data[i][2];
 
         uint8_t grb[3] = {g, r, b};
 

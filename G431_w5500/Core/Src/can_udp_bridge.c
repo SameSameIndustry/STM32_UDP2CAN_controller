@@ -28,8 +28,25 @@ static uint8_t s_dest_ip[4] = {0, 0, 0, 0};
 static uint16_t s_dest_port = 0U;
 static uint8_t s_have_dest = 0U;
 
+/* DJI C610/C620 のフィードバック (標準ID 0x201..0x20B) は約1kHzで垂れ流されるため、
+ * そのまま全部 UDP へ転送すると CANUDPBridge_Drain() の sendto() (=W5500 SPI) が
+ * メインループを食い潰し、wave motor 等の周期送信タイミングを乱す。ブリッジのログ用途
+ * では高頻度で見る意味が無いので、このID範囲だけ転送レートを間引く。 */
+#define CANUDP_DJI_FB_ID_LO      0x201U
+#define CANUDP_DJI_FB_ID_HI      0x20BU
+#define CANUDP_DJI_FB_MIN_MS      50U   /* 1本/50ms = 約20Hz まで */
+
 static void CANUDPBridge_OnCanFrame(uint32_t id, uint8_t is_extended, uint8_t *data, uint8_t len)
 {
+    if (!is_extended && id >= CANUDP_DJI_FB_ID_LO && id <= CANUDP_DJI_FB_ID_HI) {
+        static uint32_t s_dji_fb_last = 0U;
+        uint32_t now = HAL_GetTick();
+        if (s_dji_fb_last != 0U && (now - s_dji_fb_last) < CANUDP_DJI_FB_MIN_MS) {
+            return;   /* 直近に転送済み。この1本は捨てる (実制御には未使用) */
+        }
+        s_dji_fb_last = now;
+    }
+
     uint8_t next_head = (uint8_t)((s_rxq_head + 1U) % CANUDP_RXQ_SIZE);
     if (next_head == s_rxq_tail) {
         return; /* キュー満杯。古いフレームを優先し新しいフレームを捨てる */

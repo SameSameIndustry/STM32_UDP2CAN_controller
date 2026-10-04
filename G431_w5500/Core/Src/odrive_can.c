@@ -18,12 +18,22 @@
 #define ODRIVE_CMD_REBOOT                 0x016U
 #define ODRIVE_CMD_GET_BUS_VOLTAGE_CURRENT 0x017U
 #define ODRIVE_CMD_CLEAR_ERRORS          0x018U
+#define ODRIVE_CMD_SET_LINEAR_COUNT      0x019U
 #define ODRIVE_CMD_SET_POS_GAIN          0x01AU
 #define ODRIVE_CMD_SET_VEL_GAINS         0x01BU
 
 #define ODRIVECAN_MAX_TRACKED 8U
 static ODriveCAN_Axis_t *s_axis_table[ODRIVECAN_MAX_TRACKED];
 static uint8_t s_axis_count = 0U;
+
+/* mode 遷移シーケンス (Set_Controller_Mode → [Set_Input_Pos] → Set_Axis_Requested_State) の
+ * フレーム間に空ける時間 [ms]。
+ * FDCAN は AutoRetransmission=DISABLE なので、立て続けに複数フレームを投げると、
+ * ACK が返らない / CAN RX が詰まっているノード宛のフレームがまとめて落ちる。ODrive の
+ * CAN RX FIFO は小さく、mode+state を連続で受けると溢れて 2 発目 (CLOSED_LOOP 遷移) を
+ * 取りこぼすことがある (配線が弱い node で顕著。ID4 は入るが ID5 は入らない、等)。
+ * これらの関数は hot-loop から呼ばれないので数 ms の遅延で構わない。 */
+#define ODRIVE_CAN_SEQ_GAP_MS 5U
 
 static uint32_t ODriveCAN_MakeId(uint8_t node_id, uint32_t cmd_id)
 {
@@ -164,6 +174,7 @@ HAL_StatusTypeDef ODriveCAN_EnableVelocityControl(ODriveCAN_Axis_t *axis)
     if (status != HAL_OK) {
         return status;
     }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
 
@@ -174,6 +185,33 @@ HAL_StatusTypeDef ODriveCAN_EnablePositionControl(ODriveCAN_Axis_t *axis)
     if (status != HAL_OK) {
         return status;
     }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);   /* 連続送信で 2 発目が落ちるのを防ぐ */
+    return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
+}
+
+HAL_StatusTypeDef ODriveCAN_EnablePositionControlHold(ODriveCAN_Axis_t *axis)
+{
+    /* Closed Loop に入る瞬間の「飛び出し」(input_pos の既定 0 や前回値へ一気に動く)を
+     * 防ぐため、状態遷移の前に Set_Input_Pos で現在の pos_estimate を目標にしておく
+     * (tools/odrive_setup/odrive_position_test.py と同じ手順)。
+     * pos_estimate をまだ一度も受信していない間は入れない(0 へ飛び出すため)。
+     * その場合は HAL_BUSY を返すので、呼び出し側は次の機会に再試行すること。 */
+    HAL_StatusTypeDef status;
+
+    if (!axis->connected || (axis->last_encoder_tick == 0U)) {
+        return HAL_BUSY;
+    }
+    status = ODriveCAN_SetControllerMode(
+        axis, ODRIVE_CONTROL_MODE_POSITION_CONTROL, ODRIVE_INPUT_MODE_POS_FILTER);
+    if (status != HAL_OK) {
+        return status;
+    }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);
+    status = ODriveCAN_SetInputPos(axis, axis->pos_estimate, 0.0f, 0.0f);
+    if (status != HAL_OK) {
+        return status;
+    }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
 
@@ -184,6 +222,7 @@ HAL_StatusTypeDef ODriveCAN_EnableTorqueControl(ODriveCAN_Axis_t *axis)
     if (status != HAL_OK) {
         return status;
     }
+    HAL_Delay(ODRIVE_CAN_SEQ_GAP_MS);
     return ODriveCAN_SetAxisState(axis, ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL);
 }
 
@@ -226,6 +265,13 @@ HAL_StatusTypeDef ODriveCAN_SetTrajAccelLimits(ODriveCAN_Axis_t *axis, float acc
     ODriveCAN_PutF32LE(&data[0], accel_limit);
     ODriveCAN_PutF32LE(&data[4], decel_limit);
     return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_TRAJ_ACCEL_LIMITS), data, 8U);
+}
+
+HAL_StatusTypeDef ODriveCAN_SetLinearCount(ODriveCAN_Axis_t *axis, int32_t count)
+{
+    uint8_t data[4];
+    ODriveCAN_PutU32LE(data, (uint32_t)count);
+    return CANBus_SendStd(ODriveCAN_MakeId(axis->node_id, ODRIVE_CMD_SET_LINEAR_COUNT), data, 4U);
 }
 
 HAL_StatusTypeDef ODriveCAN_SetPosGain(ODriveCAN_Axis_t *axis, float pos_gain)

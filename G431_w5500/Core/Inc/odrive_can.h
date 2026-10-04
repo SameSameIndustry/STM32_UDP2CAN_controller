@@ -107,6 +107,12 @@ HAL_StatusTypeDef ODriveCAN_EnableVelocityControl(ODriveCAN_Axis_t *axis);
  * (Set_Controller_Mode(POSITION, POS_FILTER) + Set_Axis_Requested_State(CLOSED_LOOP_CONTROL)) */
 HAL_StatusTypeDef ODriveCAN_EnablePositionControl(ODriveCAN_Axis_t *axis);
 
+/* 上と同じだが、状態遷移の前に Set_Input_Pos(現在の pos_estimate) を挟み、Closed Loop
+ * 移行時にモーターが input_pos の既定値(0 等)へ飛び出すのを防ぐ。
+ * pos_estimate 未受信(connected=0 または last_encoder_tick=0)の間は何もせず HAL_BUSY を
+ * 返す(0 へ飛び出すのを避けるため)。呼び出し側は次の機会に再試行すること。 */
+HAL_StatusTypeDef ODriveCAN_EnablePositionControlHold(ODriveCAN_Axis_t *axis);
+
 /* Closed Loop Control + Torque Control に入るための一連の手順
  * (Set_Controller_Mode(TORQUE, PASSTHROUGH) + Set_Axis_Requested_State(CLOSED_LOOP_CONTROL)) */
 HAL_StatusTypeDef ODriveCAN_EnableTorqueControl(ODriveCAN_Axis_t *axis);
@@ -133,6 +139,13 @@ HAL_StatusTypeDef ODriveCAN_SetTrajAccelLimits(ODriveCAN_Axis_t *axis, float acc
 
 /* 位置ループゲイン (Set_Pos_Gain, cmd 0x01A) */
 HAL_StatusTypeDef ODriveCAN_SetPosGain(ODriveCAN_Axis_t *axis, float pos_gain);
+
+/* エンコーダの積算カウント(shadow_count)を直接書き換える (Set_Linear_Count, cmd 0x019)。
+ * ODrive python の axis.encoder.set_linear_count(count) と同じ。
+ * 位置フィードバックの原点(マルチターン)を再定義するため、必ず IDLE 状態でのみ使うこと
+ * (CLOSED_LOOP 中に呼ぶと制御基準が飛ぶ)。
+ * 用途: tools/odrive_setup/ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2「起動時に ±半回転へ正規化」。 */
+HAL_StatusTypeDef ODriveCAN_SetLinearCount(ODriveCAN_Axis_t *axis, int32_t count);
 
 /* 速度ループゲイン (Set_Vel_Gains, cmd 0x01B) */
 HAL_StatusTypeDef ODriveCAN_SetVelGains(ODriveCAN_Axis_t *axis, float vel_gain, float vel_integrator_gain);

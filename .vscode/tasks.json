@@ -15,7 +15,7 @@
         {
             "label": "Flash",
             "type": "shell",
-            "command": "C:\\Users\\ibuki_ono\\AppData\\Local\\Microsoft\\WinGet\\Packages\\xpack-dev-tools.openocd-xpack_Microsoft.Winget.Source_8wekyb3d8bbwe\\xpack-openocd-0.12.0-7\\bin\\openocd.exe",
+            "command": "openocd",
             "args": [
                 "-f", "interface/stlink.cfg",
                 "-f", "target/stm32g4x.cfg",

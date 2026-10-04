@@ -22,6 +22,161 @@ void GIM8018_Init(GIM8018_t *g, uint8_t node_id)
     g->vel_limit_turns_s    = GIM8018_DEFAULT_VEL_LIMIT_TURNS_S;
     g->torque_constant_nm_a = GIM8018_TORQUE_CONSTANT_NM_A_UNKNOWN;
     g->hard_max_current_a   = GIM8018_HARD_MAX_CURRENT_A_SAFE;
+    g->startup_normalized       = 0U;
+    g->startup_to_grid          = 0U;
+    g->startup_phase            = 0U;
+    g->startup_req_tick         = 0U;
+    g->startup_entry_tick       = 0U;
+    g->startup_last_send_tick    = 0U;
+    g->startup_origin_native    = 0.0f;
+}
+
+/* ---- 起動時ホーミング (ODRIVE_ABSOLUTE_ANGLE_NOTES.md §4.2 / §5) ---- */
+
+/* HAL_GetTick() を返すが 0 は避ける (0 = 「未設定」の意味に使うため)。 */
+static uint32_t gim8018_tick_nonzero(void)
+{
+    uint32_t t = HAL_GetTick();
+    return (t == 0U) ? 1U : t;
+}
+
+HAL_StatusTypeDef GIM8018_NormalizeMultiturnStartup(GIM8018_t *g, float center_native)
+{
+    uint32_t now;
+
+    if (g->startup_normalized) {
+        return HAL_OK;
+    }
+    now = HAL_GetTick();
+
+    /* ================= phase 2: CLOSED_LOOP 後、実測 pos_estimate を原点に確定 =============== */
+    if (g->startup_phase == 2U) {
+        float pe;
+
+        /* CLOSED_LOOP から外れた (フォールト等) → phase 1 へ戻して入れ直す。 */
+        if (g->odrv.axis_state != ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
+            g->startup_phase = 1U;
+            return HAL_BUSY;
+        }
+        /* 投入直後は ODrive が内部でマルチターン値をロード中 & CAN 送信が追いつかない。
+         * 一定時間待つ。 */
+        if ((now - g->startup_entry_tick) < GIM8018_STARTUP_SETTLE_MS) {
+            return HAL_BUSY;
+        }
+        /* CLOSED_LOOP 投入後の新鮮なエンコーダフレームを 1 発待つ (300ms 以内)。
+         * これが来ないまま長く経ったら homing を諦める。 */
+        if ((g->odrv.last_encoder_tick == 0U) || ((now - g->odrv.last_encoder_tick) > 300U)) {
+            if ((now - g->startup_entry_tick) > (GIM8018_STARTUP_SETTLE_MS + 3000U)) {
+                g->startup_origin_native = g->odrv.pos_estimate;  /* best effort */
+                g->startup_to_grid       = 0U;
+                g->startup_normalized     = 1U;
+                return HAL_OK;
+            }
+            return HAL_BUSY;
+        }
+
+        /* CLOSED_LOOP 投入後の実測 pos_estimate から「原点(= 絶対0度)」を確定する。
+         *   origin = center_native + round(pos_estimate - center_native)
+         * integer turn 部を最寄りに丸めるので、原点は必ず center_native (=初期角度) と
+         * 同じ小数部を持つ (0.2 / 1.2 / -0.8 ...)。以後の 0x05 は Set_Input_Pos = origin ± 偏差
+         * = 「原点(0度)からの絶対角度」。★モーターを能動的に origin へは動かさない
+         * (最初の 0x05 で origin+偏差 へ動く。0x05 前は電源投入位置を保持)。
+         *
+         * ※ どの integer turn (どの 45° 出力セクタ) になるかは起動時の種依存で非決定的
+         * (§3.2 の ±22.5° 曖昧性)。真のセクタ確定にはホスト側の不揮発保存が要る。 */
+        pe = g->odrv.pos_estimate;
+        {
+            float dd = pe - center_native;
+            int32_t k = (int32_t)((dd >= 0.0f) ? (dd + 0.5f) : (dd - 0.5f));
+            g->startup_origin_native = center_native + (float)k;
+        }
+        g->startup_to_grid   = 1U;
+        g->startup_normalized = 1U;
+        return HAL_OK;
+    }
+
+    /* ★一度も応答の無いノード (node_id 不一致 / 未接続 / ボーレート不一致) には送らない。
+     * ただし「一度でも受信実績があるノード」= 応答が遅い/間欠的なだけの場合は送り続ける。
+     * (heartbeat が数百ms 遅れる程度で送信を止めると、そのノードがいつまでも
+     *  IDLE のまま = ID5 が CLOSED_LOOP に入らない、という症状になる。canBusOff=0 が
+     *  確認できているので Bus-Off の心配は不要。) */
+    if (!g->odrv.connected && (g->startup_phase < 2U)) {
+        return HAL_BUSY;
+    }
+
+    /* ================= phase 1: axis_state==CLOSED_LOOP を待つ ============================= */
+    if (g->startup_phase == 1U) {
+        if (g->odrv.axis_state == ODRIVE_AXIS_STATE_CLOSED_LOOP_CONTROL) {
+            g->startup_entry_tick = gim8018_tick_nonzero();
+            g->startup_phase      = 2U;
+            return HAL_BUSY;
+        }
+        /* CLOSED_LOOP に入れないまま CL_TIMEOUT → homing を諦め、現在値を原点に。
+         * (ODrive がエラーで CLOSED_LOOP を拒否している = calibration 等を疑う) */
+        if ((g->startup_req_tick != 0U) &&
+            ((now - g->startup_req_tick) > GIM8018_STARTUP_CL_TIMEOUT_MS)) {
+            g->startup_origin_native = g->odrv.pos_estimate;
+            g->startup_to_grid       = 0U;
+            g->startup_normalized     = 1U;
+            return HAL_OK;
+        }
+        /* 投入コマンドを定期再送。★間隔にジッタを入れる: node4/node5 の CyberBeast が
+         * 同一 heartbeat_rate(100ms) で位相ロックしてバス調停を毎周期 node5 が負ける
+         * (= node5 の CAN が詰まって MOTOR_FAILED(0x40)) 問題があり、STM32 の再送まで
+         * きっかり周期的だと node5 の送信機会をさらに潰す。少しばらつかせて位相をずらす
+         * (ODrive 公式 / STM community どちらも「周期送信をスキューさせろ」と言っている)。 */
+        {
+            uint32_t interval = GIM8018_STARTUP_RESEND_MS + (uint32_t)((now >> 5) & 0x7FU); /* +0..127ms */
+            if ((now - g->startup_last_send_tick) >= interval) {
+                /* ★axis_error が latch されていると ODrive は CLOSED_LOOP を拒否する
+                 * (= その軸は永遠に IDLE)。先に Clear_Errors(cmd 0x018) を送る。 */
+                if (g->odrv.axis_error != 0U) {
+                    (void)ODriveCAN_ClearErrors(&g->odrv);
+                    HAL_Delay(5);
+                }
+                HAL_StatusTypeDef st = ODriveCAN_EnablePositionControl(&g->odrv);
+                if (st == HAL_OK) {
+                    g->startup_last_send_tick = now;
+                }
+            }
+        }
+        return HAL_BUSY;
+    }
+
+    /* ================= phase 0: CLOSED_LOOP 投入を要求 =================================== */
+    {
+        /* Set_Controller_Mode(POSITION, POS_FILTER) + Set_Axis_Requested_State(CLOSED_LOOP)。
+         * Set_Input_Pos は送らない (ODrive が遷移時に pos_setpoint=pos_estimate を
+         * 自動初期化するので飛び出さない。§5.1)。 */
+        HAL_StatusTypeDef st = ODriveCAN_EnablePositionControl(&g->odrv);
+        if (st != HAL_OK) {
+            return st;   /* 送信失敗。phase 0 のまま再試行 */
+        }
+        g->startup_req_tick      = gim8018_tick_nonzero();
+        g->startup_last_send_tick = now;
+        g->startup_phase         = 1U;
+        return HAL_BUSY;
+    }
+}
+
+uint8_t GIM8018_IsStartupNormalized(const GIM8018_t *g)
+{
+    return g->startup_normalized;
+}
+
+uint8_t GIM8018_StartupNormalizedToGrid(const GIM8018_t *g)
+{
+    return g->startup_to_grid;
+}
+
+uint8_t GIM8018_GetStartupPhase(const GIM8018_t *g)
+{
+    return g->startup_phase;
+}
+
+float GIM8018_GetStartupOriginNative(const GIM8018_t *g)
+{
+    return g->startup_origin_native;
 }
 
 void GIM8018_SetGearRatio(GIM8018_t *g, float gear_ratio)
@@ -55,6 +210,11 @@ HAL_StatusTypeDef GIM8018_SetLimits(GIM8018_t *g, float vel_limit_turns_s, float
 HAL_StatusTypeDef GIM8018_EnterPositionControl(GIM8018_t *g)
 {
     return ODriveCAN_EnablePositionControl(&g->odrv);
+}
+
+HAL_StatusTypeDef GIM8018_EnterPositionControlHold(GIM8018_t *g)
+{
+    return ODriveCAN_EnablePositionControlHold(&g->odrv);
 }
 
 HAL_StatusTypeDef GIM8018_EnterPositionControlTrajectory(GIM8018_t *g)
