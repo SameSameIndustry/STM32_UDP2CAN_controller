@@ -1,7 +1,4 @@
-# Build artifacts (STM32CubeIDE / CMake)
-CubeIDE/*/Debug/
-CubeIDE/*/Release/
-CubeIDE/*/.settings/
+# Build artifacts (CMake)
 G431_w5500/build/
 **/*.mcupreferredtarget
 
@@ -33,8 +30,9 @@ _autosave-*
 *.map
 *.list
 
-# 別管理の外部リポジトリ (SameSameIndustry/sharmech) — この親リポジトリでは追跡しない
+# 別管理の外部リポジトリ・別プロジェクト — この親リポジトリでは追跡しない
 /sharmech/
+/UDP2CAN_Bridge/
 
 # Python
 __pycache__/
